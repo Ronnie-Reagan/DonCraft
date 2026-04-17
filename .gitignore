@@ -39,3 +39,23 @@
 
 # debug information files
 *.dwo
+
+# Project-local generated output
+build/
+__pycache__/
+
+# IDE and local tool state
+.vs/
+.idea/
+.vscode/
+CMakeUserPresets.json
+compile_commands.json
+*.VC.db
+*.VC.opendb
+*.opendb
+*.suo
+*.user
+
+# Local planning and runtime data
+plan.*
+server_world.bin

@@ -1,0 +1,74 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct ParticleData
+{
+    vec4 pos_vel;
+    vec4 mass_pad;
+};
+
+struct NodeData
+{
+    vec4 mass_vel;
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer
+{
+    ParticleData particles[];
+};
+
+layout(std430, binding = 2) readonly buffer NodeBuffer
+{
+    NodeData nodes[];
+};
+
+layout(push_constant) uniform PushConstants
+{
+    int grid_width;
+    int grid_height;
+    int particle_count;
+    float cell_size;
+    float dt;
+    float gravity_y;
+} pc;
+
+uint node_index(const int x, const int y)
+{
+    return uint(y * pc.grid_width + x);
+}
+
+void main()
+{
+    const uint particle_index = gl_GlobalInvocationID.x;
+    if (particle_index >= uint(max(pc.particle_count, 0)))
+    {
+        return;
+    }
+
+    ParticleData particle = particles[particle_index];
+    vec2 position = particle.pos_vel.xy;
+    vec2 velocity = particle.pos_vel.zw;
+    const vec2 grid = position / pc.cell_size;
+    const int base_x = clamp(int(floor(grid.x)), 0, pc.grid_width - 2);
+    const int base_y = clamp(int(floor(grid.y)), 0, pc.grid_height - 2);
+    const float fx = clamp(grid.x - float(base_x), 0.0, 1.0);
+    const float fy = clamp(grid.y - float(base_y), 0.0, 1.0);
+
+    vec2 gathered_velocity = vec2(0.0);
+    gathered_velocity += nodes[node_index(base_x, base_y)].mass_vel.yz * ((1.0 - fx) * (1.0 - fy));
+    gathered_velocity += nodes[node_index(base_x + 1, base_y)].mass_vel.yz * (fx * (1.0 - fy));
+    gathered_velocity += nodes[node_index(base_x, base_y + 1)].mass_vel.yz * ((1.0 - fx) * fy);
+    gathered_velocity += nodes[node_index(base_x + 1, base_y + 1)].mass_vel.yz * (fx * fy);
+
+    velocity = gathered_velocity;
+    position += velocity * pc.dt;
+
+    const float max_x = float(pc.grid_width - 1) * pc.cell_size;
+    const float max_y = float(pc.grid_height - 1) * pc.cell_size;
+    position.x = clamp(position.x, 0.0, max_x);
+    position.y = clamp(position.y, 0.0, max_y);
+
+    particle.pos_vel = vec4(position, velocity);
+    particles[particle_index] = particle;
+}

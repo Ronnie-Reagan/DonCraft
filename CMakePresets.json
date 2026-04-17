@@ -1,0 +1,130 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 27,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base-vs2022",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "Don_Craft_ENABLE_TESTS": "ON",
+        "Don_Craft_BUILD_CLIENT": "ON",
+        "Don_Craft_BUILD_SERVER": "ON"
+      }
+    },
+    {
+      "name": "vs2022-debug",
+      "inherits": "base-vs2022",
+      "cacheVariables": {
+        "STEAMWORKS_SDK_ROOT": "C:/Steamworks/steamworks_sdk_164/sdk",
+        "Don_Craft_SDL3_SOURCE_DIR": "C:/SDL3-3.4.4"
+      }
+    },
+    {
+      "name": "vs2022-release",
+      "inherits": "base-vs2022",
+      "cacheVariables": {
+        "STEAMWORKS_SDK_ROOT": "C:/Steamworks/steamworks_sdk_164/sdk",
+        "Don_Craft_SDL3_SOURCE_DIR": "C:/SDL3-3.4.4"
+      }
+    },
+    {
+      "name": "vs2022-selfcheck",
+      "inherits": "base-vs2022",
+      "cacheVariables": {
+        "Don_Craft_BUILD_CLIENT": "OFF",
+        "Don_Craft_BUILD_SERVER": "OFF"
+      }
+    },
+    {
+      "name": "vs2022-server-debug",
+      "inherits": "base-vs2022",
+      "cacheVariables": {
+        "STEAMWORKS_SDK_ROOT": "C:/Steamworks/steamworks_sdk_164/sdk",
+        "Don_Craft_BUILD_CLIENT": "OFF",
+        "Don_Craft_BUILD_SERVER": "ON"
+      }
+    },
+    {
+      "name": "vs2022-server-release",
+      "inherits": "base-vs2022",
+      "cacheVariables": {
+        "STEAMWORKS_SDK_ROOT": "C:/Steamworks/steamworks_sdk_164/sdk",
+        "Don_Craft_BUILD_CLIENT": "OFF",
+        "Don_Craft_BUILD_SERVER": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-debug",
+      "configurePreset": "vs2022-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-release",
+      "configurePreset": "vs2022-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-selfcheck",
+      "configurePreset": "vs2022-selfcheck",
+      "configuration": "Debug",
+      "targets": [
+        "Don_Craft_selfcheck"
+      ]
+    },
+    {
+      "name": "build-server-debug",
+      "configurePreset": "vs2022-server-debug",
+      "configuration": "Debug",
+      "targets": [
+        "Don_Craft_server",
+        "Don_Craft_selfcheck"
+      ]
+    },
+    {
+      "name": "build-server-release",
+      "configurePreset": "vs2022-server-release",
+      "configuration": "Release",
+      "targets": [
+        "Don_Craft_server"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-debug",
+      "configurePreset": "vs2022-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-selfcheck",
+      "configurePreset": "vs2022-selfcheck",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-server-debug",
+      "configurePreset": "vs2022-server-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
