@@ -1,4 +1,5 @@
 #include "core/job_system.hpp"
+#include "core/log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -112,6 +113,7 @@ void JobSystem::ParallelFor(
         }
         catch (...)
         {
+            LogError("JobSystem worker task threw an exception.");
             std::lock_guard<std::mutex> lock(exceptionMutex);
             if (firstException == nullptr)
             {
@@ -119,10 +121,13 @@ void JobSystem::ParallelFor(
             }
         }
 
-        if (remainingTasks.fetch_sub(1) == 1)
+        // FIX: Lock the mutex BEFORE modifying the atomic counter.
         {
             std::lock_guard<std::mutex> lock(completionMutex);
-            completionCondition.notify_all();
+            if (remainingTasks.fetch_sub(1) == 1)
+            {
+                completionCondition.notify_all();
+            }
         }
     };
 

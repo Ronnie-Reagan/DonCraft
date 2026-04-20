@@ -1,11 +1,13 @@
 #include "world/material_field.hpp"
 
 #include "core/bit_packer.hpp"
+#include "core/log.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <system_error>
 #include <vector>
 
 namespace df::world
@@ -86,6 +88,7 @@ void MaterialField::Clear()
 
 bool MaterialField::Save(const std::filesystem::path& path) const
 {
+    LogInfo("MaterialField save begin path='", path.string(), "' chunks=", chunks_.size());
     ByteWriter writer;
     writer.WritePod(kMaterialFieldMagic);
     writer.WritePod(kMaterialFieldVersion);
@@ -101,18 +104,32 @@ bool MaterialField::Save(const std::filesystem::path& path) const
 
     if (path.has_parent_path())
     {
-        std::filesystem::create_directories(path.parent_path());
+        std::error_code createError;
+        std::filesystem::create_directories(path.parent_path(), createError);
+        if (createError)
+        {
+            LogError("MaterialField save failed to create directory path='", path.parent_path().string(), "' error='", createError.message(), "'");
+            return false;
+        }
     }
 
     std::ofstream output(path, std::ios::binary);
     if (!output)
     {
+        LogError("MaterialField save failed to open path='", path.string(), "'.");
         return false;
     }
 
     const auto bytes = writer.Span();
     output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return output.good();
+    if (!output.good())
+    {
+        LogError("MaterialField save failed while writing path='", path.string(), "' bytes=", bytes.size());
+        return false;
+    }
+
+    LogInfo("MaterialField save complete path='", path.string(), "' bytes=", bytes.size());
+    return true;
 }
 
 bool MaterialField::Load(const std::filesystem::path& path)
@@ -120,41 +137,61 @@ bool MaterialField::Load(const std::filesystem::path& path)
     std::ifstream input(path, std::ios::binary);
     if (!input)
     {
+        LogWarning("MaterialField load failed to open path='", path.string(), "'.");
         return false;
     }
 
-    const std::vector<char> rawBytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    const auto bytes = std::as_bytes(std::span(rawBytes));
-    ByteReader reader(bytes);
-
-    const std::uint32_t magic = reader.ReadPod<std::uint32_t>();
-    const std::uint32_t version = reader.ReadPod<std::uint32_t>();
-    if (magic != kMaterialFieldMagic || version != kMaterialFieldVersion)
+    try
     {
-        return false;
-    }
+        const std::vector<char> rawBytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        const auto bytes = std::as_bytes(std::span(rawBytes));
+        ByteReader reader(bytes);
 
-    Clear();
-
-    const std::uint32_t chunkCount = reader.ReadPod<std::uint32_t>();
-    for (std::uint32_t chunkIndex = 0; chunkIndex < chunkCount; ++chunkIndex)
-    {
-        ChunkCoord coord{};
-        coord.x = reader.ReadPod<int>();
-        coord.y = reader.ReadPod<int>();
-        coord.z = reader.ReadPod<int>();
-
-        MaterialChunk chunk{};
-        const auto cellBytes = reader.ReadBytes(chunk.cells.size());
-        std::memcpy(chunk.cells.data(), cellBytes.data(), cellBytes.size());
-
-        if (!chunk.Empty())
+        const std::uint32_t magic = reader.ReadPod<std::uint32_t>();
+        const std::uint32_t version = reader.ReadPod<std::uint32_t>();
+        if (magic != kMaterialFieldMagic || version != kMaterialFieldVersion)
         {
-            chunks_.emplace(coord, std::move(chunk));
+            LogWarning(
+                "MaterialField load rejected path='", path.string(),
+                "' magic=0x", std::hex, magic,
+                " version=", std::dec, version);
+            return false;
         }
-    }
 
-    return reader.Empty();
+        Clear();
+
+        const std::uint32_t chunkCount = reader.ReadPod<std::uint32_t>();
+        for (std::uint32_t chunkIndex = 0; chunkIndex < chunkCount; ++chunkIndex)
+        {
+            ChunkCoord coord{};
+            coord.x = reader.ReadPod<int>();
+            coord.y = reader.ReadPod<int>();
+            coord.z = reader.ReadPod<int>();
+
+            MaterialChunk chunk{};
+            const auto cellBytes = reader.ReadBytes(chunk.cells.size());
+            std::memcpy(chunk.cells.data(), cellBytes.data(), cellBytes.size());
+
+            if (!chunk.Empty())
+            {
+                chunks_.emplace(coord, std::move(chunk));
+            }
+        }
+
+        if (!reader.Empty())
+        {
+            LogWarning("MaterialField load left trailing bytes path='", path.string(), "'.");
+            return false;
+        }
+
+        LogInfo("MaterialField load complete path='", path.string(), "' chunks=", chunks_.size());
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        LogError("MaterialField load exception path='", path.string(), "' error='", error.what(), "'");
+        return false;
+    }
 }
 
 ChunkCoord MaterialField::WorldToChunk(const int x, const int y, const int z)

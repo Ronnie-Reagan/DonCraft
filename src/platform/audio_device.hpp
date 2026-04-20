@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL_audio.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -55,5 +56,6 @@ private:
     float engineLoad_ = 0.0f;
     float engineRoughness_ = 0.0f;
     bool engineActive_ = false;
+    std::atomic<bool> shuttingDown_{false};
 };
 }

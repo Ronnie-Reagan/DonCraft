@@ -12,6 +12,8 @@ namespace df::sim
 class VulkanMpm2D
 {
 public:
+int GridWidth() const;
+int GridHeight() const;
     struct Particle
     {
         Vec2 position{};
@@ -19,7 +21,7 @@ public:
         float mass = 1.0f;
     };
 
-    VulkanMpm2D(int gridWidth, int gridHeight, float cellSize, float dt);
+    VulkanMpm2D(int gridWidth, int gridHeight, float cellSize, float dt, bool allowGpuBackend = true);
     ~VulkanMpm2D();
 
     VulkanMpm2D(const VulkanMpm2D&) = delete;

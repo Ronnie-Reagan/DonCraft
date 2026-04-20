@@ -5,6 +5,12 @@
 #include "sim/reference_mpm.hpp"
 
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <sstream>
+#include <thread>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +31,64 @@ namespace df::sim
 {
 namespace
 {
+
+auto EnvFlagEnabled(const char* const name) -> bool
+{
+    const char* const value = std::getenv(name);
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    return value[0] == '1' || value[0] == 'T' || value[0] == 't' || value[0] == 'Y' || value[0] == 'y';
+}
+
+template <typename... Args>
+void EmitImmediateTrace(const char* const scope, const Args&... args)
+{
+    return;
+    static std::atomic<std::uint64_t> sequence{1u};
+
+    std::ostringstream stream;
+    (stream << ... << args);
+    const std::string message = stream.str();
+    const std::uint64_t sequenceId = sequence.fetch_add(1u, std::memory_order_relaxed);
+    const unsigned long long threadId = static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+    std::fprintf(
+        stderr,
+        "[MPM-TRACE][%s][#%llu][tid=%llu] %s\n",
+        scope,
+        static_cast<unsigned long long>(sequenceId),
+        threadId,
+        message.c_str());
+    std::fflush(stderr);
+
+    try
+    {
+        std::ofstream traceFile("doncraft_mpm_trace.log", std::ios::app);
+        if (traceFile)
+        {
+            traceFile
+                << "[MPM-TRACE][" << scope << "][#" << sequenceId << "][tid=" << threadId << "] "
+                << message
+                << '\n';
+            traceFile.flush();
+        }
+    }
+    catch (...)
+    {
+    }
+
+    try
+    {
+        LogInfo("[MPM-TRACE][", scope, "][#", sequenceId, "][tid=", threadId, "] ", message);
+    }
+    catch (...)
+    {
+    }
+}
+
 constexpr std::uint32_t kLocalSize = 64u;
 constexpr float kMassScale = 10000.0f;
 }
@@ -790,16 +854,35 @@ struct VulkanMpm2D::Impl
 
     void Step(const float gravityY)
     {
+        EmitImmediateTrace(
+            "VulkanMpm2D::Impl::Step",
+            "enter available=", available,
+            " backend_name=", activeBackendName,
+            " grid=", gridWidth, "x", gridHeight,
+            " particles=", particles.size(),
+            " gravityY=", gravityY);
+
         if (!available)
         {
+            EmitImmediateTrace("VulkanMpm2D::Impl::Step", "return_not_available");
             return;
         }
 
         const std::uint32_t nodeInvocationCount = static_cast<std::uint32_t>(std::max(gridWidth * gridHeight, 0));
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_ensure_buffers node_invocations=", nodeInvocationCount);
         EnsureBufferCapacity(nodeBuffer, static_cast<VkDeviceSize>(std::max(gridWidth * gridHeight, 1)) * sizeof(GpuNode));
         EnsureBufferCapacity(nodeAccumBuffer, static_cast<VkDeviceSize>(std::max(gridWidth * gridHeight, 1)) * sizeof(GpuNodeAccum));
         EnsureBufferCapacity(statsBuffer, sizeof(GpuStats));
+        EmitImmediateTrace(
+            "VulkanMpm2D::Impl::Step",
+            "after_ensure_buffers particle_capacity=", particleBuffer.capacity,
+            " node_capacity=", nodeBuffer.capacity,
+            " node_accum_capacity=", nodeAccumBuffer.capacity,
+            " stats_capacity=", statsBuffer.capacity);
+
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_upload_particles");
         UploadParticles();
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "after_upload_particles");
 
         const PushConstants pushConstants{
             .gridWidth = gridWidth,
@@ -813,15 +896,24 @@ struct VulkanMpm2D::Impl
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_reset_command_buffer");
         CheckVk(vkResetCommandBuffer(commandBuffer, 0), "Failed to reset the MPM command buffer.");
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_begin_command_buffer");
         CheckVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "Failed to begin the MPM command buffer.");
 
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "dispatch_clear");
         DispatchPipeline(commandBuffer, clearPipeline, pushConstants, nodeInvocationCount);
         AddStorageBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "dispatch_scatter particle_count=", particles.size());
         DispatchPipeline(commandBuffer, scatterPipeline, pushConstants, static_cast<std::uint32_t>(particles.size()));
         AddStorageBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "dispatch_update");
         DispatchPipeline(commandBuffer, updatePipeline, pushConstants, nodeInvocationCount);
         AddStorageBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "dispatch_advect particle_count=", particles.size());
         DispatchPipeline(commandBuffer, advectPipeline, pushConstants, static_cast<std::uint32_t>(particles.size()));
 
         std::array<VkBufferMemoryBarrier, 2> hostBarriers = {{
@@ -858,18 +950,27 @@ struct VulkanMpm2D::Impl
             0,
             nullptr);
 
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_end_command_buffer");
         CheckVk(vkEndCommandBuffer(commandBuffer), "Failed to end the MPM command buffer.");
 
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_queue_submit");
         CheckVk(vkResetFences(device, 1, &fence), "Failed to reset the MPM fence.");
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
         CheckVk(vkQueueSubmit(computeQueue, 1, &submitInfo, fence), "Failed to submit the MPM compute work.");
+
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_wait_for_fence");
         CheckVk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "Failed to wait for the MPM compute work.");
 
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_download_particles");
         DownloadParticles();
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "after_download_particles particles=", particles.size());
+
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "before_download_stats");
         DownloadStats();
+        EmitImmediateTrace("VulkanMpm2D::Impl::Step", "exit total_grid_mass=", totalGridMass);
     }
 
 #endif
@@ -907,14 +1008,36 @@ struct VulkanMpm2D::Impl
 
     void StepWithFallback(const float gravityY)
     {
+        EmitImmediateTrace(
+            "VulkanMpm2D::Impl::StepWithFallback",
+            "enter particles=", particles.size(),
+            " worker_count=", cpuFallbackWorkerCount,
+            " gravityY=", gravityY);
+
         SyncParticlesToCpuFallback();
+        EmitImmediateTrace(
+            "VulkanMpm2D::Impl::StepWithFallback",
+            "after_sync_to_fallback fallback_particles=",
+            cpuFallback != nullptr ? cpuFallback->Particles().size() : 0u);
+
         cpuFallback->Step(gravityY);
+        EmitImmediateTrace(
+            "VulkanMpm2D::Impl::StepWithFallback",
+            "after_fallback_step fallback_particles=",
+            cpuFallback != nullptr ? cpuFallback->Particles().size() : 0u,
+            " fallback_grid_mass=",
+            cpuFallback != nullptr ? cpuFallback->TotalGridMass() : 0.0f);
+
         SyncParticlesFromCpuFallback();
         activeBackendName = "CPU Reference";
+        EmitImmediateTrace(
+            "VulkanMpm2D::Impl::StepWithFallback",
+            "exit particles=", particles.size(),
+            " total_grid_mass=", totalGridMass);
     }
 };
 
-VulkanMpm2D::VulkanMpm2D(const int gridWidth, const int gridHeight, const float cellSize, const float dt)
+VulkanMpm2D::VulkanMpm2D(const int gridWidth, const int gridHeight, const float cellSize, const float dt, const bool allowGpuBackend)
     : impl_(std::make_unique<Impl>(gridWidth, gridHeight, cellSize, dt))
 {
     DF_ASSERT(gridWidth > 1 && gridHeight > 1, "VulkanMpm2D requires at least a 2x2 node grid.");
@@ -924,7 +1047,14 @@ VulkanMpm2D::VulkanMpm2D(const int gridWidth, const int gridHeight, const float 
     impl_->activeBackendName = "CPU Reference";
 
 #if defined(DF_ENABLE_VULKAN_MPM) && DF_ENABLE_VULKAN_MPM
-    impl_->Initialize();
+    if (allowGpuBackend)
+    {
+        impl_->Initialize();
+    }
+    else
+    {
+        impl_->failureMessage = "Vulkan MPM backend disabled for world simulation; using CPU fallback.";
+    }
 #else
     impl_->failureMessage = "DF_ENABLE_VULKAN_MPM is disabled for this build; using CPU fallback.";
     LogWarning(impl_->failureMessage);
@@ -935,13 +1065,28 @@ VulkanMpm2D::~VulkanMpm2D() = default;
 
 void VulkanMpm2D::ClearParticles()
 {
+    EmitImmediateTrace(
+        "VulkanMpm2D::ClearParticles",
+        "before size=", impl_->particles.size(),
+        " total_grid_mass=", impl_->totalGridMass);
     impl_->particles.clear();
     impl_->totalGridMass = 0.0f;
+    EmitImmediateTrace("VulkanMpm2D::ClearParticles", "after size=", impl_->particles.size());
 }
 
 void VulkanMpm2D::AddParticle(const Particle& particle)
 {
     impl_->particles.push_back(particle);
+}
+
+int VulkanMpm2D::GridWidth() const
+{
+    return impl_->gridWidth;
+}
+
+int VulkanMpm2D::GridHeight() const
+{
+    return impl_->gridHeight;
 }
 
 void VulkanMpm2D::SetCpuFallbackWorkerCount(const std::size_t workerCount)
@@ -955,16 +1100,36 @@ void VulkanMpm2D::SetCpuFallbackWorkerCount(const std::size_t workerCount)
 
 void VulkanMpm2D::Step(const float gravityY)
 {
+    EmitImmediateTrace(
+        "VulkanMpm2D::Step",
+        "enter available=", impl_->available,
+        " backend_name=", impl_->activeBackendName,
+        " particles=", impl_->particles.size(),
+        " total_particle_mass=", TotalParticleMass(),
+        " total_grid_mass=", impl_->totalGridMass,
+        " gravityY=", gravityY,
+        " force_cpu=", EnvFlagEnabled("DONCRAFT_MPM_FORCE_CPU_FALLBACK"));
+
 #if defined(DF_ENABLE_VULKAN_MPM) && DF_ENABLE_VULKAN_MPM
-    if (impl_->available)
+    if (impl_->available && !EnvFlagEnabled("DONCRAFT_MPM_FORCE_CPU_FALLBACK"))
     {
+        EmitImmediateTrace("VulkanMpm2D::Step", "dispatch_gpu");
         impl_->Step(gravityY);
         impl_->activeBackendName = "Vulkan Compute";
+        EmitImmediateTrace(
+            "VulkanMpm2D::Step",
+            "return_gpu particles=", impl_->particles.size(),
+            " total_grid_mass=", impl_->totalGridMass);
         return;
     }
 #endif
 
+    EmitImmediateTrace("VulkanMpm2D::Step", "dispatch_cpu_fallback");
     impl_->StepWithFallback(gravityY);
+    EmitImmediateTrace(
+        "VulkanMpm2D::Step",
+        "return_cpu_fallback particles=", impl_->particles.size(),
+        " total_grid_mass=", impl_->totalGridMass);
 }
 
 const std::vector<VulkanMpm2D::Particle>& VulkanMpm2D::Particles() const

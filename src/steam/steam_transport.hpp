@@ -46,12 +46,14 @@ private:
         HSteamNetConnection handle = k_HSteamNetConnection_Invalid;
         net::PeerInfo info{};
         net::ConnectionOrigin origin = net::ConnectionOrigin::Incoming;
+        bool lanesConfigured = false;
     };
 
     void RegisterCallbacks();
     void UnregisterCallbacks();
     void OnConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* callback);
     [[nodiscard]] auto EnsurePeer(HSteamNetConnection handle, net::ConnectionOrigin origin) -> net::PeerId;
+    void ReleaseConnection(HSteamNetConnection handle);
     [[nodiscard]] auto FindConnection(HSteamNetConnection handle) -> Connection*;
     [[nodiscard]] auto FindConnection(HSteamNetConnection handle) const -> const Connection*;
 

@@ -50,6 +50,14 @@ struct RaycastHit
 class DemoWorld
 {
 public:
+    struct CellMaterialEdit
+    {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        MaterialId material = MaterialId::Air;
+    };
+
     DemoWorld();
 
     [[nodiscard]] static auto ClampGenerationSettings(WorldGenerationSettings settings) -> WorldGenerationSettings;
@@ -66,6 +74,7 @@ public:
     [[nodiscard]] bool Load(const std::filesystem::path& path);
     [[nodiscard]] auto CaptureSnapshot() const -> DenseWorldSnapshot;
     [[nodiscard]] bool ApplySnapshot(const DenseWorldSnapshot& snapshot);
+    [[nodiscard]] bool ApplyCellEdits(std::span<const CellMaterialEdit> edits);
 
     [[nodiscard]] auto GenerationSettings() const -> const WorldGenerationSettings&
     {
@@ -98,6 +107,15 @@ public:
         std::span<const render::ColorVertex3D>& opaqueTerrainTriangles,
         std::span<const render::ColorVertex3D>& translucentTerrainTriangles,
         std::vector<render::ColorVertex3D>& debugLines,
+        bool showWireframe,
+        bool showActiveChunks);
+    void GatherRenderGeometrySmoothedCulled(
+        std::vector<render::ColorVertex3D>& opaqueTerrainTriangles,
+        std::vector<render::ColorVertex3D>& translucentTerrainTriangles,
+        std::vector<render::ColorVertex3D>& debugLines,
+        const Mat4& worldToClip,
+        const Vec3& cameraPosition,
+        float maxDistanceMeters,
         bool showWireframe,
         bool showActiveChunks);
 
@@ -145,6 +163,10 @@ public:
     {
         return terrainMeshVersion_;
     }
+    [[nodiscard]] auto TerrainContentVersion() const -> std::uint64_t
+    {
+        return terrainContentVersion_;
+    }
     [[nodiscard]] auto TrackedChunkStateCount() const -> std::size_t
     {
         return chunkRuntimeStates_.size();
@@ -174,6 +196,7 @@ private:
         float activityLifetime = 0.0f;
         std::uint32_t nonAirCellCount = 0u;
         std::uint32_t looseCellCount = 0u;
+        std::uint32_t mpmCellCount = 0u;
         bool meshDirty = true;
         bool meshInitialized = false;
         std::vector<render::ColorVertex3D> opaqueTriangles;
@@ -207,6 +230,7 @@ private:
     void ResizeStorage();
     void RebuildChunkRuntimeState();
     void NoteCellMaterialChange(int x, int y, int z, MaterialId previousMaterial, MaterialId nextMaterial);
+    void NotifyExternalTerrainEdit();
     void TouchChunk(const ChunkCoord& chunk);
     void MarkChunkMeshDirty(const ChunkCoord& chunk);
     void MarkDirtyChunk(const ChunkCoord& chunk);
@@ -288,6 +312,8 @@ private:
     float terrainRebuildInterval_ = 1.0f / 30.0f;
     double lastTerrainRebuildMilliseconds_ = 0.0;
     std::uint64_t terrainMeshVersion_ = 0;
+    std::uint64_t terrainContentVersion_ = 0;
+    int mpmStabilizationTicks_ = 0;
     FrameProfiler* profiler_ = nullptr;
 };
 }

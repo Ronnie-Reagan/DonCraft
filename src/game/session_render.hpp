@@ -12,7 +12,8 @@ struct SessionRenderOptions
     bool showActiveChunks = true;
     bool thirdPerson = false;
     bool aimDownSights = false;
-    float zoomMagnification = 1.0f;
+    float zoomMagnification = 3.5f;
+    float terrainDrawDistanceMeters = 500.0f;
     ToolType localTool = ToolType::Rifle;
     float localWeaponCycle = 0.0f;
 };

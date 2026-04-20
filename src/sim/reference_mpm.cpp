@@ -3,10 +3,70 @@
 #include "core/assert.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <fstream>
+#include <sstream>
+#include <thread>
 #include <cmath>
 
 namespace df::sim
 {
+
+namespace
+{
+auto EnvFlagEnabled(const char* const name) -> bool
+{
+    const char* const value = std::getenv(name);
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    return value[0] == '1' || value[0] == 'T' || value[0] == 't' || value[0] == 'Y' || value[0] == 'y';
+}
+
+template <typename... Args>
+void EmitImmediateTrace(const char* const scope, const Args&... args)
+{
+    return;
+    static std::atomic<std::uint64_t> sequence{1u};
+
+    std::ostringstream stream;
+    (stream << ... << args);
+    const std::string message = stream.str();
+    const std::uint64_t sequenceId = sequence.fetch_add(1u, std::memory_order_relaxed);
+    const unsigned long long threadId = static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+    std::fprintf(
+        stderr,
+        "[MPM-TRACE][%s][#%llu][tid=%llu] %s\n",
+        scope,
+        static_cast<unsigned long long>(sequenceId),
+        threadId,
+        message.c_str());
+    std::fflush(stderr);
+
+    try
+    {
+        std::ofstream traceFile("doncraft_mpm_trace.log", std::ios::app);
+        if (traceFile)
+        {
+            traceFile
+                << "[MPM-TRACE][" << scope << "][#" << sequenceId << "][tid=" << threadId << "] "
+                << message
+                << '\n';
+            traceFile.flush();
+        }
+    }
+    catch (...)
+    {
+    }
+}
+}
+
 ReferenceMpm2D::ReferenceMpm2D(const int gridWidth, const int gridHeight, const float cellSize, const float dt)
     : gridWidth_(gridWidth)
     , gridHeight_(gridHeight)
@@ -33,15 +93,38 @@ void ReferenceMpm2D::AddParticle(const Particle& particle)
 
 void ReferenceMpm2D::SetWorkerCount(const std::size_t workerCount)
 {
-    workerCount_ = std::max<std::size_t>(1, workerCount);
+    const std::size_t resolvedWorkerCount = std::max<std::size_t>(1, workerCount);
+    if (jobs_ != nullptr && workerCount_ == resolvedWorkerCount)
+    {
+        return;
+    }
+
+    if (jobs_ != nullptr)
+    {
+        jobs_->WaitIdle();
+    }
+
+    workerCount_ = resolvedWorkerCount;
     jobs_ = std::make_unique<JobSystem>(workerCount_);
 }
 
 void ReferenceMpm2D::Step(const float gravityY)
 {
-    if (particles_.size() < 256 || workerCount_ <= 1 || jobs_ == nullptr)
+    const bool forceSerial = EnvFlagEnabled("DONCRAFT_MPM_FORCE_SERIAL_CPU");
+    EmitImmediateTrace(
+        "ReferenceMpm2D::Step",
+        "enter particles=", particles_.size(),
+        " worker_count=", workerCount_,
+        " jobs_ptr=", static_cast<const void*>(jobs_.get()),
+        " grid=", gridWidth_, "x", gridHeight_,
+        " gravityY=", gravityY,
+        " force_serial=", forceSerial);
+
+    if (forceSerial || particles_.size() < 256 || workerCount_ <= 1 || jobs_ == nullptr)
     {
+        EmitImmediateTrace("ReferenceMpm2D::Step", "dispatch_serial");
         StepSerial(gravityY);
+        EmitImmediateTrace("ReferenceMpm2D::Step", "return_serial total_grid_mass=", TotalGridMass());
         return;
     }
 
@@ -50,6 +133,13 @@ void ReferenceMpm2D::Step(const float gravityY)
     const std::size_t taskCount = std::min<std::size_t>(std::max<std::size_t>(1, workerCount_), particleCount);
     const std::size_t particleTaskGrain = std::max<std::size_t>(1, (particleCount + taskCount - 1) / taskCount);
 
+    EmitImmediateTrace(
+        "ReferenceMpm2D::Step",
+        "dispatch_parallel particle_count=", particleCount,
+        " node_count=", nodeCount,
+        " task_count=", taskCount,
+        " particle_task_grain=", particleTaskGrain);
+
     for (GridNode& node : grid_)
     {
         node.mass = 0.0f;
@@ -57,6 +147,7 @@ void ReferenceMpm2D::Step(const float gravityY)
     }
 
     std::vector<std::vector<GridNode>> localGrids(taskCount, std::vector<GridNode>(nodeCount));
+    EmitImmediateTrace("ReferenceMpm2D::Step", "before_parallel_scatter");
     jobs_->ParallelFor(taskCount, 1, [&](const std::size_t taskBegin, const std::size_t taskEnd)
     {
         for (std::size_t taskIndex = taskBegin; taskIndex < taskEnd; ++taskIndex)
@@ -89,8 +180,10 @@ void ReferenceMpm2D::Step(const float gravityY)
             }
         }
     });
+    EmitImmediateTrace("ReferenceMpm2D::Step", "after_parallel_scatter");
 
     const std::size_t nodeGrain = std::max<std::size_t>(64, nodeCount / std::max<std::size_t>(1, workerCount_ * 4));
+    EmitImmediateTrace("ReferenceMpm2D::Step", "before_parallel_reduce node_grain=", nodeGrain);
     jobs_->ParallelFor(nodeCount, nodeGrain, [&](const std::size_t begin, const std::size_t end)
     {
         for (std::size_t nodeIndex = begin; nodeIndex < end; ++nodeIndex)
@@ -104,7 +197,9 @@ void ReferenceMpm2D::Step(const float gravityY)
             grid_[nodeIndex] = reduced;
         }
     });
+    EmitImmediateTrace("ReferenceMpm2D::Step", "after_parallel_reduce");
 
+    EmitImmediateTrace("ReferenceMpm2D::Step", "before_parallel_node_update");
     jobs_->ParallelFor(nodeCount, nodeGrain, [&](const std::size_t begin, const std::size_t end)
     {
         for (std::size_t nodeIndex = begin; nodeIndex < end; ++nodeIndex)
@@ -130,10 +225,12 @@ void ReferenceMpm2D::Step(const float gravityY)
             }
         }
     });
+    EmitImmediateTrace("ReferenceMpm2D::Step", "after_parallel_node_update");
 
     const float maxX = static_cast<float>(gridWidth_ - 1) * cellSize_;
     const float maxY = static_cast<float>(gridHeight_ - 1) * cellSize_;
     const std::size_t particleGrain = std::max<std::size_t>(64, particleCount / std::max<std::size_t>(1, workerCount_ * 4));
+    EmitImmediateTrace("ReferenceMpm2D::Step", "before_parallel_advect particle_grain=", particleGrain);
     jobs_->ParallelFor(particleCount, particleGrain, [&](const std::size_t begin, const std::size_t end)
     {
         for (std::size_t particleIndex = begin; particleIndex < end; ++particleIndex)
@@ -165,10 +262,19 @@ void ReferenceMpm2D::Step(const float gravityY)
             particle.position.y = Clamp(particle.position.y, 0.0f, maxY);
         }
     });
+    EmitImmediateTrace("ReferenceMpm2D::Step", "after_parallel_advect");
+
+    EmitImmediateTrace("ReferenceMpm2D::Step", "exit_parallel total_grid_mass=", TotalGridMass());
 }
 
 void ReferenceMpm2D::StepSerial(const float gravityY)
 {
+    EmitImmediateTrace(
+        "ReferenceMpm2D::StepSerial",
+        "enter particles=", particles_.size(),
+        " grid=", gridWidth_, "x", gridHeight_,
+        " gravityY=", gravityY);
+
     for (GridNode& node : grid_)
     {
         node.mass = 0.0f;
@@ -253,6 +359,8 @@ void ReferenceMpm2D::StepSerial(const float gravityY)
         particle.position.x = Clamp(particle.position.x, 0.0f, maxX);
         particle.position.y = Clamp(particle.position.y, 0.0f, maxY);
     }
+
+    EmitImmediateTrace("ReferenceMpm2D::StepSerial", "exit total_grid_mass=", TotalGridMass());
 }
 
 float ReferenceMpm2D::TotalParticleMass() const

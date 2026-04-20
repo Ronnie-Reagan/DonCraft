@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -22,8 +23,8 @@ namespace df
 {
 namespace
 {
-constexpr float kRifleWeaponCycleDecayRate = 6.5f;
-constexpr float kDigWeaponCycleDecayRate = 2.1f;
+constexpr float kMinimumRenderDistanceMeters = 100.0f;
+constexpr float kMaximumRenderDistanceMeters = 5000.0f;
 
 auto FormatFloat(const float value, const int decimals = 1) -> std::string
 {
@@ -32,9 +33,53 @@ auto FormatFloat(const float value, const int decimals = 1) -> std::string
     return buffer;
 }
 
+auto ParseUint64OrZero(const std::string_view text) -> std::uint64_t
+{
+    std::uint64_t value = 0u;
+    const auto [ptr, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || ptr != text.data() + text.size())
+    {
+        return 0u;
+    }
+    return value;
+}
+
 auto LocalWeaponCycleDecayRate(const game::ToolType tool) -> float
 {
-    return tool == game::ToolType::Dig ? kDigWeaponCycleDecayRate : kRifleWeaponCycleDecayRate;
+    return game::GetWeaponDefinition(tool).weaponCycleDecayRate;
+}
+
+auto ClampRenderDistanceMeters(const float meters) -> float
+{
+    return Clamp(meters, kMinimumRenderDistanceMeters, kMaximumRenderDistanceMeters);
+}
+
+auto FindActorSnapshot(const net::ActorSnapshotFrame& frame, const game::PlayerId playerId) -> const net::ActorSnapshot*
+{
+    for (const net::ActorSnapshot& actor : frame.players)
+    {
+        if (actor.id == playerId)
+        {
+            return &actor;
+        }
+    }
+
+    return nullptr;
+}
+
+void AppendHolosightReticle(
+    std::vector<render::ColorVertex2D>& triangles,
+    const float screenWidth,
+    const float screenHeight)
+{
+    const float centerX = screenWidth * 0.5f;
+    const float centerY = screenHeight * 0.5f;
+    const Vec4 dotColor = MakeColor(0.94f, 0.22f, 0.18f, 0.92f);
+    game::AppendRect(triangles, centerX - 2.0f, centerY - 2.0f, 4.0f, 4.0f, dotColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX - 8.0f, centerY - 0.5f, 5.0f, 1.0f, dotColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX + 3.0f, centerY - 0.5f, 5.0f, 1.0f, dotColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX - 0.5f, centerY - 8.0f, 1.0f, 5.0f, dotColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX - 0.5f, centerY + 3.0f, 1.0f, 5.0f, dotColor, screenWidth, screenHeight);
 }
 
 auto BuildEmptyRenderData(const int viewportWidth, const int viewportHeight) -> render::FrameRenderData
@@ -68,6 +113,34 @@ auto HoveredMenuRow(
 
     const int rowIndex = static_cast<int>((input.mouseY - (rowStartY - 4.0f)) / rowHeight);
     return rowIndex >= 0 && rowIndex < rowCount ? rowIndex : -1;
+}
+
+void AppendScopeOverlay(
+    std::vector<render::ColorVertex2D>& triangles,
+    const render::FrameRenderData::ScopedView& scopedView,
+    const float screenWidth,
+    const float screenHeight)
+{
+    if (!scopedView.enabled || scopedView.viewportWidth <= 0 || scopedView.viewportHeight <= 0)
+    {
+        return;
+    }
+
+    const float x = static_cast<float>(scopedView.viewportX);
+    const float y = static_cast<float>(scopedView.viewportY);
+    const float width = static_cast<float>(scopedView.viewportWidth);
+    const float height = static_cast<float>(scopedView.viewportHeight);
+    const float centerX = x + width * 0.5f;
+    const float centerY = y + height * 0.5f;
+    const float lineThickness = std::clamp(std::min(width, height) * 0.012f, 1.5f, 3.0f);
+    const float segmentLength = std::clamp(std::min(width, height) * 0.18f, 10.0f, 18.0f);
+    const float gap = std::clamp(std::min(width, height) * 0.065f, 5.0f, 9.0f);
+    const Vec4 reticleColor = MakeColor(0.96f, 0.14f, 0.14f, 0.84f);
+    game::AppendRect(triangles, centerX - lineThickness * 0.5f, centerY - gap - segmentLength, lineThickness, segmentLength, reticleColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX - lineThickness * 0.5f, centerY + gap, lineThickness, segmentLength, reticleColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX - gap - segmentLength, centerY - lineThickness * 0.5f, segmentLength, lineThickness, reticleColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX + gap, centerY - lineThickness * 0.5f, segmentLength, lineThickness, reticleColor, screenWidth, screenHeight);
+    game::AppendRect(triangles, centerX - lineThickness * 0.5f, centerY - lineThickness * 0.5f, lineThickness, lineThickness, reticleColor, screenWidth, screenHeight);
 }
 }
 
@@ -312,7 +385,7 @@ void Application::TickSimulation(const double dt)
 
     if (hostSessionActive_ && (activeSessionState == ScreenState::OfflineSession || activeSessionState == ScreenState::ListenSession))
     {
-        hostSession_.MutableRuntime().SubmitCommand(localPlayerId_, ConsumeLocalCommandForTick());
+        static_cast<void>(hostSession_.MutableRuntime().SubmitCommand(localPlayerId_, ConsumeLocalCommandForTick()));
         if (!(activeSessionState == ScreenState::OfflineSession && sessionMenuOpen_))
         {
             hostSession_.Tick(static_cast<float>(dt));
@@ -333,6 +406,14 @@ void Application::TickSimulation(const double dt)
         {
             statusText_ = clientSession_.SessionName();
         }
+        else if (clientSession_.HasServerConnection())
+        {
+            statusText_ = "SYNCING WORLD";
+        }
+        else
+        {
+            statusText_ = "CONNECTING TO HOST";
+        }
         return;
     }
 
@@ -347,12 +428,25 @@ void Application::HandleSteamEvents()
         {
         case steam::SteamClientContext::Event::Type::LobbyCreated:
             statusText_ = "LISTEN LOBBY CREATED";
-            (void)steam_.SetCurrentLobbyData("df_world_width", std::to_string(pendingWorldSettings_.worldWidth));
-            (void)steam_.SetCurrentLobbyData("df_world_height", std::to_string(pendingWorldSettings_.worldHeight));
-            (void)steam_.SetCurrentLobbyData("df_world_depth", std::to_string(pendingWorldSettings_.worldDepth));
+            (void)steam_.SetCurrentLobbyData(steam::SteamClientContext::kLobbyWorldWidthKey, std::to_string(pendingWorldSettings_.worldWidth));
+            (void)steam_.SetCurrentLobbyData(steam::SteamClientContext::kLobbyWorldHeightKey, std::to_string(pendingWorldSettings_.worldHeight));
+            (void)steam_.SetCurrentLobbyData(steam::SteamClientContext::kLobbyWorldDepthKey, std::to_string(pendingWorldSettings_.worldDepth));
+            (void)steam_.SetCurrentLobbyData(steam::SteamClientContext::kLobbyHostSteamIdKey, std::to_string(steam_.LocalSteamId()));
+            (void)steam_.SetCurrentLobbyData(steam::SteamClientContext::kLobbyHostReadyKey, "1");
+            (void)steam_.SetCurrentLobbyData(steam::SteamClientContext::kLobbyVirtualPortKey, "0");
             break;
         case steam::SteamClientContext::Event::Type::LobbyJoined:
-            statusText_ = "LOBBY JOINED";
+            if (pendingListenJoin_.has_value() && pendingListenJoin_->lobbyId == event.lobbyId)
+            {
+                CompletePendingListenJoin();
+            }
+            else
+            {
+                statusText_ = "LOBBY JOINED";
+            }
+            break;
+        case steam::SteamClientContext::Event::Type::LobbyJoinRequested:
+            QueueListenJoin(event.lobbyId, 0u, "Steam Invite", "JOINING STEAM INVITE");
             break;
         case steam::SteamClientContext::Event::Type::BrowserUpdated:
             statusText_ = "BROWSER REFRESHED";
@@ -362,6 +456,10 @@ void Application::HandleSteamEvents()
             }
             break;
         case steam::SteamClientContext::Event::Type::Error:
+            if (pendingListenJoin_.has_value())
+            {
+                pendingListenJoin_.reset();
+            }
             statusText_ = event.text;
             break;
         default:
@@ -393,6 +491,10 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
     {
         selectedTool_ = game::ToolType::Dig;
     }
+    if (input.KeyPressed(SDL_SCANCODE_4))
+    {
+        selectedTool_ = game::ToolType::Smg;
+    }
     if (input.KeyPressed(SDL_SCANCODE_F2))
     {
         renderOptions_.showActiveChunks = !renderOptions_.showActiveChunks;
@@ -405,11 +507,15 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
     {
         renderOptions_.thirdPerson = !renderOptions_.thirdPerson;
     }
-    if (selectedTool_ == game::ToolType::Rifle &&
+    const game::WeaponDefinition selectedWeapon = game::GetWeaponDefinition(selectedTool_);
+    if (selectedWeapon.usesScope &&
         (input.KeyDown(SDL_SCANCODE_LCTRL) || input.KeyDown(SDL_SCANCODE_RCTRL)) &&
         std::abs(input.mouseWheelY) > 0.0f)
     {
-        renderOptions_.zoomMagnification = Clamp(renderOptions_.zoomMagnification + input.mouseWheelY * 0.25f, 1.0f, 6.0f);
+        renderOptions_.zoomMagnification = Clamp(
+            renderOptions_.zoomMagnification + input.mouseWheelY * 0.25f,
+            selectedWeapon.minimumZoomMagnification,
+            selectedWeapon.maximumZoomMagnification);
     }
 
     localCommand_.selectedTool = selectedTool_;
@@ -419,7 +525,7 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
     localCommand_.control.moveRight = input.KeyDown(SDL_SCANCODE_D);
     localCommand_.control.sprint = input.KeyDown(SDL_SCANCODE_LSHIFT) || input.KeyDown(SDL_SCANCODE_RSHIFT);
     localCommand_.primaryDown = input.MouseDown(SDL_BUTTON_LEFT);
-    localCommand_.secondaryDown = input.MouseDown(SDL_BUTTON_RIGHT) && selectedTool_ == game::ToolType::Rifle;
+    localCommand_.secondaryDown = input.MouseDown(SDL_BUTTON_RIGHT) && selectedWeapon.supportsAds;
     renderOptions_.aimDownSights = localCommand_.secondaryDown;
     renderOptions_.localTool = selectedTool_;
 
@@ -429,11 +535,12 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
     pendingPrimaryPressed_ = pendingPrimaryPressed_ || input.MousePressed(SDL_BUTTON_LEFT);
     pendingQuickGrenadePressed_ = pendingQuickGrenadePressed_ || input.KeyPressed(SDL_SCANCODE_G);
     pendingInteractPressed_ = pendingInteractPressed_ || input.KeyPressed(SDL_SCANCODE_E);
+    pendingReloadPressed_ = pendingReloadPressed_ || input.KeyPressed(SDL_SCANCODE_R);
     localWeaponCycle_ = std::max(0.0f, localWeaponCycle_ - frameDeltaSeconds_ * LocalWeaponCycleDecayRate(selectedTool_));
     const bool repeatingToolAction =
         localCommand_.primaryDown &&
         localWeaponCycle_ <= 0.02f &&
-        (selectedTool_ == game::ToolType::Rifle || selectedTool_ == game::ToolType::Dig);
+        (selectedTool_ == game::ToolType::Dig || (game::IsFirearmTool(selectedTool_) && selectedWeapon.automatic));
     if (pendingPrimaryPressed_ || pendingQuickGrenadePressed_ || repeatingToolAction)
     {
         localWeaponCycle_ = 1.0f;
@@ -451,6 +558,7 @@ auto Application::ConsumeLocalCommandForTick() -> game::PlayerCommandFrame
     command.primaryPressed = pendingPrimaryPressed_;
     command.quickGrenadePressed = pendingQuickGrenadePressed_;
     command.interactPressed = pendingInteractPressed_;
+    command.reloadPressed = pendingReloadPressed_;
 
     pendingLookYawDelta_ = 0.0f;
     pendingLookPitchDelta_ = 0.0f;
@@ -458,6 +566,7 @@ auto Application::ConsumeLocalCommandForTick() -> game::PlayerCommandFrame
     pendingPrimaryPressed_ = false;
     pendingQuickGrenadePressed_ = false;
     pendingInteractPressed_ = false;
+    pendingReloadPressed_ = false;
     return command;
 }
 
@@ -470,13 +579,14 @@ void Application::ClearLocalCommandState()
     pendingPrimaryPressed_ = false;
     pendingQuickGrenadePressed_ = false;
     pendingInteractPressed_ = false;
+    pendingReloadPressed_ = false;
     renderOptions_.aimDownSights = false;
     renderOptions_.localTool = selectedTool_;
     localWeaponCycle_ = std::max(0.0f, localWeaponCycle_ - frameDeltaSeconds_ * LocalWeaponCycleDecayRate(selectedTool_));
     renderOptions_.localWeaponCycle = localWeaponCycle_;
 }
 
-void Application::StartOfflineSession()
+void Application::ResetActiveSessions()
 {
     if (clientSessionActive_)
     {
@@ -488,6 +598,110 @@ void Application::StartOfflineSession()
         hostSession_.Shutdown();
         hostSessionActive_ = false;
     }
+    pendingListenJoin_.reset();
+}
+
+void Application::QueueListenJoin(
+    const std::uint64_t lobbyId,
+    const std::uint64_t hostSteamIdFallback,
+    const std::string_view sessionName,
+    const std::string_view statusText)
+{
+    if (lobbyId == 0u)
+    {
+        statusText_ = "LISTEN JOIN FAILED";
+        return;
+    }
+
+    ResetActiveSessions();
+    steam_.LeaveLobby();
+    pendingListenJoin_ = PendingListenJoin{
+        .lobbyId = lobbyId,
+        .hostSteamIdFallback = hostSteamIdFallback,
+        .sessionName = std::string(sessionName),
+    };
+    screenState_ = ScreenState::MainMenu;
+    browserReturnState_.reset();
+    sessionMenuOpen_ = false;
+    sessionMenuSelection_ = 0;
+    sessionMenuDragItem_ = -1;
+    LogInfo(
+        "Application queued listen join lobby_id=", lobbyId,
+        " host_fallback=", hostSteamIdFallback,
+        " session='", sessionName, "'");
+    steam_.JoinLobby(lobbyId);
+    statusText_ = std::string(statusText);
+}
+
+bool Application::StartClientSessionWithTransport(std::unique_ptr<steam::SteamSocketsTransport> transport, const std::string_view statusText)
+{
+    if (transport == nullptr)
+    {
+        return false;
+    }
+
+    clientSession_.Initialize({playerName_}, std::move(transport));
+    clientSessionActive_ = true;
+    hostSessionActive_ = false;
+    sessionMenuOpen_ = false;
+    sessionMenuSelection_ = 0;
+    sessionMenuDragItem_ = -1;
+    screenState_ = ScreenState::ClientSession;
+    browserReturnState_.reset();
+    renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
+    localWeaponCycle_ = 0.0f;
+    ClearLocalCommandState();
+    statusText_ = std::string(statusText);
+    return true;
+}
+
+void Application::CompletePendingListenJoin()
+{
+    if (!pendingListenJoin_.has_value())
+    {
+        return;
+    }
+
+    const PendingListenJoin pending = *pendingListenJoin_;
+    std::uint64_t hostSteamId = ParseUint64OrZero(steam_.CurrentLobbyData(steam::SteamClientContext::kLobbyHostSteamIdKey));
+    if (hostSteamId == 0u)
+    {
+        hostSteamId = steam_.CurrentLobbyOwnerSteamId();
+    }
+    if (hostSteamId == 0u)
+    {
+        hostSteamId = pending.hostSteamIdFallback;
+    }
+
+    const bool hostReady = steam_.CurrentLobbyData(steam::SteamClientContext::kLobbyHostReadyKey) != "0";
+    if (hostSteamId == 0u || !hostReady)
+    {
+        LogWarning(
+            "Listen join could not resolve a valid host from lobby_id=", pending.lobbyId,
+            " host_ready=", hostReady ? "yes" : "no");
+        pendingListenJoin_.reset();
+        steam_.LeaveLobby();
+        statusText_ = "LISTEN JOIN FAILED";
+        return;
+    }
+
+    auto transport = std::make_unique<steam::SteamSocketsTransport>(SteamNetworkingSockets(), false);
+    if (!transport->ConnectP2P(hostSteamId, 0))
+    {
+        LogError("Listen join failed to connect to host steam_id=", hostSteamId, " lobby_id=", pending.lobbyId);
+        pendingListenJoin_.reset();
+        steam_.LeaveLobby();
+        statusText_ = "LISTEN CONNECT FAILED";
+        return;
+    }
+
+    pendingListenJoin_.reset();
+    (void)StartClientSessionWithTransport(std::move(transport), "CONNECTING TO LISTEN HOST");
+}
+
+void Application::StartOfflineSession()
+{
+    ResetActiveSessions();
     steam_.LeaveLobby();
 
     net::SessionHost::Config config{};
@@ -497,7 +711,16 @@ void Application::StartOfflineSession()
     config.runtime.generationSettings = pendingWorldSettings_;
     config.localHostPlayerId = localPlayerId_;
     config.localHostPlayerName = playerName_;
-    hostSession_.Initialize(config, nullptr);
+    try
+    {
+        hostSession_.Initialize(config, nullptr);
+    }
+    catch (const std::exception& error)
+    {
+        LogError("Offline session startup failed: ", error.what());
+        statusText_ = std::string("WORLD LOAD FAILED: ") + error.what();
+        return;
+    }
     hostSessionActive_ = true;
     clientSessionActive_ = false;
     sessionMenuOpen_ = false;
@@ -505,7 +728,7 @@ void Application::StartOfflineSession()
     sessionMenuDragItem_ = -1;
     screenState_ = ScreenState::OfflineSession;
     pendingWorldSettings_ = hostSession_.MutableRuntime().World().GenerationSettings();
-    renderOptions_.zoomMagnification = 1.0f;
+    renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
     ClearLocalCommandState();
     statusText_ = "OFFLINE SESSION";
@@ -513,16 +736,7 @@ void Application::StartOfflineSession()
 
 void Application::StartListenSession()
 {
-    if (clientSessionActive_)
-    {
-        clientSession_.Shutdown();
-        clientSessionActive_ = false;
-    }
-    if (hostSessionActive_)
-    {
-        hostSession_.Shutdown();
-        hostSessionActive_ = false;
-    }
+    ResetActiveSessions();
     steam_.LeaveLobby();
 
     auto transport = std::make_unique<steam::SteamSocketsTransport>(SteamNetworkingSockets(), false);
@@ -539,7 +753,16 @@ void Application::StartListenSession()
     config.runtime.generationSettings = pendingWorldSettings_;
     config.localHostPlayerId = localPlayerId_;
     config.localHostPlayerName = playerName_;
-    hostSession_.Initialize(config, std::move(transport));
+    try
+    {
+        hostSession_.Initialize(config, std::move(transport));
+    }
+    catch (const std::exception& error)
+    {
+        LogError("Listen session startup failed: ", error.what());
+        statusText_ = std::string("WORLD LOAD FAILED: ") + error.what();
+        return;
+    }
     hostSessionActive_ = true;
     clientSessionActive_ = false;
     sessionMenuOpen_ = false;
@@ -547,7 +770,7 @@ void Application::StartListenSession()
     sessionMenuDragItem_ = -1;
     screenState_ = ScreenState::ListenSession;
     pendingWorldSettings_ = hostSession_.MutableRuntime().World().GenerationSettings();
-    renderOptions_.zoomMagnification = 1.0f;
+    renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
     ClearLocalCommandState();
     steam_.CreateLobby(config.runtime.sessionName, "SELF HOSTED WORLD", config.runtime.maxPlayers);
@@ -562,72 +785,41 @@ void Application::JoinBrowserEntry(const std::size_t index)
         return;
     }
 
-    if (clientSessionActive_)
-    {
-        clientSession_.Shutdown();
-        clientSessionActive_ = false;
-    }
-    if (hostSessionActive_)
-    {
-        hostSession_.Shutdown();
-        hostSessionActive_ = false;
-    }
-    steam_.LeaveLobby();
-
-    auto transport = std::make_unique<steam::SteamSocketsTransport>(SteamNetworkingSockets(), false);
-    bool connected = false;
-    if (entries[index].type == net::BrowserEntryType::ListenHost)
-    {
-        connected = transport->ConnectP2P(entries[index].ownerSteamId, 0);
-        if (entries[index].lobbyId != 0)
-        {
-            steam_.JoinLobby(entries[index].lobbyId);
-        }
-    }
-    else
-    {
-        connected = transport->ConnectIp(entries[index].address, entries[index].port);
-    }
-
-    if (!connected)
+    const net::SessionBrowserEntry& entry = entries[index];
+    if (!entry.joinable)
     {
         statusText_ = "JOIN FAILED";
         return;
     }
 
-    clientSession_.Initialize({playerName_}, std::move(transport));
-    clientSessionActive_ = true;
-    hostSessionActive_ = false;
-    sessionMenuOpen_ = false;
-    sessionMenuSelection_ = 0;
-    sessionMenuDragItem_ = -1;
-    screenState_ = ScreenState::ClientSession;
-    browserReturnState_.reset();
-    renderOptions_.zoomMagnification = 1.0f;
-    localWeaponCycle_ = 0.0f;
-    ClearLocalCommandState();
-    statusText_ = "CONNECTING";
+    if (entry.type == net::BrowserEntryType::ListenHost)
+    {
+        QueueListenJoin(entry.lobbyId, entry.ownerSteamId, entry.name, "JOINING LISTEN LOBBY");
+        return;
+    }
+
+    ResetActiveSessions();
+    steam_.LeaveLobby();
+    auto transport = std::make_unique<steam::SteamSocketsTransport>(SteamNetworkingSockets(), false);
+    if (!transport->ConnectIp(entry.address, entry.port))
+    {
+        statusText_ = "JOIN FAILED";
+        return;
+    }
+
+    (void)StartClientSessionWithTransport(std::move(transport), "CONNECTING");
 }
 
 void Application::DisconnectToMenu(const std::string_view statusText)
 {
-    if (clientSessionActive_)
-    {
-        clientSession_.Shutdown();
-    }
-    if (hostSessionActive_)
-    {
-        hostSession_.Shutdown();
-    }
-    clientSessionActive_ = false;
-    hostSessionActive_ = false;
+    ResetActiveSessions();
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
     sessionMenuDragItem_ = -1;
     steam_.LeaveLobby();
     browserReturnState_.reset();
     platform_->SetRelativeMouseMode(false);
-    renderOptions_.zoomMagnification = 1.0f;
+    renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
     ClearLocalCommandState();
     screenState_ = ScreenState::MainMenu;
@@ -655,7 +847,7 @@ void Application::BuildOverlay(render::FrameRenderData& renderData, const platfo
     const float screenWidth = static_cast<float>(width);
     const float screenHeight = static_cast<float>(height);
 
-    game::AppendRect(renderData.overlayTriangles, 16.0f, 16.0f, 520.0f, 172.0f, MakeColor(0.05f, 0.06f, 0.08f, 0.72f), screenWidth, screenHeight);
+    game::AppendRect(renderData.overlayTriangles, 16.0f, 16.0f, 540.0f, 210.0f, MakeColor(0.05f, 0.06f, 0.08f, 0.72f), screenWidth, screenHeight);
     game::AppendText(renderData.overlayTriangles, 28.0f, 28.0f, 2.0f, std::string("FPS ") + FormatFloat(smoothedFps_), MakeColor(0.96f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
     game::AppendText(renderData.overlayTriangles, 28.0f, 46.0f, 2.0f, std::string("FRAME ") + FormatFloat(frameDeltaSeconds_ * 1000.0f) + " MS", MakeColor(0.83f, 0.90f, 0.97f, 1.0f), screenWidth, screenHeight);
     game::AppendText(renderData.overlayTriangles, 28.0f, 64.0f, 2.0f, std::string("PLAYER ") + playerName_, MakeColor(0.92f, 0.95f, 0.99f, 1.0f), screenWidth, screenHeight);
@@ -677,8 +869,9 @@ void Application::BuildOverlay(render::FrameRenderData& renderData, const platfo
             screenWidth,
             screenHeight);
     }
+    const game::WeaponDefinition selectedWeapon = game::GetWeaponDefinition(selectedTool_);
     if ((screenState_ == ScreenState::OfflineSession || screenState_ == ScreenState::ListenSession || screenState_ == ScreenState::ClientSession) &&
-        selectedTool_ == game::ToolType::Rifle)
+        selectedWeapon.usesScope)
     {
         game::AppendText(
             renderData.overlayTriangles,
@@ -689,6 +882,96 @@ void Application::BuildOverlay(render::FrameRenderData& renderData, const platfo
             renderOptions_.aimDownSights ? MakeColor(0.98f, 0.95f, 0.66f, 1.0f) : MakeColor(0.80f, 0.86f, 0.92f, 1.0f),
             screenWidth,
             screenHeight);
+    }
+    if (screenState_ == ScreenState::OfflineSession || screenState_ == ScreenState::ListenSession || screenState_ == ScreenState::ClientSession)
+    {
+        game::ToolType hudTool = selectedTool_;
+        int ammoInMagazine = -1;
+        int reserveAmmo = -1;
+        bool reloading = false;
+        float reloadRemaining = 0.0f;
+        float reloadTotal = 0.0f;
+
+        if (hostSessionActive_)
+        {
+            if (const game::SessionRuntime::PlayerState* const player = hostSession_.Runtime().FindPlayer(localPlayerId_))
+            {
+                hudTool = player->tool;
+                const auto& inventory = player->weaponInventories[game::ToToolIndex(player->tool)];
+                ammoInMagazine = inventory.ammoInMagazine;
+                reserveAmmo = inventory.reserveAmmo;
+                reloading = player->reloading;
+                reloadRemaining = player->reloadTimer;
+                reloadTotal = player->reloadDuration;
+            }
+        }
+        else if (clientSessionActive_)
+        {
+            const net::ActorSnapshotFrame hudFrame =
+                clientSession_.BuildRenderActorFrame(static_cast<float>(fixedStepClock_.InterpolationAlpha()));
+            if (const net::ActorSnapshot* const actor = FindActorSnapshot(hudFrame, localPlayerId_))
+            {
+                hudTool = actor->tool;
+                ammoInMagazine = actor->ammoInMagazine;
+                reserveAmmo = actor->reserveAmmo;
+                reloading = actor->reloading;
+                reloadRemaining = actor->reloadSecondsRemaining;
+                reloadTotal = actor->reloadSecondsTotal;
+            }
+        }
+
+        const game::WeaponDefinition hudWeapon = game::GetWeaponDefinition(hudTool);
+        game::AppendText(
+            renderData.overlayTriangles,
+            28.0f,
+            136.0f,
+            2.0f,
+            std::string("TOOL ") + std::string(hudWeapon.name) + "  DRAW " + FormatFloat(renderOptions_.terrainDrawDistanceMeters, 0) + "M",
+            MakeColor(0.84f, 0.90f, 0.96f, 1.0f),
+            screenWidth,
+            screenHeight);
+
+        if (hudWeapon.usesMagazine && ammoInMagazine >= 0)
+        {
+            const float panelWidth = 250.0f;
+            const float panelHeight = reloading ? 94.0f : 74.0f;
+            const float panelX = screenWidth - panelWidth - 22.0f;
+            const float panelY = screenHeight - panelHeight - 22.0f;
+            game::AppendRect(renderData.overlayTriangles, panelX, panelY, panelWidth, panelHeight, MakeColor(0.04f, 0.05f, 0.07f, 0.80f), screenWidth, screenHeight);
+            game::AppendText(
+                renderData.overlayTriangles,
+                panelX + 16.0f,
+                panelY + 14.0f,
+                1.9f,
+                std::string(hudWeapon.name),
+                MakeColor(0.94f, 0.97f, 1.0f, 1.0f),
+                screenWidth,
+                screenHeight);
+            game::AppendText(
+                renderData.overlayTriangles,
+                panelX + 16.0f,
+                panelY + 36.0f,
+                2.2f,
+                std::string("AMMO ") + std::to_string(ammoInMagazine) + " / " + std::to_string(reserveAmmo),
+                ammoInMagazine > 0 ? MakeColor(1.0f, 0.95f, 0.72f, 1.0f) : MakeColor(0.98f, 0.42f, 0.32f, 1.0f),
+                screenWidth,
+                screenHeight);
+            game::AppendText(
+                renderData.overlayTriangles,
+                panelX + 16.0f,
+                panelY + 56.0f,
+                1.7f,
+                reloading ? "RELOADING" : "R RELOAD",
+                MakeColor(0.78f, 0.85f, 0.92f, 1.0f),
+                screenWidth,
+                screenHeight);
+            if (reloading && reloadTotal > 0.0f)
+            {
+                const float progress = Clamp(1.0f - reloadRemaining / reloadTotal, 0.0f, 1.0f);
+                game::AppendRect(renderData.overlayTriangles, panelX + 16.0f, panelY + 72.0f, panelWidth - 32.0f, 8.0f, MakeColor(0.16f, 0.19f, 0.24f, 0.95f), screenWidth, screenHeight);
+                game::AppendRect(renderData.overlayTriangles, panelX + 16.0f, panelY + 72.0f, (panelWidth - 32.0f) * progress, 8.0f, MakeColor(0.78f, 0.82f, 0.32f, 0.95f), screenWidth, screenHeight);
+            }
+        }
     }
 
     if (screenState_ == ScreenState::MainMenu)
@@ -709,7 +992,18 @@ void Application::BuildOverlay(render::FrameRenderData& renderData, const platfo
     }
     else if (screenState_ == ScreenState::OfflineSession || screenState_ == ScreenState::ListenSession || screenState_ == ScreenState::ClientSession)
     {
-        game::AppendCrosshair(renderData.overlayTriangles, screenWidth, screenHeight, MakeColor(0.98f, 0.98f, 0.99f, 1.0f));
+        if (renderData.scopedView.enabled)
+        {
+            AppendScopeOverlay(renderData.overlayTriangles, renderData.scopedView, screenWidth, screenHeight);
+        }
+        else if (selectedTool_ == game::ToolType::Smg && renderOptions_.aimDownSights)
+        {
+            AppendHolosightReticle(renderData.overlayTriangles, screenWidth, screenHeight);
+        }
+        else
+        {
+            game::AppendCrosshair(renderData.overlayTriangles, screenWidth, screenHeight, MakeColor(0.98f, 0.98f, 0.99f, 1.0f));
+        }
     }
 }
 
@@ -846,7 +1140,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
     if (screenState_ == ScreenState::OfflineSession)
     {
         const float panelWidth = 660.0f;
-        const float panelHeight = 356.0f;
+        const float panelHeight = 380.0f;
         const float panelX = screenWidth * 0.5f - panelWidth * 0.5f;
         const float panelY = screenHeight * 0.5f - panelHeight * 0.5f;
 
@@ -854,7 +1148,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
         game::AppendRect(overlayTriangles, panelX + 14.0f, panelY + 14.0f, panelWidth - 28.0f, 30.0f, MakeColor(0.12f, 0.15f, 0.20f, 0.95f), screenWidth, screenHeight);
         game::AppendText(overlayTriangles, panelX + 28.0f, panelY + 24.0f, 2.0f, "PAUSE MENU", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-        const std::array<std::string, 11> rows = {
+        const std::array<std::string, 12> rows = {
             "RESUME",
             std::string("WORLD WIDTH ") + std::to_string(pendingWorldSettings_.worldWidth) + " CELLS",
             std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight) + " CELLS",
@@ -864,6 +1158,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
             std::string("SEED ") + std::to_string(pendingWorldSettings_.seed),
             std::string("RELIEF ") + FormatFloat(pendingWorldSettings_.terrainRelief, 2),
             std::string("WATER LEVEL ") + FormatFloat(pendingWorldSettings_.waterLevel, 2),
+            std::string("DRAW DIST ") + FormatFloat(renderOptions_.terrainDrawDistanceMeters, 0) + " M",
             std::string("TARGET FPS ") + std::to_string(targetFrameRate_),
             "APPLY REBUILD",
         };
@@ -909,12 +1204,13 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
     }
 
     const float panelX = screenWidth * 0.5f - 260.0f;
-    const float panelY = screenHeight * 0.5f - 110.0f;
-    game::AppendRect(overlayTriangles, panelX, panelY, 520.0f, 220.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
+    const float panelY = screenHeight * 0.5f - 126.0f;
+    game::AppendRect(overlayTriangles, panelX, panelY, 520.0f, 252.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
     game::AppendText(overlayTriangles, panelX + 24.0f, panelY + 24.0f, 2.2f, "SESSION MENU", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-    const std::array<std::string, 5> rows = {
+    const std::array<std::string, 6> rows = {
         "RESUME",
+        std::string("DRAW DIST ") + FormatFloat(renderOptions_.terrainDrawDistanceMeters, 0) + " M",
         "INVITE OR BROWSE",
         "SAVE WORLD",
         "RESTART WORLD",
@@ -938,6 +1234,16 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
             screenHeight);
         rowY += 28.0f;
     }
+
+    game::AppendText(
+        overlayTriangles,
+        panelX + 24.0f,
+        panelY + 220.0f,
+        1.6f,
+        "LEFT RIGHT OR DRAG DRAW DISTANCE",
+        MakeColor(0.82f, 0.87f, 0.93f, 1.0f),
+        screenWidth,
+        screenHeight);
 }
 
 void Application::HandleMainMenuInput(const platform::InputState& input, bool& running)
@@ -1123,6 +1429,7 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
             const std::uint32_t seedStep = coarseAdjust ? 100u : 1u;
             const float reliefStep = coarseAdjust ? 0.10f : 0.02f;
             const float waterStep = coarseAdjust ? 0.05f : 0.01f;
+            const int renderDistanceStep = coarseAdjust ? 250 : 25;
             const int fpsStep = coarseAdjust ? 10 : 2;
 
             switch (item)
@@ -1159,6 +1466,9 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
             case OfflinePauseItem::WaterLevel:
                 pendingWorldSettings_.waterLevel += scalar * waterStep;
                 break;
+            case OfflinePauseItem::RenderDistance:
+                renderOptions_.terrainDrawDistanceMeters = ClampRenderDistanceMeters(renderOptions_.terrainDrawDistanceMeters + static_cast<float>(quantized(renderDistanceStep)));
+                break;
             case OfflinePauseItem::TargetFps:
                 targetFrameRate_ = std::clamp(targetFrameRate_ + quantized(fpsStep), 30, 240);
                 break;
@@ -1186,7 +1496,7 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
 
         const auto [width, height] = platform_->DrawableSize();
         const float panelX = static_cast<float>(width) * 0.5f - 330.0f;
-        const float panelY = static_cast<float>(height) * 0.5f - 178.0f;
+        const float panelY = static_cast<float>(height) * 0.5f - 190.0f;
         const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 58.0f, 624.0f, 24.0f, OfflinePauseItemCount());
         if (hoveredRow >= 0)
         {
@@ -1244,21 +1554,65 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
 
     const auto [width, height] = platform_->DrawableSize();
     const float panelX = static_cast<float>(width) * 0.5f - 260.0f;
-    const float panelY = static_cast<float>(height) * 0.5f - 110.0f;
-    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 72.0f, 484.0f, 28.0f, 5);
+    const float panelY = static_cast<float>(height) * 0.5f - 126.0f;
+    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 72.0f, 484.0f, 28.0f, 6);
     if (hoveredRow >= 0)
     {
         sessionMenuSelection_ = hoveredRow;
     }
 
+    const bool coarseAdjust = input.KeyDown(SDL_SCANCODE_LSHIFT) || input.KeyDown(SDL_SCANCODE_RSHIFT);
+    const auto adjustRenderDistance = [&](const float scalar)
+    {
+        if (std::abs(scalar) <= 1.0e-4f)
+        {
+            return;
+        }
+
+        const int direction = scalar >= 0.0f ? 1 : -1;
+        const int magnitude = std::max(1, static_cast<int>(std::round(std::abs(scalar))));
+        const int step = coarseAdjust ? 250 : 25;
+        renderOptions_.terrainDrawDistanceMeters = ClampRenderDistanceMeters(
+            renderOptions_.terrainDrawDistanceMeters + static_cast<float>(direction * magnitude * step));
+    };
+
     if (input.KeyPressed(SDL_SCANCODE_UP))
     {
-        sessionMenuSelection_ = (sessionMenuSelection_ + 4) % 5;
+        sessionMenuSelection_ = (sessionMenuSelection_ + 5) % 6;
     }
     if (input.KeyPressed(SDL_SCANCODE_DOWN))
     {
-        sessionMenuSelection_ = (sessionMenuSelection_ + 1) % 5;
+        sessionMenuSelection_ = (sessionMenuSelection_ + 1) % 6;
     }
+    if ((input.KeyPressed(SDL_SCANCODE_LEFT) || input.KeyPressed(SDL_SCANCODE_RIGHT)) &&
+        static_cast<SessionMenuItem>(sessionMenuSelection_) == SessionMenuItem::RenderDistance)
+    {
+        adjustRenderDistance(input.KeyPressed(SDL_SCANCODE_RIGHT) ? 1.0f : -1.0f);
+    }
+
+    if (input.MousePressed(SDL_BUTTON_LEFT))
+    {
+        sessionMenuDragItem_ = -1;
+        if (hoveredRow >= 0)
+        {
+            sessionMenuSelection_ = hoveredRow;
+            if (static_cast<SessionMenuItem>(hoveredRow) == SessionMenuItem::RenderDistance)
+            {
+                sessionMenuDragItem_ = hoveredRow;
+                return;
+            }
+        }
+    }
+
+    if (!input.MouseDown(SDL_BUTTON_LEFT))
+    {
+        sessionMenuDragItem_ = -1;
+    }
+    else if (sessionMenuDragItem_ == static_cast<int>(SessionMenuItem::RenderDistance) && std::abs(input.mouseDeltaX) > 0.0f)
+    {
+        adjustRenderDistance(input.mouseDeltaX * 0.12f);
+    }
+
     if (!input.KeyPressed(SDL_SCANCODE_RETURN) && !(hoveredRow >= 0 && input.MousePressed(SDL_BUTTON_LEFT)))
     {
         return;
@@ -1268,6 +1622,8 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
     {
     case SessionMenuItem::Resume:
         sessionMenuOpen_ = false;
+        break;
+    case SessionMenuItem::RenderDistance:
         break;
     case SessionMenuItem::InviteOrBrowse:
         sessionMenuOpen_ = false;

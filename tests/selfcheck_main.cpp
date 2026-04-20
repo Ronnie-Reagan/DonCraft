@@ -11,10 +11,12 @@
 #include "world/demo_world.hpp"
 #include "world/material_field.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -62,7 +64,9 @@ public:
         bool connected = false;
         bool wasConnected = false;
         bool closedEventSent = false;
+        int clientReliableSendFailuresRemaining = 0;
         int serverToClientStateDelayTicks = 0;
+        std::uint32_t clientHelloAttempts = 0;
         std::uint64_t hostPumpCount = 0;
         std::vector<df::net::TransportPacket> toServer;
         std::vector<df::net::TransportPacket> toClient;
@@ -154,6 +158,23 @@ public:
         }
         else
         {
+            try
+            {
+                const df::net::DecodedMessage message = df::net::DecodeMessage(packet.payload);
+                if (message.type == df::net::MessageType::ClientHello)
+                {
+                    ++shared_->clientHelloAttempts;
+                }
+            }
+            catch (const std::exception&)
+            {
+            }
+
+            if (packet.reliable && shared_->clientReliableSendFailuresRemaining > 0)
+            {
+                --shared_->clientReliableSendFailuresRemaining;
+                return false;
+            }
             shared_->toServer.push_back(packet);
         }
 
@@ -344,19 +365,41 @@ int main()
             world.EditCell(3, 4, 5, df::world::MaterialId::BrittleConcrete);
 
             const df::world::DenseWorldSnapshot snapshot = world.CaptureSnapshot();
-            const df::net::WorldSnapshotMessage message{
-                .serverTick = 77u,
-                .world = snapshot,
-            };
-            const auto encoded = df::net::EncodeWorldSnapshotMessage(message);
-            const auto decoded = df::net::DecodeWorldSnapshotMessage(encoded);
+            const auto segments = df::net::BuildWorldSnapshotMessages(77u, snapshot, 257u);
+            allPassed &= Expect(segments.size() > 1u, "World snapshot segmentation should have produced multiple messages for a bounded payload.");
 
-            allPassed &= Expect(decoded.serverTick == message.serverTick, "World snapshot message roundtrip lost the server tick.");
-            allPassed &= Expect(decoded.world.settings.worldWidth == snapshot.settings.worldWidth, "World snapshot message roundtrip lost the world width.");
-            allPassed &= Expect(decoded.world.cells == snapshot.cells, "World snapshot message roundtrip changed cell payload.");
+            df::world::DenseWorldSnapshot decodedSnapshot{};
+            std::uint64_t decodedServerTick = 0u;
+            std::size_t nextCellOffset = 0u;
+            for (const df::net::WorldSnapshotMessage& segment : segments)
+            {
+                const auto encoded = df::net::EncodeWorldSnapshotMessage(segment);
+                const auto decoded = df::net::DecodeWorldSnapshotMessage(encoded);
+
+                if (decoded.cellOffset == 0u)
+                {
+                    decodedSnapshot.settings = decoded.settings;
+                    decodedSnapshot.cells.assign(decoded.totalCellCount, 0u);
+                    decodedServerTick = decoded.serverTick;
+                    nextCellOffset = 0u;
+                }
+
+                allPassed &= Expect(decoded.serverTick == 77u, "World snapshot message roundtrip lost the server tick.");
+                allPassed &= Expect(static_cast<std::size_t>(decoded.cellOffset) == nextCellOffset, "World snapshot message roundtrip changed the segment offset.");
+
+                std::copy(
+                    decoded.cells.begin(),
+                    decoded.cells.end(),
+                    decodedSnapshot.cells.begin() + static_cast<std::ptrdiff_t>(decoded.cellOffset));
+                nextCellOffset += decoded.cells.size();
+            }
+
+            allPassed &= Expect(decodedServerTick == 77u, "World snapshot message segmentation lost the transfer tick.");
+            allPassed &= Expect(decodedSnapshot.settings.worldWidth == snapshot.settings.worldWidth, "World snapshot message roundtrip lost the world width.");
+            allPassed &= Expect(decodedSnapshot.cells == snapshot.cells, "World snapshot message roundtrip changed cell payload.");
 
             df::world::DemoWorld replica;
-            allPassed &= Expect(replica.ApplySnapshot(decoded.world), "Applying a decoded world snapshot failed.");
+            allPassed &= Expect(replica.ApplySnapshot(decodedSnapshot), "Applying a decoded world snapshot failed.");
             allPassed &= Expect(replica.MaterialAtCell(3, 4, 5) == df::world::MaterialId::BrittleConcrete, "Applied world snapshot lost the edited cell.");
         }
 
@@ -375,13 +418,21 @@ int main()
             editedWorld.Reset();
             editedWorld.EditCell(2, 3, 4, df::world::MaterialId::BrittleConcrete);
             editedWorld.EditCell(7, 6, 5, df::world::MaterialId::DrySand);
+            editedWorld.EditCell(10, 2, 12, df::world::MaterialId::WetMud);
+            editedWorld.EditCell(18, 9, 4, df::world::MaterialId::Grass);
+            editedWorld.EditCell(21, 12, 19, df::world::MaterialId::BasaltRock);
 
             df::world::DenseWorldSnapshot baselineSnapshot = baselineWorld.CaptureSnapshot();
             const df::world::DenseWorldSnapshot editedSnapshot = editedWorld.CaptureSnapshot();
             const auto deltas = df::net::BuildChunkDeltas(baselineSnapshot, editedSnapshot);
+            const auto batches = df::net::BuildChunkDeltaBatches(deltas, 88u, 64u);
 
             allPassed &= Expect(!deltas.empty(), "Chunk delta generation produced no changes for edited terrain.");
-            allPassed &= Expect(df::net::ApplyChunkDeltas(baselineSnapshot, deltas), "Applying generated chunk deltas failed.");
+            allPassed &= Expect(batches.size() > 1u, "Chunk delta batching should have split changes into multiple payloads.");
+            for (const df::net::ChunkDeltaBatchMessage& batch : batches)
+            {
+                allPassed &= Expect(df::net::ApplyChunkDeltas(baselineSnapshot, batch.deltas), "Applying generated chunk delta batch failed.");
+            }
             allPassed &= Expect(baselineSnapshot.cells == editedSnapshot.cells, "Applying generated chunk deltas did not reproduce the edited world.");
         }
 
@@ -408,6 +459,66 @@ int main()
             loadedRuntime.Initialize(config);
             allPassed &= Expect(loadedRuntime.World().MaterialAtCell(4, 5, 6) == df::world::MaterialId::BrittleConcrete, "Session runtime reload lost the saved terrain edit.");
             loadedRuntime.Shutdown();
+
+            std::error_code removeError;
+            std::filesystem::remove(tempFile, removeError);
+        }
+
+        {
+            df::game::SessionRuntime runtime;
+            df::game::SessionRuntime::Config config{};
+            config.mode = df::game::SessionMode::Offline;
+            config.autosaveEnabled = false;
+            config.loadExistingWorld = false;
+            config.maxPlayers = 4;
+            runtime.Initialize(config);
+            allPassed &= Expect(runtime.AddPlayer(1u, "SequenceTest"), "Session runtime sequence test failed to add a player.");
+
+            df::game::PlayerCommandFrame forwardCommand{};
+            forwardCommand.sequence = 10u;
+            forwardCommand.selectedTool = df::game::ToolType::Rifle;
+            forwardCommand.control.moveForward = true;
+            const bool acceptedForward = runtime.SubmitCommand(1u, forwardCommand);
+
+            df::game::PlayerCommandFrame staleCommand = forwardCommand;
+            staleCommand.sequence = 9u;
+            staleCommand.control.moveForward = false;
+            staleCommand.control.moveBackward = true;
+            const bool acceptedStale = runtime.SubmitCommand(1u, staleCommand);
+
+            const df::game::SessionRuntime::PlayerState* const player = runtime.FindPlayer(1u);
+            allPassed &= Expect(acceptedForward, "Session runtime rejected the first authoritative command.");
+            allPassed &= Expect(!acceptedStale, "Session runtime accepted an out-of-order stale command.");
+            allPassed &= Expect(player != nullptr && player->command.sequence == 10u, "Session runtime stale command handling rolled back the current command sequence.");
+            allPassed &= Expect(player != nullptr && player->command.control.moveForward, "Session runtime stale command handling replaced the active control state.");
+            runtime.Shutdown();
+        }
+
+        {
+            const std::filesystem::path tempFile = std::filesystem::temp_directory_path() / "Don_Craft_corrupt_world.bin";
+            {
+                std::ofstream output(tempFile, std::ios::binary);
+                output << "not a valid world";
+            }
+
+            df::game::SessionRuntime runtime;
+            df::game::SessionRuntime::Config config{};
+            config.mode = df::game::SessionMode::Offline;
+            config.savePath = tempFile;
+            config.loadExistingWorld = true;
+            config.autosaveEnabled = false;
+
+            bool threw = false;
+            try
+            {
+                runtime.Initialize(config);
+            }
+            catch (const std::exception&)
+            {
+                threw = true;
+            }
+
+            allPassed &= Expect(threw, "Session runtime did not fail fast on a corrupt existing save.");
 
             std::error_code removeError;
             std::filesystem::remove(tempFile, removeError);
@@ -442,6 +553,37 @@ int main()
             allPassed &= Expect(client.IsReady(), "Listen-host loopback client never became ready.");
             allPassed &= Expect(client.ActorFrame().players.size() >= 2u, "Listen-host loopback actor frame did not include host and client players.");
 
+            df::net::ActorSnapshot spoofedClientState{};
+            spoofedClientState.id = client.LocalPlayerId();
+            spoofedClientState.position = {999.0f, 888.0f, 777.0f};
+            spoofedClientState.cameraPosition = spoofedClientState.position;
+            spoofedClientState.forward = {0.0f, 0.0f, -1.0f};
+            spoofedClientState.flatForward = {0.0f, 0.0f, -1.0f};
+            spoofedClientState.tool = df::game::ToolType::Grenade;
+            spoofedClientState.ammoInMagazine = 999;
+            spoofedClientState.reserveAmmo = 999;
+            spoofedClientState.reloading = true;
+            const std::vector<std::byte> spoofedPayload = df::net::EncodeMessage(
+                df::net::MessageType::ClientStateFrame,
+                df::net::EncodeClientStateFrame(spoofedClientState));
+            allPassed &= Expect(clientTransportRaw->Send({
+                .peerId = 1u,
+                .payload = spoofedPayload,
+                .reliable = false,
+                .channel = df::net::TransportChannel::State,
+            }), "Listen-host spoof test failed to inject a forged client state frame.");
+            host.Tick(1.0f / 60.0f);
+            client.Tick(1.0f / 60.0f, idleCommand);
+            const df::game::SessionRuntime::PlayerState* const authoritativeRemoteAfterSpoof = host.Runtime().FindPlayer(2u);
+            allPassed &= Expect(
+                authoritativeRemoteAfterSpoof != nullptr &&
+                df::LengthSquared(authoritativeRemoteAfterSpoof->controller.Position() - spoofedClientState.position) > 1000.0f,
+                "Listen-host accepted a forged client state position update.");
+            allPassed &= Expect(
+                authoritativeRemoteAfterSpoof != nullptr &&
+                authoritativeRemoteAfterSpoof->tool != df::game::ToolType::Grenade,
+                "Listen-host accepted a forged client inventory/tool update.");
+
             const df::game::SessionRuntime::PlayerState* const remotePlayer = host.Runtime().FindPlayer(2u);
             allPassed &= Expect(remotePlayer != nullptr, "Listen-host loopback never assigned a remote player ID.");
             const df::Vec3 startPosition = remotePlayer != nullptr ? remotePlayer->controller.Position() : df::Vec3{};
@@ -465,7 +607,7 @@ int main()
             syncCommand.sequence = 100u;
             for (int step = 0; step < 6; ++step)
             {
-                host.MutableRuntime().SubmitCommand(1u, hostMoveCommand);
+                static_cast<void>(host.MutableRuntime().SubmitCommand(1u, hostMoveCommand));
                 syncCommand.sequence += 1u;
                 PumpSessionPair(host, client, syncCommand, 1);
             }
@@ -478,7 +620,7 @@ int main()
                 interpolatedRemoteActor != nullptr &&
                 df::LengthSquared(latestRemoteActor->position - interpolatedRemoteActor->position) > 0.0001f,
                 "Listen-host remote interpolation did not produce a lagged render snapshot.");
-            host.MutableRuntime().SubmitCommand(1u, {});
+            static_cast<void>(host.MutableRuntime().SubmitCommand(1u, {}));
 
             shared->serverToClientStateDelayTicks = 4;
             df::game::PlayerCommandFrame delayedMoveCommand{};
@@ -524,6 +666,7 @@ int main()
             clientTransportRaw->Close(1u, 0, "loopback closed");
             PumpSessionPair(host, client, idleCommand, 2);
             allPassed &= Expect(client.Disconnected(), "Listen-host loopback client did not observe disconnect.");
+            allPassed &= Expect(client.LastDisconnectText() == "loopback closed", "Listen-host disconnect reason was not preserved.");
             allPassed &= Expect(host.Runtime().Players().size() == 1u, "Listen-host loopback host did not remove the disconnected remote player.");
 
             clientTransportRaw->Connect();
@@ -577,6 +720,71 @@ int main()
 
             client.Shutdown();
             host.Shutdown();
+        }
+
+        {
+            const auto shared = std::make_shared<LoopbackTransport::SharedState>();
+            shared->clientReliableSendFailuresRemaining = 1;
+            auto serverTransport = std::make_unique<LoopbackTransport>(shared, true);
+            auto clientTransport = std::make_unique<LoopbackTransport>(shared, false);
+            clientTransport->Connect();
+
+            df::net::SessionHost host;
+            df::net::SessionHost::Config hostConfig{};
+            hostConfig.runtime.mode = df::game::SessionMode::DedicatedServer;
+            hostConfig.runtime.autosaveEnabled = false;
+            hostConfig.runtime.loadExistingWorld = false;
+            hostConfig.runtime.sessionName = "Hello Retry";
+            hostConfig.runtime.generationSettings.worldWidth = 24;
+            hostConfig.runtime.generationSettings.worldHeight = 18;
+            hostConfig.runtime.generationSettings.worldDepth = 24;
+            hostConfig.runtime.generationSettings.activeChunkSize = 8;
+            host.Initialize(hostConfig, std::move(serverTransport));
+
+            df::net::SessionClient client;
+            client.Initialize({
+                .playerName = "RetryClient",
+                .connectTimeoutSeconds = 1.0f,
+                .handshakeTimeoutSeconds = 1.0f,
+                .helloResendIntervalSeconds = 0.01f,
+            }, std::move(clientTransport));
+
+            df::game::PlayerCommandFrame idleCommand{};
+            PumpSessionPair(host, client, idleCommand, 20);
+            allPassed &= Expect(shared->clientHelloAttempts >= 2u, "Session client did not retry the hello after the first reliable send failed.");
+            allPassed &= Expect(client.IsReady(), "Session client did not recover from a failed initial hello send.");
+
+            client.Shutdown();
+            host.Shutdown();
+        }
+
+        {
+            const auto shared = std::make_shared<LoopbackTransport::SharedState>();
+            auto clientTransport = std::make_unique<LoopbackTransport>(shared, false);
+            clientTransport->Connect();
+
+            df::net::SessionClient client;
+            client.Initialize({
+                .playerName = "TimeoutClient",
+                .connectTimeoutSeconds = 1.0f,
+                .handshakeTimeoutSeconds = 0.14f,
+                .helloResendIntervalSeconds = 0.01f,
+            }, std::move(clientTransport));
+
+            df::game::PlayerCommandFrame idleCommand{};
+            for (int step = 0; step < 5; ++step)
+            {
+                client.Tick(1.0f / 60.0f, idleCommand);
+            }
+
+            for (int step = 0; step < 5; ++step)
+            {
+                client.Tick(1.0f / 60.0f, idleCommand);
+            }
+
+            allPassed &= Expect(client.Disconnected(), "Session client did not time out after a stalled handshake.");
+
+            client.Shutdown();
         }
 
         {
@@ -663,6 +871,123 @@ int main()
             world.EditCell(29, 11, 24, df::world::MaterialId::Air);
             allPassed &= Expect(FlushWorldMesh(world), "Mesh rebuild did not converge after removing a wall-top cell.");
             allPassed &= Expect(world.TrackedChunkStateCount() <= trackedBeforeBoundaryEdit + 1u, "Boundary edits spawned too many empty neighbor chunk states.");
+        }
+
+        {
+            df::world::DemoWorld world;
+            df::world::WorldGenerationSettings settings = world.GenerationSettings();
+            settings.worldWidth = 48;
+            settings.worldHeight = 20;
+            settings.worldDepth = 48;
+            settings.activeChunkSize = 8;
+            world.SetGenerationSettings(settings);
+            world.Reset();
+
+            allPassed &= Expect(FlushWorldMesh(world), "Baseline world mesh rebuild did not converge before terrain stress validation.");
+            const df::Vec3 worldMinimum = world.WorldMin();
+            const float cellSize = world.CellSize();
+            for (int iteration = 0; iteration < 48; ++iteration)
+            {
+                const float offset = static_cast<float>(iteration % 6) * cellSize * 1.35f;
+                const df::Vec3 digCenter{
+                    worldMinimum.x + cellSize * 18.0f + offset,
+                    cellSize * (7.0f + static_cast<float>(iteration % 4)),
+                    worldMinimum.z + cellSize * (18.0f + static_cast<float>((iteration * 3) % 11)),
+                };
+                world.ApplyDig(digCenter, 1.35f, 0.92f);
+                world.ApplyExplosion(digCenter + df::Vec3{cellSize * 0.35f, cellSize * 0.5f, cellSize * 0.20f}, 2.2f, 0.55f);
+                for (int tick = 0; tick < 5; ++tick)
+                {
+                    world.Tick(1.0f / 60.0f);
+                }
+                allPassed &= Expect(FlushWorldMesh(world), "Terrain stress validation left the mesh rebuild backlog dirty.");
+            }
+        }
+
+        {
+            df::world::DemoWorld world;
+            df::world::WorldGenerationSettings settings = world.GenerationSettings();
+            settings.worldWidth = 48;
+            settings.worldHeight = 20;
+            settings.worldDepth = 48;
+            settings.activeChunkSize = 8;
+            settings.seed = 9001u;
+            world.SetGenerationSettings(settings);
+            world.Reset();
+
+            const float cellSize = world.CellSize();
+            const df::Vec3 worldMinimum = world.WorldMin();
+            const int waterOriginX = settings.worldWidth / 2 - 2;
+            const int waterOriginZ = settings.worldDepth / 2 - 2;
+            const int waterY = settings.worldHeight / 2 + 2;
+            for (int z = 0; z < 5; ++z)
+            {
+                for (int x = 0; x < 5; ++x)
+                {
+                    world.EditCell(waterOriginX + x, waterY, waterOriginZ + z, df::world::MaterialId::ShallowWater);
+                }
+            }
+
+            const std::filesystem::path tempFile = std::filesystem::temp_directory_path() / "Don_Craft_water_stress.bin";
+            for (int iteration = 0; iteration < 48; ++iteration)
+            {
+                const int patternX = waterOriginX + (iteration % 5);
+                const int patternZ = waterOriginZ + ((iteration * 3) % 5);
+                const df::Vec3 impactCenter{
+                    worldMinimum.x + (static_cast<float>(patternX) + 0.5f) * cellSize,
+                    (static_cast<float>(waterY) + 0.5f) * cellSize,
+                    worldMinimum.z + (static_cast<float>(patternZ) + 0.5f) * cellSize,
+                };
+                world.ApplyRifleImpact(impactCenter, df::Vec3{0.0f, -0.2f, 1.0f}, df::world::MaterialId::ShallowWater);
+                world.ApplyExplosion(impactCenter + df::Vec3{0.0f, cellSize * 0.35f, 0.0f}, 2.6f, 0.72f);
+                world.EditCell(patternX, waterY + 1, patternZ, df::world::MaterialId::ShallowWater);
+
+                for (int tick = 0; tick < 10; ++tick)
+                {
+                    world.Tick(1.0f / 60.0f);
+                }
+
+                allPassed &= Expect(FlushWorldMesh(world), "Water/deformation stress left the mesh rebuild backlog dirty.");
+
+                if (iteration % 4 == 0)
+                {
+                    allPassed &= Expect(world.Save(tempFile), "Water/deformation stress save failed.");
+                    df::world::DemoWorld reloadedWorld;
+                    allPassed &= Expect(reloadedWorld.Load(tempFile), "Water/deformation stress reload failed.");
+                    allPassed &= Expect(
+                        reloadedWorld.GenerationSettings().worldWidth == settings.worldWidth &&
+                        reloadedWorld.GenerationSettings().worldDepth == settings.worldDepth,
+                        "Water/deformation stress reload lost world dimensions.");
+                }
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove(tempFile, removeError);
+        }
+
+        {
+            df::world::DemoWorld world;
+            df::world::WorldGenerationSettings settings = world.GenerationSettings();
+            settings.worldWidth = 8;
+            settings.worldHeight = 8;
+            settings.worldDepth = 8;
+            settings.activeChunkSize = 8;
+            world.SetGenerationSettings(settings);
+            world.Reset();
+
+            for (int z = 0; z < settings.worldDepth; ++z)
+            {
+                for (int y = 0; y < settings.worldHeight; ++y)
+                {
+                    for (int x = 0; x < settings.worldWidth; ++x)
+                    {
+                        world.EditCell(x, y, z, df::world::MaterialId::BrittleConcrete);
+                    }
+                }
+            }
+
+            allPassed &= Expect(FlushWorldMesh(world), "Filled-world boundary mesh validation did not converge.");
+            allPassed &= Expect(world.OpaqueTerrainVertexCount() > 0u, "Filled-world boundary mesh validation produced no outer shell geometry.");
         }
 
         {

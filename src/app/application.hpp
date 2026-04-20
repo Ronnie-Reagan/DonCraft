@@ -14,12 +14,18 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace df::platform
 {
 class SdlPlatform;
 struct InputState;
+}
+
+namespace df::steam
+{
+class SteamSocketsTransport;
 }
 
 namespace df
@@ -33,6 +39,13 @@ public:
     int Run();
 
 private:
+    struct PendingListenJoin
+    {
+        std::uint64_t lobbyId = 0;
+        std::uint64_t hostSteamIdFallback = 0;
+        std::string sessionName;
+    };
+
     enum class ScreenState
     {
         MainMenu,
@@ -46,6 +59,7 @@ private:
     enum class SessionMenuItem
     {
         Resume = 0,
+        RenderDistance,
         InviteOrBrowse,
         SaveWorld,
         RestartWorld,
@@ -63,6 +77,7 @@ private:
         Seed,
         Relief,
         WaterLevel,
+        RenderDistance,
         TargetFps,
         ApplyAndRebuild,
     };
@@ -73,6 +88,10 @@ private:
     void BuildLocalCommand(const platform::InputState& input, bool gameplayInputEnabled);
     [[nodiscard]] auto ConsumeLocalCommandForTick() -> game::PlayerCommandFrame;
     void ClearLocalCommandState();
+    void ResetActiveSessions();
+    void QueueListenJoin(std::uint64_t lobbyId, std::uint64_t hostSteamIdFallback, std::string_view sessionName, std::string_view statusText);
+    [[nodiscard]] bool StartClientSessionWithTransport(std::unique_ptr<steam::SteamSocketsTransport> transport, std::string_view statusText);
+    void CompletePendingListenJoin();
     void StartOfflineSession();
     void StartListenSession();
     void JoinBrowserEntry(std::size_t index);
@@ -105,6 +124,7 @@ private:
     std::filesystem::path userDataPath_;
     ScreenState screenState_ = ScreenState::MainMenu;
     std::optional<ScreenState> browserReturnState_{};
+    std::optional<PendingListenJoin> pendingListenJoin_{};
     bool sessionMenuOpen_ = false;
     int mainMenuSelection_ = 0;
     int hostSetupSelection_ = 0;
@@ -122,6 +142,7 @@ private:
     bool pendingPrimaryPressed_ = false;
     bool pendingQuickGrenadePressed_ = false;
     bool pendingInteractPressed_ = false;
+    bool pendingReloadPressed_ = false;
     std::string statusText_;
     std::string playerName_ = "Frontier Player";
     net::SessionHost hostSession_{};

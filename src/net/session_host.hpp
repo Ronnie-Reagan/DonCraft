@@ -1,8 +1,11 @@
 #pragma once
 
 #include "game/session_runtime.hpp"
+#include "net/session_protocol.hpp"
 #include "net/transport.hpp"
 
+#include <deque>
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 
@@ -48,21 +51,32 @@ private:
         PeerId peerId = kInvalidPeerId;
         game::PlayerId playerId = game::kInvalidPlayerId;
         bool welcomed = false;
+        float handshakeElapsedSeconds = 0.0f;
         world::DenseWorldSnapshot baselineWorld{};
+        std::uint64_t baselineWorldVersion = 0;
+        std::deque<std::vector<std::byte>> reliableQueue{};
+        bool reliableQueueBlocked = false;
     };
 
+    void RefreshWorldSnapshotCache();
     [[nodiscard]] auto BuildActorFrame() const -> ActorSnapshotFrame;
-    void SendWelcome(PeerId peerId, game::PlayerId playerId);
-    void SendWorldSnapshot(PeerId peerId, const world::DenseWorldSnapshot& snapshot);
+    void QueueReliablePayload(RemotePeerState& peer, std::vector<std::byte> payload);
+    void FlushReliableQueue(PeerId peerId, RemotePeerState& peer);
+    void SendWelcome(PeerId peerId, RemotePeerState& peer, game::PlayerId playerId);
+    void SendWorldSnapshot(PeerId peerId, RemotePeerState& peer, const world::DenseWorldSnapshot& snapshot);
     void SendWorldDelta(PeerId peerId, RemotePeerState& peer, const world::DenseWorldSnapshot& current);
+    void SendInitialState(PeerId peerId, RemotePeerState& peer);
     void BroadcastActorFrame(const ActorSnapshotFrame& frame);
     void ProcessPeerEvents();
     void ProcessPackets();
+    void UpdatePendingHandshakes(float dt);
 
     Config config_{};
     game::SessionRuntime runtime_{};
     std::unique_ptr<ITransport> transport_;
     std::unordered_map<PeerId, RemotePeerState> peers_;
     game::PlayerId nextRemotePlayerId_ = 2u;
+    world::DenseWorldSnapshot worldSnapshotCache_{};
+    std::uint64_t worldSnapshotVersion_ = 0;
 };
 }

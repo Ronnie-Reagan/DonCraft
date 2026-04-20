@@ -14,6 +14,19 @@ namespace df::steam
 class SteamClientContext
 {
 public:
+    static constexpr const char* kLobbyGameKey = "df_game";
+    static constexpr const char* kLobbyKindKey = "df_kind";
+    static constexpr const char* kLobbyNameKey = "df_name";
+    static constexpr const char* kLobbySummaryKey = "df_summary";
+    static constexpr const char* kLobbyOwnerKey = "df_owner";
+    static constexpr const char* kLobbyVersionKey = "df_version";
+    static constexpr const char* kLobbyHostSteamIdKey = "df_host_steamid";
+    static constexpr const char* kLobbyHostReadyKey = "df_host_ready";
+    static constexpr const char* kLobbyVirtualPortKey = "df_virtual_port";
+    static constexpr const char* kLobbyWorldWidthKey = "df_world_width";
+    static constexpr const char* kLobbyWorldHeightKey = "df_world_height";
+    static constexpr const char* kLobbyWorldDepthKey = "df_world_depth";
+
     SteamClientContext();
     ~SteamClientContext();
 
@@ -26,6 +39,7 @@ public:
         {
             LobbyCreated,
             LobbyJoined,
+            LobbyJoinRequested,
             LobbyLeft,
             BrowserUpdated,
             Error,
@@ -74,6 +88,7 @@ private:
 
     void PushError(std::string text);
     void PushBrowserUpdated();
+    void OnLobbyJoinRequested(GameLobbyJoinRequested_t* result);
     void OnLobbyCreated(LobbyCreated_t* result, bool ioFailure);
     void OnLobbyEntered(LobbyEnter_t* result, bool ioFailure);
     void OnLobbyMatchList(LobbyMatchList_t* result, bool ioFailure);
@@ -89,6 +104,7 @@ private:
     CCallResult<SteamClientContext, LobbyCreated_t> lobbyCreatedCallResult_{};
     CCallResult<SteamClientContext, LobbyEnter_t> lobbyEnterCallResult_{};
     CCallResult<SteamClientContext, LobbyMatchList_t> lobbyMatchListCallResult_{};
+    CCallbackManual<SteamClientContext, GameLobbyJoinRequested_t> lobbyJoinRequestedCallback_{};
     std::vector<Event> events_;
     std::vector<net::SessionBrowserEntry> browserEntries_;
     ServerBrowserResponse* serverBrowserResponse_ = nullptr;

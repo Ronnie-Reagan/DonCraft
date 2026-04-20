@@ -2,15 +2,66 @@
 
 #include "core/log.hpp"
 
+#include <steam/isteamnetworkingutils.h>
 #include <steam/steamnetworkingtypes.h>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include <cstring>
+#include <string>
 
 namespace df::steam
 {
+namespace
+{
+constexpr int kTransportLaneCount = 2;
+constexpr int kTransportLanePriorities[kTransportLaneCount] = {10, 0};
+constexpr uint16 kTransportLaneWeights[kTransportLaneCount] = {1, 1};
+
+auto ConnectionStateName(const ESteamNetworkingConnectionState state) -> const char*
+{
+    switch (state)
+    {
+    case k_ESteamNetworkingConnectionState_None: return "none";
+    case k_ESteamNetworkingConnectionState_Connecting: return "connecting";
+    case k_ESteamNetworkingConnectionState_FindingRoute: return "finding-route";
+    case k_ESteamNetworkingConnectionState_Connected: return "connected";
+    case k_ESteamNetworkingConnectionState_ClosedByPeer: return "closed-by-peer";
+    case k_ESteamNetworkingConnectionState_ProblemDetectedLocally: return "problem-local";
+    case k_ESteamNetworkingConnectionState_FinWait: return "fin-wait";
+    case k_ESteamNetworkingConnectionState_Linger: return "linger";
+    case k_ESteamNetworkingConnectionState_Dead: return "dead";
+    default: return "unknown";
+    }
+}
+
+auto DescribeRemoteIdentity(const SteamNetworkingIdentity& identity) -> std::string
+{
+    if (const std::uint64_t steamId = identity.GetSteamID64(); steamId != 0u)
+    {
+        return "steamid:" + std::to_string(steamId);
+    }
+
+    if (const SteamNetworkingIPAddr* const ip = identity.GetIPAddr(); ip != nullptr)
+    {
+        return "ip:" + std::to_string(ip->GetIPv4()) + ":" + std::to_string(ip->m_port);
+    }
+
+    if (const char* const genericString = identity.GetGenericString(); genericString != nullptr)
+    {
+        return "generic:" + std::string(genericString);
+    }
+
+    return "type:" + std::to_string(static_cast<int>(identity.m_eType));
+}
+
+auto TransportLaneIndex(const net::TransportChannel channel) -> uint16
+{
+    return channel == net::TransportChannel::State ? 1u : 0u;
+}
+}
+
 SteamSocketsTransport::SteamSocketsTransport(ISteamNetworkingSockets* const sockets, const bool useGameserverCallbacks)
     : sockets_(sockets)
     , useGameserverCallbacks_(useGameserverCallbacks)
@@ -43,11 +94,20 @@ bool SteamSocketsTransport::StartListenP2P(const int virtualPort)
 {
     if (sockets_ == nullptr)
     {
+        LogError("Steam transport failed to start P2P listen socket: sockets interface unavailable.");
         return false;
     }
 
     listenSocket_ = sockets_->CreateListenSocketP2P(virtualPort, 0, nullptr);
     serverMode_ = listenSocket_ != k_HSteamListenSocket_Invalid;
+    if (serverMode_)
+    {
+        LogInfo("Steam transport listening for P2P connections on virtual_port=", virtualPort, " socket=", listenSocket_);
+    }
+    else
+    {
+        LogError("Steam transport failed to create a P2P listen socket on virtual_port=", virtualPort);
+    }
     return serverMode_;
 }
 
@@ -55,6 +115,7 @@ bool SteamSocketsTransport::StartListenIp(const std::uint16_t port)
 {
     if (sockets_ == nullptr)
     {
+        LogError("Steam transport failed to start IP listen socket: sockets interface unavailable.");
         return false;
     }
 
@@ -63,6 +124,14 @@ bool SteamSocketsTransport::StartListenIp(const std::uint16_t port)
     address.m_port = port;
     listenSocket_ = sockets_->CreateListenSocketIP(address, 0, nullptr);
     serverMode_ = listenSocket_ != k_HSteamListenSocket_Invalid;
+    if (serverMode_)
+    {
+        LogInfo("Steam transport listening for IP connections on port=", port, " socket=", listenSocket_);
+    }
+    else
+    {
+        LogError("Steam transport failed to create an IP listen socket on port=", port);
+    }
     return serverMode_;
 }
 
@@ -70,6 +139,13 @@ bool SteamSocketsTransport::ConnectP2P(const std::uint64_t remoteSteamId, const 
 {
     if (sockets_ == nullptr)
     {
+        LogError("Steam transport failed P2P connect: sockets interface unavailable.");
+        return false;
+    }
+
+    if (remoteSteamId == 0u)
+    {
+        LogError("Steam transport rejected P2P connect with an invalid remote Steam ID.");
         return false;
     }
 
@@ -78,10 +154,12 @@ bool SteamSocketsTransport::ConnectP2P(const std::uint64_t remoteSteamId, const 
     const HSteamNetConnection connection = sockets_->ConnectP2P(remoteIdentity, virtualPort, 0, nullptr);
     if (connection == k_HSteamNetConnection_Invalid)
     {
+        LogError("Steam transport failed to connect P2P to steam_id=", remoteSteamId, " virtual_port=", virtualPort);
         return false;
     }
 
     (void)EnsurePeer(connection, net::ConnectionOrigin::Outgoing);
+    LogInfo("Steam transport connecting P2P to steam_id=", remoteSteamId, " virtual_port=", virtualPort, " handle=", connection);
     return true;
 }
 
@@ -89,6 +167,7 @@ bool SteamSocketsTransport::ConnectIp(const std::string& address, const std::uin
 {
     if (sockets_ == nullptr)
     {
+        LogError("Steam transport failed IP connect: sockets interface unavailable.");
         return false;
     }
 
@@ -121,6 +200,7 @@ bool SteamSocketsTransport::ConnectIp(const std::string& address, const std::uin
         IN6_ADDR ipv6Address{};
         if (InetPtonA(AF_INET6, host.c_str(), &ipv6Address) != 1)
         {
+            LogError("Steam transport rejected invalid remote address '", address, "'");
             return false;
         }
 
@@ -130,10 +210,12 @@ bool SteamSocketsTransport::ConnectIp(const std::string& address, const std::uin
     const HSteamNetConnection connection = sockets_->ConnectByIPAddress(remoteAddress, 0, nullptr);
     if (connection == k_HSteamNetConnection_Invalid)
     {
+        LogError("Steam transport failed to connect to address=", address, " port=", port);
         return false;
     }
 
     (void)EnsurePeer(connection, net::ConnectionOrigin::Outgoing);
+    LogInfo("Steam transport connecting by IP address=", address, " port=", port, " handle=", connection);
     return true;
 }
 
@@ -181,6 +263,30 @@ bool SteamSocketsTransport::Send(const net::TransportPacket& packet)
     }
 
     const int sendFlags = packet.reliable ? k_nSteamNetworkingSend_Reliable : k_nSteamNetworkingSend_UnreliableNoDelay;
+    if (iter->second.lanesConfigured)
+    {
+        ISteamNetworkingUtils* const utils = SteamNetworkingUtils();
+        if (utils != nullptr)
+        {
+            SteamNetworkingMessage_t* const message = utils->AllocateMessage(static_cast<int>(packet.payload.size()));
+            if (message != nullptr)
+            {
+                message->m_conn = iter->second.handle;
+                message->m_nFlags = sendFlags;
+                message->m_idxLane = TransportLaneIndex(packet.channel);
+                if (!packet.payload.empty())
+                {
+                    std::memcpy(message->m_pData, packet.payload.data(), packet.payload.size());
+                }
+
+                SteamNetworkingMessage_t* messages[] = {message};
+                int64 result = 0;
+                sockets_->SendMessages(1, messages, &result);
+                return result > 0;
+            }
+        }
+    }
+
     return sockets_->SendMessageToConnection(
                iter->second.handle,
                packet.payload.data(),
@@ -206,6 +312,11 @@ auto SteamSocketsTransport::Receive() -> std::vector<net::TransportPacket>
 
         SteamNetworkingMessage_t* messages[32]{};
         const int messageCount = sockets_->ReceiveMessagesOnConnection(connection.handle, messages, 32);
+        if (messageCount < 0)
+        {
+            LogWarning("Steam transport failed to receive messages on handle=", connection.handle, " peer=", peerId);
+            continue;
+        }
         for (int index = 0; index < messageCount; ++index)
         {
             SteamNetworkingMessage_t* const message = messages[index];
@@ -213,8 +324,10 @@ auto SteamSocketsTransport::Receive() -> std::vector<net::TransportPacket>
             packet.peerId = peerId;
             packet.payload.resize(static_cast<std::size_t>(message->m_cbSize));
             std::memcpy(packet.payload.data(), message->m_pData, packet.payload.size());
-            packet.reliable = message->m_nFlags & k_nSteamNetworkingSend_Reliable;
-            packet.channel = message->m_nChannel == 1 ? net::TransportChannel::State : net::TransportChannel::Reliable;
+            packet.reliable = (message->m_nFlags & k_nSteamNetworkingSend_Reliable) != 0;
+            packet.channel = message->m_idxLane == TransportLaneIndex(net::TransportChannel::State)
+                ? net::TransportChannel::State
+                : net::TransportChannel::Reliable;
             packets.push_back(std::move(packet));
             message->Release();
         }
@@ -249,6 +362,11 @@ void SteamSocketsTransport::Close(const net::PeerId peerId, const int reason, co
         return;
     }
 
+    LogInfo(
+        "Steam transport closing peer=", peerId,
+        " handle=", iter->second.handle,
+        " reason=", reason,
+        " detail='", (debugText != nullptr ? debugText : ""), "'");
     (void)sockets_->CloseConnection(iter->second.handle, reason, debugText, false);
     iter->second.info.status = net::ConnectionStatus::Closed;
 }
@@ -294,19 +412,47 @@ void SteamSocketsTransport::OnConnectionStatusChanged(SteamNetConnectionStatusCh
         return;
     }
 
+    LogInfo(
+        "Steam transport state change handle=", callback->m_hConn,
+        " peer=", peerId,
+        " origin=", static_cast<int>(connection->origin),
+        " remote='", DescribeRemoteIdentity(callback->m_info.m_identityRemote),
+        "' state=", ConnectionStateName(callback->m_info.m_eState),
+        " detail='", callback->m_info.m_szEndDebug, "'");
+
     switch (callback->m_info.m_eState)
     {
     case k_ESteamNetworkingConnectionState_Connecting:
         connection->info.status = net::ConnectionStatus::Connecting;
         if (incoming)
         {
-            (void)sockets_->AcceptConnection(callback->m_hConn);
+            const EResult acceptResult = sockets_->AcceptConnection(callback->m_hConn);
+            if (acceptResult != k_EResultOK)
+            {
+                LogError(
+                    "Steam transport failed to accept incoming connection handle=", callback->m_hConn,
+                    " result=", static_cast<int>(acceptResult));
+                pendingPeerEvents_.push_back({peerId, connection->origin, net::ConnectionStatus::Closed, "accept failed"});
+                (void)sockets_->CloseConnection(callback->m_hConn, 0, "accept failed", false);
+                ReleaseConnection(callback->m_hConn);
+                break;
+            }
         }
         pendingPeerEvents_.push_back({peerId, connection->origin, net::ConnectionStatus::Connecting, callback->m_info.m_szEndDebug});
         break;
 
     case k_ESteamNetworkingConnectionState_Connected:
         connection->info.status = net::ConnectionStatus::Connected;
+        connection->lanesConfigured =
+            sockets_->ConfigureConnectionLanes(
+                callback->m_hConn,
+                kTransportLaneCount,
+                kTransportLanePriorities,
+                kTransportLaneWeights) == k_EResultOK;
+        if (!connection->lanesConfigured)
+        {
+            LogWarning("Steam transport failed to configure lanes for handle=", callback->m_hConn, " peer=", peerId);
+        }
         pendingPeerEvents_.push_back({peerId, connection->origin, net::ConnectionStatus::Connected, callback->m_info.m_szEndDebug});
         break;
 
@@ -315,6 +461,7 @@ void SteamSocketsTransport::OnConnectionStatusChanged(SteamNetConnectionStatusCh
         connection->info.status = net::ConnectionStatus::Closed;
         pendingPeerEvents_.push_back({peerId, connection->origin, net::ConnectionStatus::Closed, callback->m_info.m_szEndDebug});
         (void)sockets_->CloseConnection(callback->m_hConn, 0, "closed", false);
+        ReleaseConnection(callback->m_hConn);
         break;
 
     default:
@@ -339,6 +486,18 @@ auto SteamSocketsTransport::EnsurePeer(const HSteamNetConnection handle, const n
     peers_.emplace(peerId, connection);
     handleToPeer_.emplace(handle, peerId);
     return peerId;
+}
+
+void SteamSocketsTransport::ReleaseConnection(const HSteamNetConnection handle)
+{
+    const auto handleIter = handleToPeer_.find(handle);
+    if (handleIter == handleToPeer_.end())
+    {
+        return;
+    }
+
+    peers_.erase(handleIter->second);
+    handleToPeer_.erase(handleIter);
 }
 
 auto SteamSocketsTransport::FindConnection(const HSteamNetConnection handle) -> Connection*

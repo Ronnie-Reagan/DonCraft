@@ -271,7 +271,7 @@ if(Don_Craft_BUILD_CLIENT)
     df_configure_target(Don_Craft_client)
     add_dependencies(Don_Craft_client df_shaders)
     set_target_properties(Don_Craft_client PROPERTIES
-        VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:Don_Craft_client>"
+        VS_DEBUGGER_WORKING_DIRECTORY "$(TargetDir)"
     )
 
     add_custom_command(TARGET Don_Craft_client POST_BUILD
@@ -314,7 +314,7 @@ if(Don_Craft_BUILD_SERVER)
     target_link_libraries(Don_Craft_server PRIVATE df_server_app)
     df_configure_target(Don_Craft_server)
     set_target_properties(Don_Craft_server PROPERTIES
-        VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:Don_Craft_server>"
+        VS_DEBUGGER_WORKING_DIRECTORY "$(TargetDir)"
     )
 
     add_custom_command(TARGET Don_Craft_server POST_BUILD
@@ -340,9 +340,9 @@ if(Don_Craft_ENABLE_TESTS)
     )
     target_link_libraries(Don_Craft_selfcheck PRIVATE df_core df_world df_game df_net df_sim)
     df_configure_target(Don_Craft_selfcheck)
-    set_target_properties(Don_Craft_selfcheck PROPERTIES
-        VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:Don_Craft_selfcheck>"
-    )
+set_target_properties(Don_Craft_client PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "$(TargetDir)"
+)
 
     if(TARGET df_shaders)
         add_dependencies(Don_Craft_selfcheck df_shaders)

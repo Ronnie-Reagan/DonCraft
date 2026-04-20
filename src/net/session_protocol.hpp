@@ -5,6 +5,7 @@
 #include "net/chunk_delta.hpp"
 #include "world/demo_world.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -12,7 +13,9 @@
 
 namespace df::net
 {
-inline constexpr std::uint32_t kSessionProtocolVersion = 1u;
+inline constexpr std::uint32_t kSessionProtocolVersion = 4u;
+inline constexpr std::size_t kMaxWorldSnapshotCellsPerMessage = 64u * 1024u;
+inline constexpr std::size_t kMaxChunkDeltaBatchPayloadBytes = 64u * 1024u;
 
 enum class MessageType : std::uint8_t
 {
@@ -23,6 +26,7 @@ enum class MessageType : std::uint8_t
     ChunkDeltaBatch = 5,
     ActorSnapshotFrame = 6,
     Disconnect = 7,
+    ClientStateFrame = 8,
 };
 
 enum class BrowserEntryType : std::uint8_t
@@ -89,6 +93,12 @@ struct ActorSnapshot
     float walkCycleRadians = 0.0f;
     float yawRadians = 0.0f;
     float pitchRadians = 0.0f;
+    float weaponCycle = 0.0f;
+    int ammoInMagazine = 0;
+    int reserveAmmo = 0;
+    bool reloading = false;
+    float reloadSecondsRemaining = 0.0f;
+    float reloadSecondsTotal = 0.0f;
     std::uint32_t lastAppliedCommandSequence = 0;
 };
 
@@ -138,7 +148,10 @@ struct ActorSnapshotFrame
 struct WorldSnapshotMessage
 {
     std::uint64_t serverTick = 0;
-    world::DenseWorldSnapshot world;
+    world::WorldGenerationSettings settings{};
+    std::uint32_t totalCellCount = 0;
+    std::uint32_t cellOffset = 0;
+    std::vector<std::uint8_t> cells;
 };
 
 struct ChunkDeltaBatchMessage
@@ -171,11 +184,22 @@ struct DecodedMessage
 [[nodiscard]] auto EncodeCommandFrame(const game::PlayerCommandFrame& frame) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeCommandFrame(std::span<const std::byte> bytes) -> game::PlayerCommandFrame;
 
+[[nodiscard]] auto EncodeClientStateFrame(const ActorSnapshot& snapshot) -> std::vector<std::byte>;
+[[nodiscard]] auto DecodeClientStateFrame(std::span<const std::byte> bytes) -> ActorSnapshot;
+
 [[nodiscard]] auto EncodeWorldSnapshotMessage(const WorldSnapshotMessage& message) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeWorldSnapshotMessage(std::span<const std::byte> bytes) -> WorldSnapshotMessage;
+[[nodiscard]] auto BuildWorldSnapshotMessages(
+    std::uint64_t serverTick,
+    const world::DenseWorldSnapshot& snapshot,
+    std::size_t maxCellsPerMessage = kMaxWorldSnapshotCellsPerMessage) -> std::vector<WorldSnapshotMessage>;
 
 [[nodiscard]] auto EncodeChunkDeltaBatchMessage(const ChunkDeltaBatchMessage& message) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeChunkDeltaBatchMessage(std::span<const std::byte> bytes) -> ChunkDeltaBatchMessage;
+[[nodiscard]] auto BuildChunkDeltaBatches(
+    std::span<const ChunkDelta> deltas,
+    std::uint64_t serverTick,
+    std::size_t maxPayloadBytes = kMaxChunkDeltaBatchPayloadBytes) -> std::vector<ChunkDeltaBatchMessage>;
 
 [[nodiscard]] auto EncodeActorSnapshotFrame(const ActorSnapshotFrame& frame) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeActorSnapshotFrame(std::span<const std::byte> bytes) -> ActorSnapshotFrame;

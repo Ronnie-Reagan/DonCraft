@@ -14,6 +14,7 @@ public:
     void Spawn(const world::DemoWorld& world);
     void PlaceAt(const Vec3& position, float yawRadians, float pitchRadians);
     void Tick(const ControlState& input, const world::DemoWorld& world, float dt);
+    void AddViewKick(float yawRadiansDelta, float pitchRadiansDelta);
 
     [[nodiscard]] auto Position() const -> Vec3
     {

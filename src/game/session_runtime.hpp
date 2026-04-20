@@ -4,8 +4,10 @@
 #include "game/player_controller.hpp"
 #include "game/session_types.hpp"
 #include "game/truck_controller.hpp"
+#include "game/weapon_definitions.hpp"
 #include "world/demo_world.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -57,16 +59,27 @@ public:
 
     struct PlayerState
     {
+        struct WeaponInventory
+        {
+            int ammoInMagazine = 0;
+            int reserveAmmo = 0;
+        };
+
         PlayerId id = kInvalidPlayerId;
         std::string name;
         PlayerController controller;
         PlayerCommandFrame command{};
+        bool hasReceivedCommand = false;
         ToolType tool = ToolType::Rifle;
         bool drivingTruck = false;
-        float rifleCooldown = 0.0f;
+        std::array<WeaponInventory, kToolTypeCount> weaponInventories{};
+        float fireCooldown = 0.0f;
         float digCooldown = 0.0f;
+        float reloadTimer = 0.0f;
+        float reloadDuration = 0.0f;
         float weaponCycle = 0.0f;
         float footstepCooldown = 0.0f;
+        bool reloading = false;
         world::MaterialId crosshairMaterial = world::MaterialId::Air;
         std::uint32_t lastAppliedCommandSequence = 0;
     };
@@ -93,7 +106,7 @@ public:
 
     [[nodiscard]] bool AddPlayer(PlayerId id, std::string_view name);
     void RemovePlayer(PlayerId id);
-    void SubmitCommand(PlayerId id, const PlayerCommandFrame& command);
+    [[nodiscard]] bool SubmitCommand(PlayerId id, const PlayerCommandFrame& command);
     void Tick(float dt);
 
     [[nodiscard]] bool SaveNow() const;
@@ -157,13 +170,15 @@ private:
     void TickTruck(float dt);
     void UpdateProjectiles(float dt);
     void UpdatePlayerCrosshair(PlayerState& player);
-    void FireRifle(PlayerState& player);
+    void FireWeapon(PlayerState& player);
     void UseDigTool(PlayerState& player);
     void SpawnGrenade(const PlayerState& player);
     void UpdateGrenades(float dt);
     void UpdateBeams(float dt);
     void UpdateBullets(float dt);
     void QueueBulletImpactAudio(world::MaterialId material, float impactSpeed);
+    void StartReload(PlayerState& player);
+    void CompleteReload(PlayerState& player);
 
     [[nodiscard]] auto CurrentAimPosition(const PlayerState& player) const -> Vec3;
     [[nodiscard]] auto CurrentForwardVector(const PlayerState& player) const -> Vec3;

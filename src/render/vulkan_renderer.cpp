@@ -340,6 +340,8 @@ void VulkanRenderer::Shutdown()
         DestroyBuffer(frame.translucentTerrainVertexBuffer);
         DestroyBuffer(frame.dynamicVertexBuffer);
         DestroyBuffer(frame.dynamicTranslucentVertexBuffer);
+        DestroyBuffer(frame.viewModelVertexBuffer);
+        DestroyBuffer(frame.viewModelPostScopeVertexBuffer);
         DestroyBuffer(frame.effectVertexBuffer);
         DestroyBuffer(frame.lineVertexBuffer);
         DestroyBuffer(frame.overlayVertexBuffer);
@@ -407,6 +409,7 @@ void VulkanRenderer::Shutdown()
 
 void VulkanRenderer::Draw(const FrameRenderData& frameData)
 {
+    const ScopedCrashContext crashContext("VulkanRenderer::Draw");
     const ScopedProfileSection drawScope(profiler_, "Render Draw Internal");
     if (!initialized_)
     {
@@ -477,14 +480,13 @@ void VulkanRenderer::Draw(const FrameRenderData& frameData)
 
     {
         const ScopedProfileSection scope(profiler_, "Render Upload");
-        if (frame.uploadedTerrainMeshVersion != frameData.terrainMeshVersion)
-        {
-            frame.uploadedTerrainMeshVersion = frameData.terrainMeshVersion;
-            uploadVertices(frame.terrainVertexBuffer, frameData.terrainTriangles.data(), frameData.terrainTriangles.size(), sizeof(ColorVertex3D));
-        }
+        frame.uploadedTerrainMeshVersion = frameData.terrainMeshVersion;
+        uploadVertices(frame.terrainVertexBuffer, frameData.terrainTriangles.data(), frameData.terrainTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.translucentTerrainVertexBuffer, frameData.translucentTerrainTriangles.data(), frameData.translucentTerrainTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.dynamicVertexBuffer, frameData.dynamicTriangles.data(), frameData.dynamicTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.dynamicTranslucentVertexBuffer, frameData.dynamicTranslucentTriangles.data(), frameData.dynamicTranslucentTriangles.size(), sizeof(ColorVertex3D));
+        uploadVertices(frame.viewModelVertexBuffer, frameData.viewModelTriangles.data(), frameData.viewModelTriangles.size(), sizeof(ColorVertex3D));
+        uploadVertices(frame.viewModelPostScopeVertexBuffer, frameData.viewModelPostScopeTriangles.data(), frameData.viewModelPostScopeTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.effectVertexBuffer, frameData.effectTriangles.data(), frameData.effectTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.lineVertexBuffer, frameData.debugLines.data(), frameData.debugLines.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.overlayVertexBuffer, frameData.overlayTriangles.data(), frameData.overlayTriangles.size(), sizeof(ColorVertex2D));
@@ -1306,6 +1308,9 @@ void VulkanRenderer::CreatePipelines()
         VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, position))},
         VkVertexInputAttributeDescription{1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, color))},
     }};
+    const std::array<VkVertexInputAttributeDescription, 1> shadowAttributes = {{
+        VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, position))},
+    }};
 
     const VkVertexInputBindingDescription overlayBindingDescription{0, sizeof(ColorVertex2D), VK_VERTEX_INPUT_RATE_VERTEX};
     const std::array<VkVertexInputAttributeDescription, 2> overlayAttributes = {{
@@ -1313,7 +1318,7 @@ void VulkanRenderer::CreatePipelines()
         VkVertexInputAttributeDescription{1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex2D, color))},
     }};
 
-    shadowPipeline_ = createPipeline(shadowVertexShader, VK_NULL_HANDLE, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), shadowBlendState, shadowDepthState, shadowRenderingInfo);
+    shadowPipeline_ = createPipeline(shadowVertexShader, VK_NULL_HANDLE, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, shadowAttributes.data(), static_cast<std::uint32_t>(shadowAttributes.size()), shadowBlendState, shadowDepthState, shadowRenderingInfo);
     terrainPipeline_ = createPipeline(worldVertexShader, worldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), opaqueBlendState, terrainDepthState, sceneRenderingInfo);
     translucentTerrainPipeline_ = createPipeline(worldVertexShader, worldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), alphaBlendState, translucentTerrainDepthState, sceneRenderingInfo);
     effectPipeline_ = createPipeline(worldVertexShader, unshadowedWorldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), opaqueBlendState, terrainDepthState, sceneRenderingInfo);
@@ -1379,6 +1384,10 @@ void VulkanRenderer::RecordFrame(
     CheckVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "Failed to begin recording the frame command buffer.");
 
     const Mat4 worldToShadowClip = BuildShadowProjection(frameData);
+    const ScenePushConstants shadowPushConstants{
+        worldToShadowClip,
+        worldToShadowClip,
+    };
     const ScenePushConstants pushConstants{
         frameData.worldToClip,
         worldToShadowClip,
@@ -1431,7 +1440,7 @@ void VulkanRenderer::RecordFrame(
     {
         const VkBuffer vertexBuffer = frame.terrainVertexBuffer.buffer;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat4), &worldToShadowClip);
+        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &shadowPushConstants);
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
         vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.terrainTriangles.size()), 1, 0, 0);
     }
@@ -1440,7 +1449,7 @@ void VulkanRenderer::RecordFrame(
     {
         const VkBuffer vertexBuffer = frame.dynamicVertexBuffer.buffer;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat4), &worldToShadowClip);
+        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &shadowPushConstants);
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
         vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTriangles.size()), 1, 0, 0);
     }
@@ -1502,68 +1511,153 @@ void VulkanRenderer::RecordFrame(
         1.0f,
     };
     const VkRect2D scissor{{0, 0}, swapchainExtent_};
-    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &shadowDescriptorSet_, 0, nullptr);
 
-    if (!frameData.terrainTriangles.empty())
+    const auto drawScene = [&](const ScenePushConstants& scenePushConstants, const VkViewport& sceneViewport, const VkRect2D& sceneScissor)
     {
-        const VkBuffer vertexBuffer = frame.terrainVertexBuffer.buffer;
+        vkCmdSetViewport(commandBuffer, 0, 1, &sceneViewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &sceneScissor);
+
+        if (!frameData.terrainTriangles.empty())
+        {
+            const VkBuffer vertexBuffer = frame.terrainVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.terrainTriangles.size()), 1, 0, 0);
+        }
+
+        if (!frameData.dynamicTriangles.empty())
+        {
+            const VkBuffer vertexBuffer = frame.dynamicVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTriangles.size()), 1, 0, 0);
+        }
+
+        if (!frameData.translucentTerrainTriangles.empty())
+        {
+            const VkBuffer vertexBuffer = frame.translucentTerrainVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainPipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.translucentTerrainTriangles.size()), 1, 0, 0);
+        }
+
+        if (!frameData.dynamicTranslucentTriangles.empty())
+        {
+            const VkBuffer vertexBuffer = frame.dynamicTranslucentVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainPipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTranslucentTriangles.size()), 1, 0, 0);
+        }
+
+        if (!frameData.effectTriangles.empty())
+        {
+            const VkBuffer vertexBuffer = frame.effectVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, effectPipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.effectTriangles.size()), 1, 0, 0);
+        }
+
+        if (!frameData.debugLines.empty())
+        {
+            const VkBuffer vertexBuffer = frame.lineVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, linePipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.debugLines.size()), 1, 0, 0);
+        }
+    };
+
+    const auto drawViewModelBuffer = [&](const BufferResource& buffer, const std::size_t vertexCount, const ScenePushConstants& scenePushConstants)
+    {
+        if (vertexCount == 0)
+        {
+            return;
+        }
+
+        const VkBuffer vertexBuffer = buffer.buffer;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushConstants);
+        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.terrainTriangles.size()), 1, 0, 0);
-    }
+        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(vertexCount), 1, 0, 0);
+    };
 
-    if (!frameData.dynamicTriangles.empty())
-    {
-        const VkBuffer vertexBuffer = frame.dynamicVertexBuffer.buffer;
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushConstants);
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTriangles.size()), 1, 0, 0);
-    }
+    drawScene(pushConstants, viewport, scissor);
 
-    if (!frameData.translucentTerrainTriangles.empty())
-    {
-        const VkBuffer vertexBuffer = frame.translucentTerrainVertexBuffer.buffer;
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushConstants);
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.translucentTerrainTriangles.size()), 1, 0, 0);
-    }
+    const bool scopedPassEnabled =
+        frameData.scopedView.enabled &&
+        frameData.scopedView.viewportWidth > 0 &&
+        frameData.scopedView.viewportHeight > 0;
 
-    if (!frameData.dynamicTranslucentTriangles.empty())
+    if (scopedPassEnabled)
     {
-        const VkBuffer vertexBuffer = frame.dynamicTranslucentVertexBuffer.buffer;
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushConstants);
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTranslucentTriangles.size()), 1, 0, 0);
-    }
+        drawViewModelBuffer(frame.viewModelVertexBuffer, frameData.viewModelTriangles.size(), pushConstants);
 
-    if (!frameData.effectTriangles.empty())
-    {
-        const VkBuffer vertexBuffer = frame.effectVertexBuffer.buffer;
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, effectPipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushConstants);
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.effectTriangles.size()), 1, 0, 0);
-    }
+        std::array<VkClearAttachment, 2> scopedClearAttachments{};
+        scopedClearAttachments[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        scopedClearAttachments[0].colorAttachment = 0;
+        scopedClearAttachments[0].clearValue = clearColorValue;
+        scopedClearAttachments[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        scopedClearAttachments[1].clearValue.depthStencil.depth = 1.0f;
 
-    if (!frameData.debugLines.empty())
+        const VkClearRect scopedClearRect{
+            {
+                {frameData.scopedView.viewportX, frameData.scopedView.viewportY},
+                {
+                    static_cast<std::uint32_t>(frameData.scopedView.viewportWidth),
+                    static_cast<std::uint32_t>(frameData.scopedView.viewportHeight),
+                },
+            },
+            0,
+            1,
+        };
+        vkCmdClearAttachments(
+            commandBuffer,
+            static_cast<std::uint32_t>(scopedClearAttachments.size()),
+            scopedClearAttachments.data(),
+            1,
+            &scopedClearRect);
+
+        const VkViewport scopedViewport{
+            static_cast<float>(frameData.scopedView.viewportX),
+            static_cast<float>(frameData.scopedView.viewportY),
+            static_cast<float>(frameData.scopedView.viewportWidth),
+            static_cast<float>(frameData.scopedView.viewportHeight),
+            0.0f,
+            1.0f,
+        };
+        const VkRect2D scopedScissor{
+            {frameData.scopedView.viewportX, frameData.scopedView.viewportY},
+            {
+                static_cast<std::uint32_t>(frameData.scopedView.viewportWidth),
+                static_cast<std::uint32_t>(frameData.scopedView.viewportHeight),
+            },
+        };
+        const ScenePushConstants scopedPushConstants{
+            frameData.scopedView.worldToClip,
+            worldToShadowClip,
+        };
+        drawScene(scopedPushConstants, scopedViewport, scopedScissor);
+        drawViewModelBuffer(frame.viewModelPostScopeVertexBuffer, frameData.viewModelPostScopeTriangles.size(), pushConstants);
+    }
+    else
     {
-        const VkBuffer vertexBuffer = frame.lineVertexBuffer.buffer;
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, linePipeline_);
-        vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &pushConstants);
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-        vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.debugLines.size()), 1, 0, 0);
+        drawViewModelBuffer(frame.viewModelVertexBuffer, frameData.viewModelTriangles.size(), pushConstants);
     }
 
     if (!frameData.overlayTriangles.empty())
     {
         const VkBuffer vertexBuffer = frame.overlayVertexBuffer.buffer;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
         vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.overlayTriangles.size()), 1, 0, 0);
     }

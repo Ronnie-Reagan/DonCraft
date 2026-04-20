@@ -355,7 +355,16 @@ void ServerApplication::PrintUsage()
 
 int ServerApplication::RunWithOptions(const Options& options)
 {
-    std::filesystem::create_directories(options.savePath.parent_path().empty() ? std::filesystem::current_path() : options.savePath.parent_path());
+    if (!options.savePath.parent_path().empty())
+    {
+        std::error_code createError;
+        std::filesystem::create_directories(options.savePath.parent_path(), createError);
+        if (createError)
+        {
+            LogError("Dedicated server could not prepare the save directory '", options.savePath.parent_path().string(), "': ", createError.message());
+            return 1;
+        }
+    }
 
     steam::SteamServerContext steamServer{};
     steam::SteamServerContext::Config steamConfig{};
@@ -391,7 +400,16 @@ int ServerApplication::RunWithOptions(const Options& options)
     hostConfig.runtime.autosaveEnabled = true;
     hostConfig.runtime.autosaveIntervalSeconds = options.autosaveIntervalSeconds;
     hostConfig.runtime.maxPlayers = options.maxPlayers;
-    sessionHost.Initialize(hostConfig, std::move(transport));
+    try
+    {
+        sessionHost.Initialize(hostConfig, std::move(transport));
+    }
+    catch (const std::exception& error)
+    {
+        LogError("Dedicated world startup failed: ", error.what());
+        steamServer.Shutdown();
+        return 1;
+    }
 
     LogInfo(
         "Dedicated world started. name='", options.serverName,

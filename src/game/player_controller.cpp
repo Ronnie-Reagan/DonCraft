@@ -158,6 +158,12 @@ void PlayerController::PlaceAt(const Vec3& position, const float yawRadians, con
     onGround_ = false;
 }
 
+void PlayerController::AddViewKick(const float yawRadiansDelta, const float pitchRadiansDelta)
+{
+    yawRadians_ = WrapAngle(yawRadians_ + yawRadiansDelta);
+    pitchRadians_ = Clamp(pitchRadians_ + pitchRadiansDelta, DegreesToRadians(-89.0f), DegreesToRadians(89.0f));
+}
+
 void PlayerController::Tick(const ControlState& input, const world::DemoWorld& world, const float dt)
 {
     yawRadians_ += input.lookYawDelta * 0.0026f;
@@ -207,7 +213,7 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     const Vec3 halfExtents = CollisionHalfExtents();
     constexpr float kFootToCenterHeight = 0.86f;
     constexpr Vec3 kFootHalfExtents{0.12f, 0.08f, 0.19f};
-    const float stepHeight = wasGrounded ? std::max(0.22f, world.CellSize() * 0.95f) : 0.0f;
+    const float stepHeight = wasGrounded ? std::max(0.32f, world.CellSize() * 1.35f) : 0.0f;
     const Vec3 horizontalDelta{velocity_.x * dt, 0.0f, velocity_.z * dt};
     if (!TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
     {
@@ -228,6 +234,15 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
         if (position_.z == previousZ)
         {
             velocity_.z = 0.0f;
+        }
+    }
+
+    if (wasGrounded && velocity_.y <= 0.0f)
+    {
+        Vec3 snappedPosition = position_;
+        if (SnapDownToGround(world, snappedPosition, halfExtents, stepHeight + world.CellSize() * 0.55f))
+        {
+            position_.y = snappedPosition.y;
         }
     }
 
@@ -308,8 +323,8 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     {
         groundedTargetCenterY /= static_cast<float>(groundedFeet);
         const float supportDelta = groundedTargetCenterY - position_.y;
-        const float maxSupportRise = wasGrounded ? stepHeight + 0.08f : 0.10f;
-        const float maxSupportDrop = wasGrounded ? stepHeight + world.CellSize() * 0.35f : std::max(0.12f, world.CellSize() * 0.35f);
+        const float maxSupportRise = wasGrounded ? stepHeight + world.CellSize() * 0.35f : 0.18f;
+        const float maxSupportDrop = wasGrounded ? stepHeight + world.CellSize() * 0.55f : std::max(0.18f, world.CellSize() * 0.45f);
         if (supportDelta >= -maxSupportDrop && supportDelta <= maxSupportRise)
         {
             position_.y = groundedTargetCenterY;
@@ -352,7 +367,7 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
         if (velocity_.y <= 0.0f && groundedFeet > 0)
         {
             groundedTargetCenterY /= static_cast<float>(groundedFeet);
-            const float catchDistance = wasGrounded ? (stepHeight + world.CellSize() * 0.35f) : std::max(0.12f, world.CellSize() * 0.35f);
+            const float catchDistance = wasGrounded ? (stepHeight + world.CellSize() * 0.55f) : std::max(0.18f, world.CellSize() * 0.45f);
             if ((position_.y - groundedTargetCenterY) >= -0.05f && (position_.y - groundedTargetCenterY) <= catchDistance)
             {
                 position_.y = groundedTargetCenterY;

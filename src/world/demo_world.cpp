@@ -9,11 +9,18 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <cstdio>
+#include <functional>
+#include <sstream>
+#include <thread>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <span>
+#include <system_error>
 #include <unordered_map>
 
 namespace df::world
@@ -37,7 +44,112 @@ constexpr std::uint32_t kWaterBacktrackCooldownPasses = 4u;
 constexpr int kLooseSimulationPaddingCells = 1;
 constexpr float kMpmSimulationIntervalSeconds = 1.0f / 60.0f;
 constexpr int kMpmSliceBudgetPerAxisPass = 16;
+constexpr std::size_t kMpmParticleWarningThreshold = 8192u;
 constexpr float kSurfaceIsoLevel = 0.5f;
+
+
+auto EnvFlagEnabled(const char* const name) -> bool
+{
+    const char* const value = std::getenv(name);
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    return value[0] == '1' || value[0] == 'T' || value[0] == 't' || value[0] == 'Y' || value[0] == 'y';
+}
+
+auto NextImmediateTraceCallId() -> std::uint64_t
+{
+    static std::atomic<std::uint64_t> nextId{1u};
+    return nextId.fetch_add(1u, std::memory_order_relaxed);
+}
+
+template <typename... Args>
+void EmitImmediateTrace(const char* const scope, const Args&... args)
+{
+    static std::atomic<std::uint64_t> sequence{1u};
+
+    std::ostringstream stream;
+    (stream << ... << args);
+    const std::string message = stream.str();
+    const std::uint64_t sequenceId = sequence.fetch_add(1u, std::memory_order_relaxed);
+    const unsigned long long threadId = static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+    std::fprintf(
+        stderr,
+        "[MPM-TRACE][%s][#%llu][tid=%llu] %s\n",
+        scope,
+        static_cast<unsigned long long>(sequenceId),
+        threadId,
+        message.c_str());
+    std::fflush(stderr);
+
+    try
+    {
+        std::ofstream traceFile("doncraft_mpm_trace.log", std::ios::app);
+        if (traceFile)
+        {
+            traceFile
+                << "[MPM-TRACE][" << scope << "][#" << sequenceId << "][tid=" << threadId << "] "
+                << message
+                << '\n';
+            traceFile.flush();
+        }
+    }
+    catch (...)
+    {
+    }
+
+    try
+    {
+        LogInfo("[MPM-TRACE][", scope, "][#", sequenceId, "][tid=", threadId, "] ", message);
+    }
+    catch (...)
+    {
+    }
+}
+
+void EmitImmediateTracePopup(const char* const title, const std::string& body, const bool force)
+{
+#if defined(SDL_MESSAGEBOX_ERROR)
+    static std::atomic<int> popupBudget{8};
+    if (!force && !EnvFlagEnabled("DONCRAFT_MPM_TRACE_POPUPS"))
+    {
+        return;
+    }
+
+    int expected = popupBudget.load(std::memory_order_relaxed);
+    while (expected > 0 &&
+           !popupBudget.compare_exchange_weak(expected, expected - 1, std::memory_order_relaxed))
+    {
+    }
+
+    if (expected > 0)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, body.c_str(), nullptr);
+    }
+#else
+    static_cast<void>(title);
+    static_cast<void>(body);
+    static_cast<void>(force);
+#endif
+}
+
+auto AllowGpuLooseMaterialSimulation() -> bool
+{
+    static const bool enabled = []()
+    {
+        const char* const value = std::getenv("DONCRAFT_ENABLE_VULKAN_MPM");
+        if (value == nullptr)
+        {
+            return false;
+        }
+
+        return value[0] == '1' || value[0] == 'T' || value[0] == 't' || value[0] == 'Y' || value[0] == 'y';
+    }();
+    return enabled;
+}
 constexpr float kSurfaceIntersectionEpsilon = 1.0e-4f;
 constexpr std::size_t kMinMeshChunkBudgetPerPass = 32u;
 constexpr std::size_t kMeshChunkBudgetPerWorker = 16u;
@@ -250,6 +362,11 @@ auto WaterSurfaceColor() -> Vec4
     return color;
 }
 
+auto UsesMpmLooseSimulation(const MaterialId material) -> bool
+{
+    return material == MaterialId::DrySand || material == MaterialId::WetMud;
+}
+
 auto PositionsNearlyEqual(const Vec3& lhs, const Vec3& rhs, const float epsilon = kSurfaceIntersectionEpsilon) -> bool
 {
     const Vec3 delta = lhs - rhs;
@@ -290,6 +407,87 @@ auto FindStableSurfaceNormal(const std::array<Vec3, 6>& points, const int pointC
     }
 
     return {};
+}
+
+auto TransformPointHomogeneous(const Mat4& matrix, const Vec3& point) -> Vec4
+{
+    return {
+        matrix(0, 0) * point.x + matrix(0, 1) * point.y + matrix(0, 2) * point.z + matrix(0, 3),
+        matrix(1, 0) * point.x + matrix(1, 1) * point.y + matrix(1, 2) * point.z + matrix(1, 3),
+        matrix(2, 0) * point.x + matrix(2, 1) * point.y + matrix(2, 2) * point.z + matrix(2, 3),
+        matrix(3, 0) * point.x + matrix(3, 1) * point.y + matrix(3, 2) * point.z + matrix(3, 3),
+    };
+}
+
+auto PointInsideAabb(const Vec3& point, const Vec3& minCorner, const Vec3& maxCorner) -> bool
+{
+    return point.x >= minCorner.x && point.x <= maxCorner.x &&
+           point.y >= minCorner.y && point.y <= maxCorner.y &&
+           point.z >= minCorner.z && point.z <= maxCorner.z;
+}
+
+auto BoxIntersectsClipSpace(const Mat4& worldToClip, const Vec3& minCorner, const Vec3& maxCorner, const Vec3& cameraPosition) -> bool
+{
+    if (PointInsideAabb(cameraPosition, minCorner, maxCorner))
+    {
+        return true;
+    }
+
+    const std::array<Vec3, 8> corners = {
+        Vec3{minCorner.x, minCorner.y, minCorner.z},
+        Vec3{maxCorner.x, minCorner.y, minCorner.z},
+        Vec3{minCorner.x, maxCorner.y, minCorner.z},
+        Vec3{maxCorner.x, maxCorner.y, minCorner.z},
+        Vec3{minCorner.x, minCorner.y, maxCorner.z},
+        Vec3{maxCorner.x, minCorner.y, maxCorner.z},
+        Vec3{minCorner.x, maxCorner.y, maxCorner.z},
+        Vec3{maxCorner.x, maxCorner.y, maxCorner.z},
+    };
+
+    bool allLeft = true;
+    bool allRight = true;
+    bool allBottom = true;
+    bool allTop = true;
+    bool allNear = true;
+    bool allFar = true;
+    bool anyInside = false;
+    bool anyBehindCamera = false;
+
+    for (const Vec3& corner : corners)
+    {
+        const Vec4 clip = TransformPointHomogeneous(worldToClip, corner);
+        if (!std::isfinite(clip.x) || !std::isfinite(clip.y) || !std::isfinite(clip.z) || !std::isfinite(clip.w))
+        {
+            continue;
+        }
+
+        if (clip.w <= 1.0e-6f)
+        {
+            anyBehindCamera = true;
+            continue;
+        }
+
+        allLeft = allLeft && (clip.x < -clip.w);
+        allRight = allRight && (clip.x > clip.w);
+        allBottom = allBottom && (clip.y < -clip.w);
+        allTop = allTop && (clip.y > clip.w);
+        allNear = allNear && (clip.z < 0.0f);
+        allFar = allFar && (clip.z > clip.w);
+
+        if (clip.x >= -clip.w && clip.x <= clip.w &&
+            clip.y >= -clip.w && clip.y <= clip.w &&
+            clip.z >= 0.0f && clip.z <= clip.w)
+        {
+            anyInside = true;
+        }
+    }
+
+    if (anyInside || anyBehindCamera)
+    {
+        return true;
+    }
+
+    return !(allLeft || allRight || allBottom || allTop || allNear || allFar);
 }
 }
 
@@ -401,6 +599,10 @@ void DemoWorld::RebuildChunkRuntimeState()
                 {
                     ++state.looseCellCount;
                 }
+                if (UsesMpmLooseSimulation(material))
+                {
+                    ++state.mpmCellCount;
+                }
             }
         }
     }
@@ -437,6 +639,10 @@ void DemoWorld::NoteCellMaterialChange(
     {
         --state.looseCellCount;
     }
+    if (UsesMpmLooseSimulation(previousMaterial) && state.mpmCellCount > 0u)
+    {
+        --state.mpmCellCount;
+    }
 
     if (nextMaterial != MaterialId::Air)
     {
@@ -446,6 +652,16 @@ void DemoWorld::NoteCellMaterialChange(
     {
         ++state.looseCellCount;
     }
+    if (UsesMpmLooseSimulation(nextMaterial))
+    {
+        ++state.mpmCellCount;
+    }
+}
+
+void DemoWorld::NotifyExternalTerrainEdit()
+{
+    mpmTimeAccumulator_ = 0.0f;
+    mpmStabilizationTicks_ = std::max(mpmStabilizationTicks_, 1);
 }
 
 void DemoWorld::TouchChunk(const ChunkCoord& chunk)
@@ -633,11 +849,13 @@ void DemoWorld::Reset()
 
     RebuildChunkRuntimeState();
     terrainDirty_ = true;
+    ++terrainContentVersion_;
     EnsureMpmBackend();
 }
 
 void DemoWorld::Tick(const float dt)
 {
+    const ScopedCrashContext crashContext("DemoWorld::Tick");
     const ScopedProfileSection tickScope(profiler_, "World Tick Internal");
     terrainRebuildCooldown_ = std::max(terrainRebuildCooldown_ - dt, 0.0f);
     std::optional<LooseSimulationBounds> looseBounds;
@@ -699,7 +917,10 @@ void DemoWorld::Tick(const float dt)
 
         {
             const ScopedProfileSection scope(profiler_, "World MPM");
-            SimulateLooseMaterialMpm(dt);
+            if (mpmStabilizationTicks_ <= 0)
+            {
+                SimulateLooseMaterialMpm(dt);
+            }
         }
     }
     else
@@ -728,11 +949,24 @@ void DemoWorld::Tick(const float dt)
         }
     }
 
+    if (mpmStabilizationTicks_ > 0)
+    {
+        --mpmStabilizationTicks_;
+    }
+
     PruneRetiredChunkStates();
 }
 
 bool DemoWorld::Save(const std::filesystem::path& path) const
 {
+    const ScopedCrashContext crashContext("DemoWorld::Save");
+    LogInfo(
+        "DemoWorld save begin path='", path.string(),
+        "' cells=", cells_.size(),
+        " active_chunks=", activeChunkCount_,
+        " tracked_chunks=", chunkRuntimeStates_.size(),
+        " terrain_mesh_version=", terrainMeshVersion_,
+        " terrain_content_version=", terrainContentVersion_);
     ByteWriter writer;
     writer.WritePod(kDemoWorldMagic);
     writer.WritePod(kDemoWorldVersion);
@@ -748,18 +982,32 @@ bool DemoWorld::Save(const std::filesystem::path& path) const
 
     if (path.has_parent_path())
     {
-        std::filesystem::create_directories(path.parent_path());
+        std::error_code createError;
+        std::filesystem::create_directories(path.parent_path(), createError);
+        if (createError)
+        {
+            LogError("DemoWorld save failed to create directory path='", path.parent_path().string(), "' error='", createError.message(), "'");
+            return false;
+        }
     }
 
     std::ofstream output(path, std::ios::binary);
     if (!output)
     {
+        LogError("DemoWorld save failed to open path='", path.string(), "'.");
         return false;
     }
 
     const auto bytes = writer.Span();
     output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return output.good();
+    if (!output.good())
+    {
+        LogError("DemoWorld save failed while writing path='", path.string(), "' bytes=", bytes.size());
+        return false;
+    }
+
+    LogInfo("DemoWorld save complete path='", path.string(), "' bytes=", bytes.size());
+    return true;
 }
 
 auto DemoWorld::CaptureSnapshot() const -> DenseWorldSnapshot
@@ -772,6 +1020,7 @@ auto DemoWorld::CaptureSnapshot() const -> DenseWorldSnapshot
 
 bool DemoWorld::ApplySnapshot(const DenseWorldSnapshot& snapshot)
 {
+    const ScopedCrashContext crashContext("DemoWorld::ApplySnapshot");
     const WorldGenerationSettings clampedSettings = ClampGenerationSettings(snapshot.settings);
     const std::size_t expectedCellCount =
         static_cast<std::size_t>(clampedSettings.worldWidth) *
@@ -795,21 +1044,50 @@ bool DemoWorld::ApplySnapshot(const DenseWorldSnapshot& snapshot)
     ResetTransientState();
     RebuildChunkRuntimeState();
     terrainDirty_ = true;
+    ++terrainContentVersion_;
     EnsureMpmBackend();
+    return true;
+}
+
+bool DemoWorld::ApplyCellEdits(const std::span<const CellMaterialEdit> edits)
+{
+    const std::size_t expectedCellCount = static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * static_cast<std::size_t>(depth_);
+    if (cells_.size() != expectedCellCount)
+    {
+        return false;
+    }
+
+    std::vector<ChunkCoord> changedChunks;
+    changedChunks.reserve(edits.size());
+    for (const CellMaterialEdit& edit : edits)
+    {
+        SetCellBatched(edit.x, edit.y, edit.z, edit.material, changedChunks);
+    }
+
+    const bool anyChange = !changedChunks.empty();
+    CommitChunkEdits(changedChunks);
+    if (anyChange)
+    {
+        NotifyExternalTerrainEdit();
+    }
+
     return true;
 }
 
 bool DemoWorld::Load(const std::filesystem::path& path)
 {
+    const ScopedCrashContext crashContext("DemoWorld::Load");
     std::ifstream input(path, std::ios::binary);
     if (!input)
     {
+        LogWarning("DemoWorld load failed to open path='", path.string(), "'.");
         return false;
     }
 
     const std::vector<char> rawBytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     if (rawBytes.size() < sizeof(std::uint32_t) * 2u)
     {
+        LogWarning("DemoWorld load falling back to legacy field path='", path.string(), "' reason='file too small for world header'");
         return LoadLegacyMaterialField(path);
     }
 
@@ -820,12 +1098,16 @@ bool DemoWorld::Load(const std::filesystem::path& path)
         const std::uint32_t magic = reader.ReadPod<std::uint32_t>();
         if (magic != kDemoWorldMagic)
         {
+            LogWarning(
+                "DemoWorld load falling back to legacy field path='", path.string(),
+                "' reason='unexpected magic' magic=0x", std::hex, magic, std::dec);
             return LoadLegacyMaterialField(path);
         }
 
         const std::uint32_t version = reader.ReadPod<std::uint32_t>();
         if (version != 2u && version != kDemoWorldVersion)
         {
+            LogError("DemoWorld load rejected unsupported version path='", path.string(), "' version=", version);
             return false;
         }
 
@@ -851,6 +1133,9 @@ bool DemoWorld::Load(const std::filesystem::path& path)
 
         if (width_ <= 0 || height_ <= 0 || depth_ <= 0)
         {
+            LogError(
+                "DemoWorld load rejected invalid dimensions path='", path.string(),
+                "' width=", width_, " height=", height_, " depth=", depth_);
             return false;
         }
 
@@ -859,6 +1144,7 @@ bool DemoWorld::Load(const std::filesystem::path& path)
         std::memcpy(cells_.data(), cellBytes.data(), cellBytes.size());
         if (!reader.Empty())
         {
+            LogError("DemoWorld load rejected trailing bytes path='", path.string(), "' remaining=", reader.RemainingBytes());
             return false;
         }
 
@@ -866,11 +1152,23 @@ bool DemoWorld::Load(const std::filesystem::path& path)
         ResetTransientState();
         RebuildChunkRuntimeState();
         terrainDirty_ = true;
+        ++terrainContentVersion_;
         EnsureMpmBackend();
+        LogInfo(
+            "DemoWorld load complete path='", path.string(),
+            "' cells=", cells_.size(),
+            " active_chunk_size=", activeChunkSize_,
+            " width=", width_,
+            " height=", height_,
+            " depth=", depth_);
         return true;
     }
-    catch (const std::exception&)
+    catch (const std::exception& error)
     {
+        LogWarning(
+            "DemoWorld load encountered exception path='", path.string(),
+            "' error='", error.what(),
+            "'; attempting legacy field fallback.");
         return LoadLegacyMaterialField(path);
     }
 }
@@ -994,6 +1292,7 @@ auto DemoWorld::Raycast(const Ray& ray, const float maxDistance) const -> Raycas
 
 void DemoWorld::ApplyDig(const Vec3& center, const float radius, const float power)
 {
+    const ScopedCrashContext crashContext("DemoWorld::ApplyDig");
     const Int3 minCell = WorldToCell(center - Vec3{radius, radius, radius});
     const Int3 maxCell = WorldToCell(center + Vec3{radius, radius, radius});
     std::vector<ChunkCoord> changedChunks;
@@ -1034,11 +1333,17 @@ void DemoWorld::ApplyDig(const Vec3& center, const float radius, const float pow
         }
     }
 
+    const bool hadChanges = !changedChunks.empty();
     CommitChunkEdits(changedChunks);
+    if (hadChanges)
+    {
+        NotifyExternalTerrainEdit();
+    }
 }
 
 void DemoWorld::ApplyRifleImpact(const Vec3& center, const Vec3& direction, const MaterialId impactMaterial)
 {
+    const ScopedCrashContext crashContext("DemoWorld::ApplyRifleImpact");
     float radius = 0.9f;
     float power = 0.75f;
 
@@ -1163,11 +1468,17 @@ void DemoWorld::ApplyRifleImpact(const Vec3& center, const Vec3& direction, cons
         }
     }
 
+    const bool hadChanges = !changedChunks.empty();
     CommitChunkEdits(changedChunks);
+    if (hadChanges)
+    {
+        NotifyExternalTerrainEdit();
+    }
 }
 
 void DemoWorld::ApplyExplosion(const Vec3& center, float radius, float power)
 {
+    const ScopedCrashContext crashContext("DemoWorld::ApplyExplosion");
     const MaterialId centerMaterial = MaterialAtWorldPosition(center);
     if (centerMaterial == MaterialId::ShallowWater)
     {
@@ -1297,12 +1608,29 @@ void DemoWorld::ApplyExplosion(const Vec3& center, float radius, float power)
         }
     }
 
+    const bool hadChanges = !changedChunks.empty();
     CommitChunkEdits(changedChunks);
+    if (hadChanges)
+    {
+        NotifyExternalTerrainEdit();
+    }
 }
 
 void DemoWorld::EditCell(const int x, const int y, const int z, const MaterialId material)
 {
+    if (!InBounds(x, y, z))
+    {
+        return;
+    }
+
+    const MaterialId previousMaterial = GetCell(x, y, z);
+    if (previousMaterial == material)
+    {
+        return;
+    }
+
     SetCell(x, y, z, material);
+    NotifyExternalTerrainEdit();
 }
 
 void DemoWorld::GatherRenderGeometry(
@@ -1393,6 +1721,147 @@ void DemoWorld::GatherRenderGeometrySmoothed(
             };
             AppendBoxLines(debugLines, minCorner, maxCorner, color);
         }
+    }
+}
+
+void DemoWorld::GatherRenderGeometrySmoothedCulled(
+    std::vector<render::ColorVertex3D>& opaqueTerrainTriangles,
+    std::vector<render::ColorVertex3D>& translucentTerrainTriangles,
+    std::vector<render::ColorVertex3D>& debugLines,
+    const Mat4& worldToClip,
+    const Vec3& cameraPosition,
+    const float maxDistanceMeters,
+    const bool showWireframe,
+    const bool showActiveChunks)
+{
+    const bool meshCacheInitialized = !solidSurfaceHeightMap_.empty() && !waterSurfaceHeightMap_.empty();
+    if (terrainDirty_ && (!meshCacheInitialized || terrainRebuildCooldown_ <= 0.0f))
+    {
+        RebuildMeshCache();
+    }
+
+    opaqueTerrainTriangles.clear();
+    translucentTerrainTriangles.clear();
+    debugLines.clear();
+
+    const int chunkSpan = std::max(activeChunkSize_, 1);
+    const float clampedDrawDistance = std::max(maxDistanceMeters, 1.0f);
+
+    std::vector<ChunkCoord> visibleChunks;
+    visibleChunks.reserve(chunkRuntimeStates_.size());
+    for (const auto& [chunk, state] : chunkRuntimeStates_)
+    {
+        if (state.opaqueTriangles.empty() && state.translucentTriangles.empty())
+        {
+            continue;
+        }
+
+        const Vec3 minCorner = WorldMin() + Vec3{
+            static_cast<float>(chunk.x * chunkSpan) * cellSize_,
+            static_cast<float>(chunk.y * chunkSpan) * cellSize_,
+            static_cast<float>(chunk.z * chunkSpan) * cellSize_,
+        };
+        const int chunkWidthCells = std::min(chunkSpan, std::max(width_ - chunk.x * chunkSpan, 0));
+        const int chunkHeightCells = std::min(chunkSpan, std::max(height_ - chunk.y * chunkSpan, 0));
+        const int chunkDepthCells = std::min(chunkSpan, std::max(depth_ - chunk.z * chunkSpan, 0));
+        if (chunkWidthCells <= 0 || chunkHeightCells <= 0 || chunkDepthCells <= 0)
+        {
+            continue;
+        }
+
+        const Vec3 maxCorner = minCorner + Vec3{
+            static_cast<float>(chunkWidthCells) * cellSize_,
+            static_cast<float>(chunkHeightCells) * cellSize_,
+            static_cast<float>(chunkDepthCells) * cellSize_,
+        };
+        const Vec3 center = (minCorner + maxCorner) * 0.5f;
+        const float radius = Length(maxCorner - center);
+        if (Length(center - cameraPosition) - radius > clampedDrawDistance)
+        {
+            continue;
+        }
+        if (!BoxIntersectsClipSpace(worldToClip, minCorner, maxCorner, cameraPosition))
+        {
+            continue;
+        }
+        visibleChunks.push_back(chunk);
+    }
+
+    std::sort(visibleChunks.begin(), visibleChunks.end(), [](const ChunkCoord& lhs, const ChunkCoord& rhs)
+    {
+        if (lhs.z != rhs.z)
+        {
+            return lhs.z < rhs.z;
+        }
+        if (lhs.y != rhs.y)
+        {
+            return lhs.y < rhs.y;
+        }
+        return lhs.x < rhs.x;
+    });
+
+    std::size_t totalOpaqueVertices = 0u;
+    std::size_t totalTranslucentVertices = 0u;
+    for (const ChunkCoord& chunk : visibleChunks)
+    {
+        const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
+        totalOpaqueVertices += state.opaqueTriangles.size();
+        totalTranslucentVertices += state.translucentTriangles.size();
+    }
+    opaqueTerrainTriangles.reserve(totalOpaqueVertices);
+    translucentTerrainTriangles.reserve(totalTranslucentVertices);
+    debugLines.reserve(showWireframe ? (totalOpaqueVertices + totalTranslucentVertices) * 2u : visibleChunks.size() * 24u);
+
+    if (showWireframe)
+    {
+        const auto appendWireframe = [&debugLines](const std::vector<render::ColorVertex3D>& triangles, const Vec4& color)
+        {
+            for (std::size_t index = 0; index + 2 < triangles.size(); index += 3)
+            {
+                const Vec3& a = triangles[index + 0].position;
+                const Vec3& b = triangles[index + 1].position;
+                const Vec3& c = triangles[index + 2].position;
+                debugLines.push_back({a, color});
+                debugLines.push_back({b, color});
+                debugLines.push_back({b, color});
+                debugLines.push_back({c, color});
+                debugLines.push_back({c, color});
+                debugLines.push_back({a, color});
+            }
+        };
+
+        for (const ChunkCoord& chunk : visibleChunks)
+        {
+            const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
+            appendWireframe(state.opaqueTriangles, MakeColor(0.05f, 0.05f, 0.05f, 0.85f));
+            appendWireframe(state.translucentTriangles, MakeColor(0.05f, 0.16f, 0.24f, 0.65f));
+        }
+    }
+
+    for (const ChunkCoord& chunk : visibleChunks)
+    {
+        const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
+        opaqueTerrainTriangles.insert(opaqueTerrainTriangles.end(), state.opaqueTriangles.begin(), state.opaqueTriangles.end());
+        translucentTerrainTriangles.insert(translucentTerrainTriangles.end(), state.translucentTriangles.begin(), state.translucentTriangles.end());
+
+        if (!showActiveChunks || state.activityLifetime <= 0.0f)
+        {
+            continue;
+        }
+
+        const float intensity = Clamp(state.activityLifetime / kActiveChunkLifetimeSeconds, 0.2f, 1.0f);
+        const Vec4 color = MakeColor(0.25f, 0.95f, 1.0f, intensity);
+        const Vec3 minCorner = WorldMin() + Vec3{
+            static_cast<float>(chunk.x * chunkSpan) * cellSize_,
+            static_cast<float>(chunk.y * chunkSpan) * cellSize_,
+            static_cast<float>(chunk.z * chunkSpan) * cellSize_,
+        };
+        const Vec3 maxCorner = minCorner + Vec3{
+            static_cast<float>(chunkSpan) * cellSize_,
+            static_cast<float>(chunkSpan) * cellSize_,
+            static_cast<float>(chunkSpan) * cellSize_,
+        };
+        AppendBoxLines(debugLines, minCorner, maxCorner, color);
     }
 }
 
@@ -1552,6 +2021,7 @@ void DemoWorld::CommitChunkEdits(std::vector<ChunkCoord>& changedChunks)
         MarkDirtyChunk(chunk);
     }
 
+    ++terrainContentVersion_;
     changedChunks.clear();
 }
 
@@ -1595,6 +2065,7 @@ void DemoWorld::SetCell(const int x, const int y, const int z, const MaterialId 
     SetCellUnchecked(x, y, z, material);
     ClearCellWaterMetadata(CellIndex(x, y, z));
     MarkDirty(x, y, z);
+    ++terrainContentVersion_;
 }
 
 auto DemoWorld::TryMoveCell(
@@ -1834,6 +2305,7 @@ void DemoWorld::SimulateWetMudPass(const LooseSimulationBounds& bounds)
 
 void DemoWorld::SimulateWaterFallPass(const LooseSimulationBounds& bounds)
 {
+    const ScopedCrashContext crashContext("DemoWorld::SimulateWaterFallPass");
     const ScanOrder scan = BuildScanOrder(++simulationStep_, width_, depth_);
     std::vector<ChunkCoord> changedChunks;
     const int xStart = scan.xStep > 0 ? bounds.minX : bounds.maxX;
@@ -1874,6 +2346,7 @@ void DemoWorld::SimulateWaterFallPass(const LooseSimulationBounds& bounds)
 
 void DemoWorld::SimulateWaterSpreadPass(const LooseSimulationBounds& bounds)
 {
+    const ScopedCrashContext crashContext("DemoWorld::SimulateWaterSpreadPass");
     const ScanOrder scan = BuildScanOrder(++simulationStep_, width_, depth_);
     std::vector<ChunkCoord> changedChunks;
     const int xStart = scan.xStep > 0 ? bounds.minX : bounds.maxX;
@@ -1948,12 +2421,12 @@ void DemoWorld::EnsureMpmBackend()
 
     if (!xySliceMpm_)
     {
-        xySliceMpm_ = std::make_unique<sim::VulkanMpm2D>(width_, height_, cellSize_, mpmDt_);
+        xySliceMpm_ = std::make_unique<sim::VulkanMpm2D>(width_, height_, cellSize_, mpmDt_, AllowGpuLooseMaterialSimulation());
         xySliceMpm_->SetCpuFallbackWorkerCount(mpmWorkerCount_);
     }
     if (!zySliceMpm_)
     {
-        zySliceMpm_ = std::make_unique<sim::VulkanMpm2D>(depth_, height_, cellSize_, mpmDt_);
+        zySliceMpm_ = std::make_unique<sim::VulkanMpm2D>(depth_, height_, cellSize_, mpmDt_, AllowGpuLooseMaterialSimulation());
         zySliceMpm_->SetCpuFallbackWorkerCount(mpmWorkerCount_);
     }
 }
@@ -1973,15 +2446,35 @@ auto DemoWorld::LooseMaterialParticleMass(const MaterialId material) const -> fl
     }
 }
 
+
 void DemoWorld::SimulateLooseMaterialMpm(const float dt)
 {
+    const ScopedCrashContext crashContext("DemoWorld::SimulateLooseMaterialMpm");
+    const std::uint64_t traceCallId = NextImmediateTraceCallId();
+    auto breadcrumb = [&](const char* const stage, const auto&... extra)
+    {
+        EmitImmediateTrace(
+            "DemoWorld::SimulateLooseMaterialMpm",
+            "call=", traceCallId,
+            " stage=", stage,
+            " dt=", dt,
+            " accum=", mpmTimeAccumulator_,
+            " xy_cursor=", mpmNextXySlice_,
+            " zy_cursor=", mpmNextZySlice_,
+            " active_chunks=", activeChunkCount_,
+            " tracked_chunks=", chunkRuntimeStates_.size(),
+            extra...);
+    };
+
+    // breadcrumb("ENTER");
+
     bool hasActiveLooseChunk = false;
     {
         const ScopedProfileSection scope(profiler_, "World MPM Scan");
         for (const auto& [chunk, state] : chunkRuntimeStates_)
         {
             static_cast<void>(chunk);
-            if (state.activityLifetime > 0.0f && state.looseCellCount > 0u)
+            if (state.activityLifetime > 0.0f && state.mpmCellCount > 0u)
             {
                 hasActiveLooseChunk = true;
                 break;
@@ -1989,327 +2482,770 @@ void DemoWorld::SimulateLooseMaterialMpm(const float dt)
         }
     }
 
+    // breadcrumb("POST_SCAN", " has_active_loose_chunk=", hasActiveLooseChunk);
+
     if (!hasActiveLooseChunk)
     {
         mpmTimeAccumulator_ = 0.0f;
         mpmNextXySlice_ = 0;
         mpmNextZySlice_ = 0;
+        // breadcrumb("NO_ACTIVE_CHUNKS_RESET");
         return;
     }
 
     mpmTimeAccumulator_ += dt;
     if (mpmTimeAccumulator_ < kMpmSimulationIntervalSeconds)
     {
+        // breadcrumb("ACCUMULATING_ONLY", " threshold=", kMpmSimulationIntervalSeconds);
         return;
     }
     mpmTimeAccumulator_ = std::max(0.0f, mpmTimeAccumulator_ - kMpmSimulationIntervalSeconds);
+    // breadcrumb("STEP_TRIGGERED", " threshold=", kMpmSimulationIntervalSeconds);
 
     {
         const ScopedProfileSection scope(profiler_, "World MPM Backend");
+        // breadcrumb("BEFORE_ENSURE_BACKEND");
         EnsureMpmBackend();
+        // breadcrumb(
+        //    "AFTER_ENSURE_BACKEND",
+        //    " xy_backend_ptr=", static_cast<const void*>(xySliceMpm_.get()),
+        //    " zy_backend_ptr=", static_cast<const void*>(zySliceMpm_.get()),
+        //    " active_backend_name=", activeMpmBackendName_);
     }
 
     {
         const ScopedProfileSection scope(profiler_, "World MPM Slice XY");
+        // breadcrumb("BEFORE_SLICE_XY");
         SimulateLooseMaterialSlicePass(true, kMpmSliceBudgetPerAxisPass);
+        // breadcrumb("AFTER_SLICE_XY", " active_backend_name=", activeMpmBackendName_, " worker_count=", mpmWorkerCount_);
     }
     {
         const ScopedProfileSection scope(profiler_, "World MPM Slice ZY");
+        // breadcrumb("BEFORE_SLICE_ZY");
         SimulateLooseMaterialSlicePass(false, kMpmSliceBudgetPerAxisPass);
+        // breadcrumb("AFTER_SLICE_ZY", " active_backend_name=", activeMpmBackendName_, " worker_count=", mpmWorkerCount_);
     }
+
+    // breadcrumb("EXIT");
 }
 
 void DemoWorld::SimulateLooseMaterialSlicePass(const bool slicesAlongZ, const int sliceBudget)
 {
+    const ScopedCrashContext crashContext("DemoWorld::SimulateLooseMaterialSlicePass");
     const ScopedProfileSection sliceScope(profiler_, "World MPM Slice Internal");
-    if (sliceBudget <= 0)
-    {
-        return;
-    }
 
-    sim::VulkanMpm2D* backend = slicesAlongZ ? xySliceMpm_.get() : zySliceMpm_.get();
-    if (backend == nullptr)
-    {
-        return;
-    }
+    const std::uint64_t traceCallId = NextImmediateTraceCallId();
+    const char* const axisName = slicesAlongZ ? "XY" : "ZY";
+    bool popupShownThisCall = false;
+    int currentSliceForLogs = -1;
+    int patchWidthForLogs = 0;
+    int patchHeightForLogs = 0;
+    std::size_t emittedParticleCountForLogs = 0;
+    const bool disableBackendStep = EnvFlagEnabled("DONCRAFT_MPM_DISABLE_BACKEND_STEP");
+    const bool disableRebuild = EnvFlagEnabled("DONCRAFT_MPM_DISABLE_REBUILD");
+    const bool disableCommit = EnvFlagEnabled("DONCRAFT_MPM_DISABLE_COMMIT");
 
-    int& nextSliceCursor = slicesAlongZ ? mpmNextXySlice_ : mpmNextZySlice_;
-    const int chunkSpan = std::max(activeChunkSize_, 1);
-    const int sliceCount = slicesAlongZ ? depth_ : width_;
-    const int lateralCount = slicesAlongZ ? width_ : depth_;
-    struct SliceBounds
+    auto showGuardedPopup = [&](const std::string& title, const std::string& body, const bool force)
     {
-        int minU = std::numeric_limits<int>::max();
-        int maxU = std::numeric_limits<int>::min();
-        int minY = std::numeric_limits<int>::max();
-        int maxY = std::numeric_limits<int>::min();
+        if (popupShownThisCall && !force)
+        {
+            return;
+        }
+
+        popupShownThisCall = true;
+        EmitImmediateTracePopup(title.c_str(), body, force);
     };
 
+    auto breadcrumb = [&](const char* const stage, const auto&... extra)
     {
-        const ScopedProfileSection boundsScope(profiler_, "World MPM Slice Bounds");
-        std::vector<SliceBounds> activeSliceBounds(static_cast<std::size_t>(sliceCount));
-        for (const auto& [chunk, state] : chunkRuntimeStates_)
-        {
-            if (state.activityLifetime <= 0.0f || state.looseCellCount == 0u)
-            {
-                continue;
-            }
+        EmitImmediateTrace(
+            "DemoWorld::SimulateLooseMaterialSlicePass",
+            "call=", traceCallId,
+            " axis=", axisName,
+            " stage=", stage,
+            " slice_budget=", sliceBudget,
+            " slice=", currentSliceForLogs,
+            " patch=", patchWidthForLogs, "x", patchHeightForLogs,
+            " emitted_particles=", emittedParticleCountForLogs,
+            " active_chunks=", activeChunkCount_,
+            " tracked_chunks=", chunkRuntimeStates_.size(),
+            extra...);
+    };
 
-            const int sliceStart = slicesAlongZ ? chunk.z * chunkSpan : chunk.x * chunkSpan;
-            const int sliceEnd = std::min(sliceCount - 1, sliceStart + chunkSpan - 1);
-            const int lateralStart = std::max(0, (slicesAlongZ ? chunk.x : chunk.z) * chunkSpan - 1);
-            const int lateralEnd = std::min(lateralCount - 1, (slicesAlongZ ? chunk.x : chunk.z) * chunkSpan + chunkSpan);
-            const int verticalStart = std::max(0, chunk.y * chunkSpan - 1);
-            const int verticalEnd = std::min(height_ - 1, chunk.y * chunkSpan + chunkSpan);
-            for (int slice = std::max(0, sliceStart); slice <= sliceEnd; ++slice)
-            {
-                SliceBounds& bounds = activeSliceBounds[static_cast<std::size_t>(slice)];
-                bounds.minU = std::min(bounds.minU, lateralStart);
-                bounds.maxU = std::max(bounds.maxU, lateralEnd);
-                bounds.minY = std::min(bounds.minY, verticalStart);
-                bounds.maxY = std::max(bounds.maxY, verticalEnd);
-            }
+    auto reportFailure = [&](const char* const stage, const std::string& detail)
+    {
+        // breadcrumb("FAIL", " fail_stage=", stage, " detail=", detail);
+        showGuardedPopup(
+            "DonCraft recovered from loose-material pass failure",
+            std::string("Stage: ") + stage +
+            "\nAxis: " + axisName +
+            "\nSlice: " + std::to_string(currentSliceForLogs) +
+            "\nPatch: " + std::to_string(patchWidthForLogs) + "x" + std::to_string(patchHeightForLogs) +
+            "\nParticles: " + std::to_string(emittedParticleCountForLogs) +
+            "\n\n" + detail,
+            true);
+    };
+
+    // breadcrumb(
+    //    "ENTER",
+    //    " disable_backend_step=", disableBackendStep,
+    //    " disable_rebuild=", disableRebuild,
+    //    " disable_commit=", disableCommit,
+    //    " width=", width_,
+    //    " height=", height_,
+    //    " depth=", depth_,
+    //    " active_chunk_size=", activeChunkSize_);
+
+    try
+    {
+        if (sliceBudget <= 0)
+        {
+            // breadcrumb("EARLY_RETURN_ZERO_BUDGET");
+            return;
         }
 
-        const auto worldCoords = [&](const int u, const int y, const int slice) -> Int3
+        if (width_ <= 0 || height_ <= 0 || depth_ <= 0)
         {
-            return slicesAlongZ ? Int3{u, y, slice} : Int3{slice, y, u};
+            reportFailure("ValidateWorld", "World dimensions are invalid.");
+            return;
+        }
+
+        const std::size_t totalCellCount =
+            static_cast<std::size_t>(width_) *
+            static_cast<std::size_t>(height_) *
+            static_cast<std::size_t>(depth_);
+
+        if (waterLastLateralDirection_.size() < totalCellCount ||
+            waterLastLateralPass_.size() < totalCellCount)
+        {
+            reportFailure(
+                "ValidateWorldArrays",
+                "waterLastLateral arrays are smaller than total world cell count.");
+            return;
+        }
+
+        sim::VulkanMpm2D* backend = slicesAlongZ ? xySliceMpm_.get() : zySliceMpm_.get();
+        // breadcrumb("BACKEND_SELECTED", " backend_ptr=", static_cast<const void*>(backend));
+
+        if (backend == nullptr)
+        {
+            reportFailure("ValidateBackend", "Selected 2D MPM backend is null.");
+            return;
+        }
+
+        // breadcrumb(
+        //    "BACKEND_STATE",
+        //    " backend_name=", backend->ActiveBackendName(),
+        //    " backend_available=", backend->IsAvailable(),
+        //    " grid=", backend->GridWidth(), "x", backend->GridHeight(),
+        //    " failure='", backend->FailureMessage(), "'");
+
+        if (backend->GridWidth() <= 1 || backend->GridHeight() <= 1)
+        {
+            reportFailure(
+                "ValidateBackend",
+                "Backend grid dimensions are invalid: " +
+                std::to_string(backend->GridWidth()) + "x" +
+                std::to_string(backend->GridHeight()));
+            return;
+        }
+
+        int& nextSliceCursor = slicesAlongZ ? mpmNextXySlice_ : mpmNextZySlice_;
+        const int chunkSpan = std::max(activeChunkSize_, 1);
+        const int sliceCount = slicesAlongZ ? depth_ : width_;
+        const int lateralCount = slicesAlongZ ? width_ : depth_;
+
+        // breadcrumb(
+        //    "DIMENSIONS_READY",
+        //    " next_slice_cursor=", nextSliceCursor,
+        //    " chunk_span=", chunkSpan,
+        //    " slice_count=", sliceCount,
+        //    " lateral_count=", lateralCount);
+
+        if (sliceCount <= 0 || lateralCount <= 0)
+        {
+            // breadcrumb("EARLY_RETURN_NO_SLICES");
+            return;
+        }
+
+        struct SliceBounds
+        {
+            int minU = std::numeric_limits<int>::max();
+            int maxU = std::numeric_limits<int>::min();
+            int minY = std::numeric_limits<int>::max();
+            int maxY = std::numeric_limits<int>::min();
         };
-        const auto sliceLinearIndex = [lateralCount](const int u, const int y) -> std::size_t
+
         {
-            return static_cast<std::size_t>(y * lateralCount + u);
-        };
+            const ScopedProfileSection boundsScope(profiler_, "World MPM Slice Bounds");
 
-        struct SettlementCandidate
-        {
-            std::size_t particleIndex = 0;
-            int targetU = 0;
-            int targetY = 0;
-        };
+            std::vector<SliceBounds> activeSliceBounds(static_cast<std::size_t>(sliceCount));
+            // breadcrumb("BOUNDS_BEGIN", " active_slice_bound_count=", activeSliceBounds.size());
 
-        std::vector<MaterialId> particleMaterials;
-        std::vector<MaterialId> rebuilt;
-        std::vector<std::uint8_t> occupied;
-        std::vector<SettlementCandidate> settlementOrder;
-
-        bool anyChange = false;
-        int processedSlices = 0;
-        int visitedSlices = 0;
-        int sliceCursor = sliceCount > 0 ? std::clamp(nextSliceCursor, 0, sliceCount - 1) : 0;
-        while (visitedSlices < sliceCount && processedSlices < sliceBudget)
-        {
-            const int slice = sliceCursor;
-            sliceCursor = (sliceCursor + 1) % sliceCount;
-            ++visitedSlices;
-
-            const SliceBounds& bounds = activeSliceBounds[static_cast<std::size_t>(slice)];
-            if (bounds.maxU < bounds.minU || bounds.maxY < bounds.minY)
+            for (const auto& [chunk, state] : chunkRuntimeStates_)
             {
-                continue;
+                if (state.activityLifetime <= 0.0f || state.mpmCellCount == 0u)
+                {
+                    continue;
+                }
+
+                const int sliceStart = slicesAlongZ ? chunk.z * chunkSpan : chunk.x * chunkSpan;
+                const int sliceEnd = std::min(sliceCount - 1, sliceStart + chunkSpan - 1);
+                const int lateralStart = std::max(0, (slicesAlongZ ? chunk.x : chunk.z) * chunkSpan - 1);
+                const int lateralEnd = std::min(lateralCount - 1, (slicesAlongZ ? chunk.x : chunk.z) * chunkSpan + chunkSpan);
+                const int verticalStart = std::max(0, chunk.y * chunkSpan - 1);
+                const int verticalEnd = std::min(height_ - 1, chunk.y * chunkSpan + chunkSpan);
+
+                for (int slice = std::max(0, sliceStart); slice <= sliceEnd; ++slice)
+                {
+                    SliceBounds& bounds = activeSliceBounds[static_cast<std::size_t>(slice)];
+                    bounds.minU = std::min(bounds.minU, lateralStart);
+                    bounds.maxU = std::max(bounds.maxU, lateralEnd);
+                    bounds.minY = std::min(bounds.minY, verticalStart);
+                    bounds.maxY = std::max(bounds.maxY, verticalEnd);
+                }
             }
-            ++processedSlices;
 
-            const int patchUBegin = bounds.minU;
-            const int patchUEnd = std::min(lateralCount, bounds.maxU + 1);
-            const int patchYBegin = bounds.minY;
-            const int patchYEnd = std::min(height_, bounds.maxY + 1);
-            const int patchWidth = std::max(0, patchUEnd - patchUBegin);
-            const int patchHeight = std::max(0, patchYEnd - patchYBegin);
-            if (patchWidth <= 0 || patchHeight <= 0)
-            {
-                continue;
-            }
+            // breadcrumb("BOUNDS_READY");
 
-            const auto patchLinearIndex = [patchUBegin, patchYBegin, patchWidth](const int u, const int y) -> std::size_t
+            const auto worldCoords = [&](const int u, const int y, const int slice) -> Int3
             {
-                return static_cast<std::size_t>((y - patchYBegin) * patchWidth + (u - patchUBegin));
+                return slicesAlongZ ? Int3{u, y, slice} : Int3{slice, y, u};
             };
 
-            const std::size_t patchCellCount = static_cast<std::size_t>(patchWidth * patchHeight);
+            struct SettlementCandidate
             {
-                const ScopedProfileSection setupScope(profiler_, "World MPM Slice Setup");
-                backend->ClearParticles();
-                particleMaterials.clear();
-                settlementOrder.clear();
-                rebuilt.assign(patchCellCount, MaterialId::Air);
-                occupied.assign(patchCellCount, static_cast<std::uint8_t>(0));
-                particleMaterials.reserve(patchCellCount);
-                settlementOrder.reserve(patchCellCount);
+                std::size_t particleIndex = 0;
+                int targetU = 0;
+                int targetY = 0;
+            };
 
-                for (int y = patchYBegin; y < patchYEnd; ++y)
+            std::vector<MaterialId> particleMaterials;
+            std::vector<MaterialId> rebuilt;
+            std::vector<std::uint8_t> occupied;
+            std::vector<SettlementCandidate> settlementOrder;
+
+            bool anyChange = false;
+            int processedSlices = 0;
+            int visitedSlices = 0;
+            int sliceCursor = std::clamp(nextSliceCursor, 0, sliceCount - 1);
+
+            // breadcrumb("LOOP_BEGIN", " starting_slice_cursor=", sliceCursor);
+
+            while (visitedSlices < sliceCount && processedSlices < sliceBudget)
+            {
+                const int slice = sliceCursor;
+                currentSliceForLogs = slice;
+                sliceCursor = (sliceCursor + 1) % sliceCount;
+                ++visitedSlices;
+
+                const SliceBounds& bounds = activeSliceBounds[static_cast<std::size_t>(slice)];
+                if (bounds.maxU < bounds.minU || bounds.maxY < bounds.minY)
                 {
-                    for (int u = patchUBegin; u < patchUEnd; ++u)
-                    {
-                        const Int3 cell = worldCoords(u, y, slice);
-                        const MaterialId material = GetCell(cell.x, cell.y, cell.z);
-                        const std::size_t idx = patchLinearIndex(u, y);
-                        if (IsLooseMaterial(material))
-                        {
-                            backend->AddParticle({
-                                Vec2{(static_cast<float>(u) + 0.5f) * cellSize_, (static_cast<float>(y) + 0.5f) * cellSize_},
-                                Vec2{},
-                                LooseMaterialParticleMass(material),
-                            });
-                            particleMaterials.push_back(material);
-                        }
-                        else
-                        {
-                            rebuilt[idx] = material;
-                            occupied[idx] = material != MaterialId::Air ? 1u : 0u;
-                        }
-                    }
-                }
-            }
-
-            if (particleMaterials.empty())
-            {
-                continue;
-            }
-
-            {
-                const ScopedProfileSection backendScope(profiler_, "World MPM Backend Step");
-                backend->Step(-9.81f);
-                activeMpmBackendName_ = backend->ActiveBackendName();
-                mpmWorkerCount_ = backend->CpuFallbackWorkerCount();
-            }
-
-            {
-                const ScopedProfileSection rebuildScope(profiler_, "World MPM Slice Rebuild");
-                const auto& particles = backend->Particles();
-                {
-                    const ScopedProfileSection targetsScope(profiler_, "World MPM Rebuild Targets");
-                    for (std::size_t particleIndex = 0; particleIndex < particles.size() && particleIndex < particleMaterials.size(); ++particleIndex)
-                    {
-                        settlementOrder.push_back({
-                            particleIndex,
-                            std::clamp(static_cast<int>(std::floor(particles[particleIndex].position.x / cellSize_)), patchUBegin, patchUEnd - 1),
-                            std::clamp(static_cast<int>(std::floor(particles[particleIndex].position.y / cellSize_)), patchYBegin, patchYEnd - 1),
-                        });
-                    }
+                    // breadcrumb("SLICE_SKIPPED_INACTIVE", " visited_slices=", visitedSlices, " processed_slices=", processedSlices);
+                    continue;
                 }
 
+                ++processedSlices;
+
+                const int patchUBegin = bounds.minU;
+                const int patchUEnd = std::min(lateralCount, bounds.maxU + 1);
+                const int patchYBegin = bounds.minY;
+                const int patchYEnd = std::min(height_, bounds.maxY + 1);
+                const int patchWidth = std::max(0, patchUEnd - patchUBegin);
+                const int patchHeight = std::max(0, patchYEnd - patchYBegin);
+
+                patchWidthForLogs = patchWidth;
+                patchHeightForLogs = patchHeight;
+                emittedParticleCountForLogs = 0;
+
+                // breadcrumb(
+                //    "SLICE_ACTIVE",
+                //    " visited_slices=", visitedSlices,
+                //    " processed_slices=", processedSlices,
+                //    " patch_u=[", patchUBegin, ",", patchUEnd, ")",
+                //    " patch_y=[", patchYBegin, ",", patchYEnd, ")");
+
+                if (patchWidth <= 0 || patchHeight <= 0)
                 {
-                    const ScopedProfileSection sortScope(profiler_, "World MPM Rebuild Sort");
-                    std::stable_sort(settlementOrder.begin(), settlementOrder.end(), [](const SettlementCandidate& lhs, const SettlementCandidate& rhs)
-                    {
-                        if (lhs.targetY != rhs.targetY)
-                        {
-                            return lhs.targetY < rhs.targetY;
-                        }
-                        return lhs.targetU < rhs.targetU;
-                    });
+                    // breadcrumb("SLICE_SKIPPED_EMPTY_PATCH");
+                    continue;
                 }
 
-                const auto tryPlaceInColumn = [&](const MaterialId material, const int candidateU, const int targetY) -> bool
+                const std::size_t patchWidthSz = static_cast<std::size_t>(patchWidth);
+                const std::size_t patchHeightSz = static_cast<std::size_t>(patchHeight);
+
+                if (patchWidthSz != 0 &&
+                    patchHeightSz > (std::numeric_limits<std::size_t>::max() / patchWidthSz))
                 {
-                    if (candidateU < patchUBegin || candidateU >= patchUEnd)
-                    {
-                        return false;
-                    }
+                    reportFailure("PatchSizing", "patchWidth * patchHeight overflowed size_t.");
+                    continue;
+                }
 
-                    for (int deltaY = 0; deltaY < patchHeight; ++deltaY)
-                    {
-                        const int belowY = targetY - deltaY;
-                        if (belowY >= patchYBegin)
-                        {
-                            const std::size_t idx = patchLinearIndex(candidateU, belowY);
-                            if (!occupied[idx])
-                            {
-                                rebuilt[idx] = material;
-                                occupied[idx] = true;
-                                return true;
-                            }
-                        }
+                const std::size_t patchCellCount = patchWidthSz * patchHeightSz;
 
-                        if (deltaY == 0)
-                        {
-                            continue;
-                        }
-
-                        const int aboveY = targetY + deltaY;
-                        if (aboveY < patchYEnd)
-                        {
-                            const std::size_t idx = patchLinearIndex(candidateU, aboveY);
-                            if (!occupied[idx])
-                            {
-                                rebuilt[idx] = material;
-                                occupied[idx] = true;
-                                return true;
-                            }
-                        }
-                    }
-
-                    return false;
+                const auto patchLinearIndex = [patchUBegin, patchYBegin, patchWidth](const int u, const int y) -> std::size_t
+                {
+                    return static_cast<std::size_t>(y - patchYBegin) * static_cast<std::size_t>(patchWidth) +
+                           static_cast<std::size_t>(u - patchUBegin);
                 };
 
+                bool skipSlice = false;
+
                 {
-                    const ScopedProfileSection placeScope(profiler_, "World MPM Rebuild Place");
-                    for (const SettlementCandidate& candidate : settlementOrder)
+                    const ScopedProfileSection setupScope(profiler_, "World MPM Slice Setup");
+
+                    // breadcrumb("BEFORE_BACKEND_CLEAR", " backend_particles_before_clear=", backend->Particles().size());
+                    backend->ClearParticles();
+                    // breadcrumb("AFTER_BACKEND_CLEAR", " backend_particles_after_clear=", backend->Particles().size());
+
+                    particleMaterials.clear();
+                    settlementOrder.clear();
+                    rebuilt.assign(patchCellCount, MaterialId::Air);
+                    occupied.assign(patchCellCount, static_cast<std::uint8_t>(0));
+                    particleMaterials.reserve(patchCellCount);
+                    settlementOrder.reserve(patchCellCount);
+
+                    // breadcrumb("BEFORE_SETUP_SCAN", " patch_cell_count=", patchCellCount);
+
+                    for (int y = patchYBegin; y < patchYEnd && !skipSlice; ++y)
                     {
-                        const MaterialId material = particleMaterials[candidate.particleIndex];
-                        bool placed = tryPlaceInColumn(material, candidate.targetU, candidate.targetY);
-                        for (int lateralOffset = 1; !placed && lateralOffset < patchWidth; ++lateralOffset)
+                        for (int u = patchUBegin; u < patchUEnd; ++u)
                         {
-                            placed = tryPlaceInColumn(material, candidate.targetU - lateralOffset, candidate.targetY);
-                            if (!placed)
+                            const Int3 cell = worldCoords(u, y, slice);
+                            if (cell.x < 0 || cell.x >= width_ ||
+                                cell.y < 0 || cell.y >= height_ ||
+                                cell.z < 0 || cell.z >= depth_)
                             {
-                                placed = tryPlaceInColumn(material, candidate.targetU + lateralOffset, candidate.targetY);
+                                reportFailure(
+                                    "PatchSetupWorldCoords",
+                                    "worldCoords produced out-of-range cell (" +
+                                    std::to_string(cell.x) + "," +
+                                    std::to_string(cell.y) + "," +
+                                    std::to_string(cell.z) + ").");
+                                skipSlice = true;
+                                break;
+                            }
+
+                            const std::size_t idx = patchLinearIndex(u, y);
+                            if (idx >= patchCellCount)
+                            {
+                                reportFailure(
+                                    "PatchSetupIndex",
+                                    "patchLinearIndex out of range during setup: idx=" +
+                                    std::to_string(idx) + " patchCellCount=" +
+                                    std::to_string(patchCellCount) + ".");
+                                skipSlice = true;
+                                break;
+                            }
+
+                            const MaterialId material = GetCell(cell.x, cell.y, cell.z);
+                            if (UsesMpmLooseSimulation(material))
+                            {
+                                backend->AddParticle({
+                                    Vec2{
+                                        (static_cast<float>(u - patchUBegin) + 0.5f) * cellSize_,
+                                        (static_cast<float>(y - patchYBegin) + 0.5f) * cellSize_,
+                                    },
+                                    Vec2{},
+                                    LooseMaterialParticleMass(material),
+                                });
+                                particleMaterials.push_back(material);
+                            }
+                            else
+                            {
+                                rebuilt[idx] = material;
+                                occupied[idx] = material != MaterialId::Air ? 1u : 0u;
                             }
                         }
                     }
-                }
-            }
 
-            {
-                const ScopedProfileSection commitScope(profiler_, "World MPM Slice Commit");
-                bool sliceChanged = false;
-                std::vector<ChunkCoord> changedChunks;
-                changedChunks.reserve(static_cast<std::size_t>(std::max(1, patchWidth * patchHeight / std::max(chunkSpan * chunkSpan, 1))));
-                for (int y = patchYBegin; y < patchYEnd; ++y)
-                {
-                    for (int u = patchUBegin; u < patchUEnd; ++u)
+                    emittedParticleCountForLogs = particleMaterials.size();
+                    // breadcrumb(
+                    //    "AFTER_SETUP_SCAN",
+                    //    " skip_slice=", skipSlice,
+                    //    " particle_material_count=", particleMaterials.size(),
+                    //    " backend_particles=", backend->Particles().size());
+
+                    if (particleMaterials.size() > kMpmParticleWarningThreshold)
                     {
-                        const Int3 cell = worldCoords(u, y, slice);
-                        const std::size_t worldIdx = CellIndex(cell.x, cell.y, cell.z);
-                        const MaterialId material = rebuilt[patchLinearIndex(u, y)];
-                        const MaterialId previousMaterial = GetCell(cell.x, cell.y, cell.z);
-                        if (previousMaterial != material)
-                        {
-                            NoteCellMaterialChange(cell.x, cell.y, cell.z, previousMaterial, material);
-                            SetCellUnchecked(cell.x, cell.y, cell.z, material);
-                            waterLastLateralDirection_[worldIdx] = 0;
-                            waterLastLateralPass_[worldIdx] = 0u;
-                            sliceChanged = true;
-                            changedChunks.push_back(CellToChunkCoord(cell.x, cell.y, cell.z));
-                        }
-                        else if (IsLooseMaterial(material))
-                        {
-                            waterLastLateralDirection_[worldIdx] = 0;
-                            waterLastLateralPass_[worldIdx] = 0u;
-                        }
+                        LogWarning(
+                            "DemoWorld large MPM slice load axis=", axisName,
+                            " slice=", slice,
+                            " particles=", particleMaterials.size(),
+                            " patch=", patchWidth, "x", patchHeight,
+                            " active_chunks=", activeChunkCount_,
+                            " tracked_chunks=", chunkRuntimeStates_.size());
                     }
                 }
 
-                if (sliceChanged)
+                if (skipSlice)
                 {
-                    anyChange = true;
-                    CommitChunkEdits(changedChunks);
+                    // breadcrumb("SLICE_SKIPPED_AFTER_SETUP_FAILURE");
+                    continue;
+                }
+
+                if (particleMaterials.empty())
+                {
+                    // breadcrumb("SLICE_SKIPPED_NO_PARTICLES");
+                    continue;
+                }
+
+                {
+                    const ScopedProfileSection backendScope(profiler_, "World MPM Backend Step");
+
+                    if ((patchWidth + 1) > backend->GridWidth() || (patchHeight + 1) > backend->GridHeight())
+                    {
+                        reportFailure(
+                            "BackendGrid",
+                            "Patch exceeds backend grid. patch=" +
+                            std::to_string(patchWidth) + "x" + std::to_string(patchHeight) +
+                            " grid=" +
+                            std::to_string(backend->GridWidth()) + "x" +
+                            std::to_string(backend->GridHeight()) + ".");
+                        continue;
+                    }
+
+                    // breadcrumb(
+                    //    "BEFORE_BACKEND_STEP",
+                    //    " backend_name=", backend->ActiveBackendName(),
+                    //    " particle_count=", backend->Particles().size(),
+                    //    " total_particle_mass=", backend->TotalParticleMass(),
+                    //    " total_grid_mass=", backend->TotalGridMass());
+
+                    if (disableBackendStep)
+                    {
+                        // breadcrumb("BACKEND_STEP_DISABLED_BY_ENV");
+                    }
+                    else
+                    {
+                        backend->Step(-9.81f);
+                        // breadcrumb(
+                        //    "AFTER_BACKEND_STEP",
+                        //    " backend_name=", backend->ActiveBackendName(),
+                        //    " returned_particles=", backend->Particles().size(),
+                        //    " total_particle_mass=", backend->TotalParticleMass(),
+                        //    " total_grid_mass=", backend->TotalGridMass());
+                    }
+
+                    activeMpmBackendName_ = backend->ActiveBackendName();
+                    mpmWorkerCount_ = backend->CpuFallbackWorkerCount();
+                }
+
+                if (disableRebuild)
+                {
+                    // breadcrumb("REBUILD_DISABLED_BY_ENV");
+                    continue;
+                }
+
+                {
+                    const ScopedProfileSection rebuildScope(profiler_, "World MPM Slice Rebuild");
+                    // breadcrumb("BEFORE_BACKEND_PARTICLES_VIEW");
+                    const auto& particles = backend->Particles();
+                    // breadcrumb("AFTER_BACKEND_PARTICLES_VIEW", " returned_particles=", particles.size());
+
+                    if (particles.size() != particleMaterials.size())
+                    {
+                        LogWarning(
+                            "Loose material particle count mismatch after backend step",
+                            " axis=", axisName,
+                            " slice=", slice,
+                            " emitted=", particleMaterials.size(),
+                            " returned=", particles.size());
+                    }
+
+                    {
+                        const ScopedProfileSection targetsScope(profiler_, "World MPM Rebuild Targets");
+
+                        // breadcrumb("BEFORE_REBUILD_TARGETS");
+
+                        for (std::size_t particleIndex = 0;
+                             particleIndex < particles.size() && particleIndex < particleMaterials.size();
+                             ++particleIndex)
+                        {
+                            const int localU = std::clamp(
+                                static_cast<int>(std::floor(particles[particleIndex].position.x / cellSize_)),
+                                0,
+                                patchWidth - 1);
+
+                            const int localY = std::clamp(
+                                static_cast<int>(std::floor(particles[particleIndex].position.y / cellSize_)),
+                                0,
+                                patchHeight - 1);
+
+                            settlementOrder.push_back({
+                                particleIndex,
+                                patchUBegin + localU,
+                                patchYBegin + localY,
+                            });
+                        }
+
+                        // breadcrumb("AFTER_REBUILD_TARGETS", " settlement_candidates=", settlementOrder.size());
+                    }
+
+                    {
+                        const ScopedProfileSection sortScope(profiler_, "World MPM Rebuild Sort");
+                        // breadcrumb("BEFORE_REBUILD_SORT");
+                        std::stable_sort(
+                            settlementOrder.begin(),
+                            settlementOrder.end(),
+                            [](const SettlementCandidate& lhs, const SettlementCandidate& rhs)
+                            {
+                                if (lhs.targetY != rhs.targetY)
+                                {
+                                    return lhs.targetY < rhs.targetY;
+                                }
+                                return lhs.targetU < rhs.targetU;
+                            });
+                        // breadcrumb("AFTER_REBUILD_SORT");
+                    }
+
+                    bool rebuildCorrupt = false;
+
+                    const auto tryPlaceInColumn = [&](const MaterialId material, const int candidateU, const int targetY) -> bool
+                    {
+                        if (candidateU < patchUBegin || candidateU >= patchUEnd)
+                        {
+                            return false;
+                        }
+
+                        for (int deltaY = 0; deltaY < patchHeight; ++deltaY)
+                        {
+                            const int belowY = targetY - deltaY;
+                            if (belowY >= patchYBegin)
+                            {
+                                const std::size_t idx = patchLinearIndex(candidateU, belowY);
+                                if (idx >= patchCellCount)
+                                {
+                                    reportFailure(
+                                        "RebuildPlaceIndex",
+                                        "patchLinearIndex out of range while placing below: idx=" +
+                                        std::to_string(idx) + " patchCellCount=" +
+                                        std::to_string(patchCellCount) + ".");
+                                    rebuildCorrupt = true;
+                                    return false;
+                                }
+
+                                if (!occupied[idx])
+                                {
+                                    rebuilt[idx] = material;
+                                    occupied[idx] = true;
+                                    return true;
+                                }
+                            }
+
+                            if (deltaY == 0)
+                            {
+                                continue;
+                            }
+
+                            const int aboveY = targetY + deltaY;
+                            if (aboveY < patchYEnd)
+                            {
+                                const std::size_t idx = patchLinearIndex(candidateU, aboveY);
+                                if (idx >= patchCellCount)
+                                {
+                                    reportFailure(
+                                        "RebuildPlaceIndex",
+                                        "patchLinearIndex out of range while placing above: idx=" +
+                                        std::to_string(idx) + " patchCellCount=" +
+                                        std::to_string(patchCellCount) + ".");
+                                    rebuildCorrupt = true;
+                                    return false;
+                                }
+
+                                if (!occupied[idx])
+                                {
+                                    rebuilt[idx] = material;
+                                    occupied[idx] = true;
+                                    return true;
+                                }
+                            }
+                        }
+
+                        return false;
+                    };
+
+                    {
+                        const ScopedProfileSection placeScope(profiler_, "World MPM Rebuild Place");
+                        // breadcrumb("BEFORE_REBUILD_PLACE");
+
+                        for (const SettlementCandidate& candidate : settlementOrder)
+                        {
+                            if (candidate.particleIndex >= particleMaterials.size())
+                            {
+                                reportFailure(
+                                    "RebuildCandidate",
+                                    "candidate.particleIndex out of range: " +
+                                    std::to_string(candidate.particleIndex) + " >= " +
+                                    std::to_string(particleMaterials.size()) + ".");
+                                rebuildCorrupt = true;
+                                break;
+                            }
+
+                            const MaterialId material = particleMaterials[candidate.particleIndex];
+                            bool placed = tryPlaceInColumn(material, candidate.targetU, candidate.targetY);
+
+                            for (int lateralOffset = 1; !placed && lateralOffset < patchWidth; ++lateralOffset)
+                            {
+                                placed = tryPlaceInColumn(material, candidate.targetU - lateralOffset, candidate.targetY);
+                                if (!placed)
+                                {
+                                    placed = tryPlaceInColumn(material, candidate.targetU + lateralOffset, candidate.targetY);
+                                }
+                            }
+
+                            if (rebuildCorrupt)
+                            {
+                                break;
+                            }
+                        }
+
+                        // breadcrumb("AFTER_REBUILD_PLACE", " rebuild_corrupt=", rebuildCorrupt);
+                    }
+
+                    if (rebuildCorrupt)
+                    {
+                        // breadcrumb("SLICE_SKIPPED_REBUILD_CORRUPT");
+                        continue;
+                    }
+                }
+
+                if (disableCommit)
+                {
+                    // breadcrumb("COMMIT_DISABLED_BY_ENV");
+                    continue;
+                }
+
+                {
+                    const ScopedProfileSection commitScope(profiler_, "World MPM Slice Commit");
+
+                    bool sliceChanged = false;
+                    std::vector<ChunkCoord> changedChunks;
+                    changedChunks.reserve(static_cast<std::size_t>(
+                        std::max(1, patchWidth * patchHeight / std::max(chunkSpan * chunkSpan, 1))));
+
+                    bool commitCorrupt = false;
+                    // breadcrumb("BEFORE_COMMIT_SCAN");
+
+                    for (int y = patchYBegin; y < patchYEnd && !commitCorrupt; ++y)
+                    {
+                        for (int u = patchUBegin; u < patchUEnd; ++u)
+                        {
+                            const Int3 cell = worldCoords(u, y, slice);
+                            if (cell.x < 0 || cell.x >= width_ ||
+                                cell.y < 0 || cell.y >= height_ ||
+                                cell.z < 0 || cell.z >= depth_)
+                            {
+                                reportFailure(
+                                    "CommitWorldCoords",
+                                    "worldCoords produced out-of-range cell during commit (" +
+                                    std::to_string(cell.x) + "," +
+                                    std::to_string(cell.y) + "," +
+                                    std::to_string(cell.z) + ").");
+                                commitCorrupt = true;
+                                break;
+                            }
+
+                            const std::size_t patchIdx = patchLinearIndex(u, y);
+                            if (patchIdx >= patchCellCount)
+                            {
+                                reportFailure(
+                                    "CommitPatchIndex",
+                                    "patchLinearIndex out of range during commit: idx=" +
+                                    std::to_string(patchIdx) + " patchCellCount=" +
+                                    std::to_string(patchCellCount) + ".");
+                                commitCorrupt = true;
+                                break;
+                            }
+
+                            const std::size_t worldIdx = CellIndex(cell.x, cell.y, cell.z);
+                            if (worldIdx >= totalCellCount ||
+                                worldIdx >= waterLastLateralDirection_.size() ||
+                                worldIdx >= waterLastLateralPass_.size())
+                            {
+                                reportFailure(
+                                    "CommitWorldIndex",
+                                    "CellIndex out of range during commit: worldIdx=" +
+                                    std::to_string(worldIdx) + " totalCellCount=" +
+                                    std::to_string(totalCellCount) + ".");
+                                commitCorrupt = true;
+                                break;
+                            }
+
+                            const MaterialId material = rebuilt[patchIdx];
+                            const MaterialId previousMaterial = GetCell(cell.x, cell.y, cell.z);
+
+                            if (previousMaterial != material)
+                            {
+                                NoteCellMaterialChange(cell.x, cell.y, cell.z, previousMaterial, material);
+                                SetCellUnchecked(cell.x, cell.y, cell.z, material);
+                                waterLastLateralDirection_[worldIdx] = 0;
+                                waterLastLateralPass_[worldIdx] = 0u;
+                                sliceChanged = true;
+                                changedChunks.push_back(CellToChunkCoord(cell.x, cell.y, cell.z));
+                            }
+                            else if (IsLooseMaterial(material))
+                            {
+                                waterLastLateralDirection_[worldIdx] = 0;
+                                waterLastLateralPass_[worldIdx] = 0u;
+                            }
+                        }
+                    }
+
+                    // breadcrumb(
+                    //    "AFTER_COMMIT_SCAN",
+                    //    " commit_corrupt=", commitCorrupt,
+                    //    " slice_changed=", sliceChanged,
+                    //    " changed_chunk_refs=", changedChunks.size());
+
+                    if (commitCorrupt)
+                    {
+                        continue;
+                    }
+
+                    if (sliceChanged)
+                    {
+                        anyChange = true;
+                        // breadcrumb("BEFORE_COMMIT_CHUNK_EDITS", " changed_chunk_refs=", changedChunks.size());
+                        CommitChunkEdits(changedChunks);
+                        // breadcrumb("AFTER_COMMIT_CHUNK_EDITS", " unique_changed_chunk_refs=", changedChunks.size());
+                    }
                 }
             }
-        }
-        nextSliceCursor = processedSlices > 0 ? sliceCursor : 0;
 
-        if (anyChange)
-        {
-            terrainDirty_ = true;
+            nextSliceCursor = processedSlices > 0 ? sliceCursor : 0;
+            // breadcrumb(
+            //    "LOOP_END",
+            //    " processed_slices=", processedSlices,
+            //    " visited_slices=", visitedSlices,
+            //    " next_slice_cursor=", nextSliceCursor,
+            //    " any_change=", anyChange);
+
+            if (anyChange)
+            {
+                terrainDirty_ = true;
+            }
         }
     }
+    catch (const std::exception& e)
+    {
+        reportFailure("Exception", std::string("Caught std::exception: ") + e.what());
+    }
+    catch (...)
+    {
+        reportFailure("Exception", "Caught unknown exception.");
+    }
+
+    // breadcrumb("EXIT");
 }
+
 
 auto DemoWorld::LoadLegacyMaterialField(const std::filesystem::path& path) -> bool
 {
     if (!field_.Load(path))
     {
+        LogError("DemoWorld legacy field load failed path='", path.string(), "'.");
         return false;
     }
 
@@ -2333,12 +3269,15 @@ auto DemoWorld::LoadLegacyMaterialField(const std::filesystem::path& path) -> bo
     ResetTransientState();
     RebuildChunkRuntimeState();
     terrainDirty_ = true;
+    ++terrainContentVersion_;
     EnsureMpmBackend();
+    LogInfo("DemoWorld legacy field load complete path='", path.string(), "' cells=", cells_.size());
     return true;
 }
 
 void DemoWorld::RebuildMeshCache()
 {
+    const ScopedCrashContext crashContext("DemoWorld::RebuildMeshCache");
     if (meshWorkerCount_ == 0)
     {
         meshWorkerCount_ = JobSystem::RecommendWorkerCount(1);
@@ -2988,7 +3927,7 @@ void DemoWorld::RebuildMeshCache()
                                 maxDensity = std::max(maxDensity, cubeDensities[cornerIndexValue]);
                             }
 
-                            if (minDensity >= kSurfaceIsoLevel || maxDensity < kSurfaceIsoLevel)
+                            if (minDensity > kSurfaceIsoLevel || maxDensity < kSurfaceIsoLevel)
                             {
                                 continue;
                             }

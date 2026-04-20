@@ -70,6 +70,8 @@ private:
         BufferResource translucentTerrainVertexBuffer{};
         BufferResource dynamicVertexBuffer{};
         BufferResource dynamicTranslucentVertexBuffer{};
+        BufferResource viewModelVertexBuffer{};
+        BufferResource viewModelPostScopeVertexBuffer{};
         BufferResource effectVertexBuffer{};
         BufferResource lineVertexBuffer{};
         BufferResource overlayVertexBuffer{};

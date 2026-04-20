@@ -26,6 +26,8 @@ bool AudioDevice::Initialize()
         return true;
     }
 
+    shuttingDown_.store(false, std::memory_order_release);
+
     SDL_AudioSpec spec{};
     spec.format = SDL_AUDIO_F32;
     spec.channels = 1;
@@ -44,6 +46,7 @@ void AudioDevice::Shutdown()
 {
     if (stream_ != nullptr)
     {
+        shuttingDown_.store(true, std::memory_order_release);
         SDL_DestroyAudioStream(stream_);
         stream_ = nullptr;
     }
@@ -80,6 +83,11 @@ void AudioDevice::SetEngineState(const float load, const float roughness, const 
 void SDLCALL AudioDevice::StreamCallback(void* userdata, SDL_AudioStream* stream, const int additionalAmount, int)
 {
     auto* device = static_cast<AudioDevice*>(userdata);
+    if (device == nullptr || device->shuttingDown_.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
     const int sampleCount = additionalAmount / static_cast<int>(sizeof(float));
     if (sampleCount <= 0)
     {
@@ -93,6 +101,11 @@ void SDLCALL AudioDevice::StreamCallback(void* userdata, SDL_AudioStream* stream
 
 void AudioDevice::Mix(float* samples, const int sampleCount)
 {
+    if (shuttingDown_.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
     std::scoped_lock lock(mutex_);
 
     for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)

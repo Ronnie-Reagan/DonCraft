@@ -5,7 +5,10 @@
 #include "world/material_properties.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <stdexcept>
+#include <system_error>
 
 namespace df::game
 {
@@ -14,13 +17,11 @@ namespace
 constexpr float kGrenadeRadius = 0.16f;
 constexpr float kBulletRadius = 0.035f;
 constexpr Vec3 kWorldUp{0.0f, 1.0f, 0.0f};
-constexpr float kRifleWeaponCycleDecayRate = 6.5f;
-constexpr float kDigWeaponCycleDecayRate = 2.1f;
 constexpr float kDigRepeatCooldownSeconds = 0.42f;
 
 auto WeaponCycleDecayRate(const ToolType tool) -> float
 {
-    return tool == ToolType::Dig ? kDigWeaponCycleDecayRate : kRifleWeaponCycleDecayRate;
+    return GetWeaponDefinition(tool).weaponCycleDecayRate;
 }
 
 auto FlatForwardFromDirection(const Vec3& forward) -> Vec3
@@ -34,7 +35,63 @@ auto RightFromForward(const Vec3& forward) -> Vec3
     return Normalize(Cross(FlatForwardFromDirection(forward), kWorldUp));
 }
 
+auto WeaponSightLocalPoint(const ToolType tool) -> Vec3
+{
+    return GetWeaponViewTuning(tool).ads.sightLocalPoint;
+}
+
+auto WeaponAdsEyeRelief(const ToolType tool) -> float
+{
+    return GetWeaponViewTuning(tool).ads.eyeReliefMeters;
+}
+
+auto WeaponMuzzleLocalPoint(const ToolType tool) -> Vec3
+{
+    return GetWeaponViewTuning(tool).muzzleLocalPoint;
+}
+
+auto SequenceGreaterThan(const std::uint32_t lhs, const std::uint32_t rhs) -> bool
+{
+    return static_cast<std::int32_t>(lhs - rhs) > 0;
+}
+
+void ResetPlayerWeaponInventories(SessionRuntime::PlayerState& player)
+{
+    player.weaponInventories = {};
+    for (const ToolType tool : {ToolType::Rifle, ToolType::Smg})
+    {
+        const WeaponDefinition definition = GetWeaponDefinition(tool);
+        SessionRuntime::PlayerState::WeaponInventory& inventory = player.weaponInventories[ToToolIndex(tool)];
+        inventory.ammoInMagazine = definition.magazineCapacity;
+        inventory.reserveAmmo = definition.startingReserveAmmo;
+    }
+}
+
+auto ActiveWeaponInventory(SessionRuntime::PlayerState& player) -> SessionRuntime::PlayerState::WeaponInventory&
+{
+    return player.weaponInventories[ToToolIndex(player.tool)];
+}
+
+auto ActiveWeaponInventory(const SessionRuntime::PlayerState& player) -> const SessionRuntime::PlayerState::WeaponInventory&
+{
+    return player.weaponInventories[ToToolIndex(player.tool)];
+}
+
+auto RecoilNoise(const SessionRuntime::PlayerState& player, const std::uint64_t tickIndex) -> float
+{
+    std::uint64_t state = tickIndex * 0x9e3779b97f4a7c15ull;
+    state ^= static_cast<std::uint64_t>(player.id) * 0xbf58476d1ce4e5b9ull;
+    state ^= static_cast<std::uint64_t>(player.lastAppliedCommandSequence) * 0x94d049bb133111ebull;
+    state ^= state >> 30u;
+    state *= 0xbf58476d1ce4e5b9ull;
+    state ^= state >> 27u;
+    state *= 0x94d049bb133111ebull;
+    state ^= state >> 31u;
+    return static_cast<float>(state & 0xffffu) / 32767.5f - 1.0f;
+}
+
 auto BuildHeldItemBasis(
+    const ToolType tool,
     const Vec3& aimPosition,
     const Vec3& forward,
     const float walkCycle,
@@ -48,11 +105,13 @@ auto BuildHeldItemBasis(
     basis.origin += basis.right * Lerp(std::sin(walkCycle) * 0.024f * swayWeight + 0.30f, 0.015f, clampedAdsBlend);
     basis.origin -= basis.up * Lerp(0.21f - std::abs(std::sin(walkCycle * 0.5f)) * 0.018f * swayWeight, 0.055f, clampedAdsBlend);
     basis.origin += basis.forward * Lerp(0.52f, 0.66f, clampedAdsBlend);
-    basis.origin -= basis.forward * (weaponCycle * weaponCycle) * 0.08f;
-    if (clampedAdsBlend > 0.0f)
+    const WeaponDefinition definition = GetWeaponDefinition(tool);
+    basis.origin -= basis.forward * (weaponCycle * weaponCycle) * definition.viewModelKickDistance;
+    basis.origin += basis.up * weaponCycle * definition.viewModelKickRise;
+    if (clampedAdsBlend > 0.0f && definition.supportsAds)
     {
-        const Vec3 sightPoint = model::TransformPoint(basis, Vec3{0.0f, 0.07f, 0.20f});
-        const Vec3 desiredSightPoint = aimPosition + basis.forward * 0.40f;
+        const Vec3 sightPoint = model::TransformPoint(basis, WeaponSightLocalPoint(tool));
+        const Vec3 desiredSightPoint = aimPosition + basis.forward * WeaponAdsEyeRelief(tool);
         basis.origin += (desiredSightPoint - sightPoint) * clampedAdsBlend;
     }
     return basis;
@@ -65,7 +124,7 @@ auto BuildShovelBasis(
     const float moveSpeed,
     const float weaponCycle) -> model::Basis3
 {
-    model::Basis3 basis = BuildHeldItemBasis(aimPosition, forward, walkCycle, moveSpeed, weaponCycle);
+    model::Basis3 basis = BuildHeldItemBasis(ToolType::Dig, aimPosition, forward, walkCycle, moveSpeed, weaponCycle);
     const float swingPhase = Clamp(weaponCycle, 0.0f, 1.0f);
     const float swingPitch = DegreesToRadians(Lerp(30.0f, -56.0f, swingPhase));
     const float swingYaw = DegreesToRadians(Lerp(-8.0f, 12.0f, swingPhase));
@@ -84,11 +143,9 @@ auto BuildShovelBladeCenter(const model::Basis3& shovelBasis) -> Vec3
 
 auto BuildPlayerHeldItemBasis(const SessionRuntime::PlayerState& player) -> model::Basis3
 {
-    const float adsBlend =
-        player.tool == ToolType::Rifle && player.command.secondaryDown
-            ? 1.0f
-            : 0.0f;
+    const float adsBlend = GetWeaponDefinition(player.tool).supportsAds && player.command.secondaryDown ? 1.0f : 0.0f;
     return BuildHeldItemBasis(
+        player.tool,
         player.controller.CameraPosition(),
         player.controller.ForwardVector(),
         player.controller.WalkCycleRadians(),
@@ -97,10 +154,10 @@ auto BuildPlayerHeldItemBasis(const SessionRuntime::PlayerState& player) -> mode
         adsBlend);
 }
 
-auto BuildRifleMuzzlePosition(const SessionRuntime::PlayerState& player) -> Vec3
+auto BuildGunMuzzlePosition(const SessionRuntime::PlayerState& player) -> Vec3
 {
     const model::Basis3 heldItemBasis = BuildPlayerHeldItemBasis(player);
-    return model::TransformPoint(heldItemBasis, Vec3{0.0f, -0.01f, 0.96f});
+    return model::TransformPoint(heldItemBasis, WeaponMuzzleLocalPoint(player.tool));
 }
 
 void IntegrateOrientation(Vec3& forward, Vec3& up, const Vec3& angularVelocity, const float dt)
@@ -138,9 +195,29 @@ void SessionRuntime::Initialize(const Config& config)
 {
     config_ = config;
     world_.SetGenerationSettings(config_.generationSettings);
-    if (!config_.savePath.empty() && config_.loadExistingWorld && world_.Load(config_.savePath))
+    if (!config_.savePath.empty() && config_.loadExistingWorld)
     {
-        config_.generationSettings = world_.GenerationSettings();
+        std::error_code existsError;
+        const bool saveExists = std::filesystem::exists(config_.savePath, existsError);
+        if (existsError)
+        {
+            throw std::runtime_error("Failed to inspect world save path '" + config_.savePath.string() + "': " + existsError.message());
+        }
+
+        if (saveExists)
+        {
+            if (!world_.Load(config_.savePath))
+            {
+                throw std::runtime_error("Failed to load world save '" + config_.savePath.string() + "'.");
+            }
+
+            config_.generationSettings = world_.GenerationSettings();
+        }
+        else
+        {
+            LogInfo("Session runtime starting a new world because save path was not found: ", config_.savePath.string());
+            world_.Reset();
+        }
     }
     else
     {
@@ -171,6 +248,7 @@ bool SessionRuntime::AddPlayer(const PlayerId id, const std::string_view name)
     state.id = id;
     state.name = std::string(name);
     state.controller.Spawn(world_);
+    ResetPlayerWeaponInventories(state);
     players_.emplace(id, std::move(state));
     return true;
 }
@@ -191,20 +269,34 @@ void SessionRuntime::RemovePlayer(const PlayerId id)
     players_.erase(iter);
 }
 
-void SessionRuntime::SubmitCommand(const PlayerId id, const PlayerCommandFrame& command)
+bool SessionRuntime::SubmitCommand(const PlayerId id, const PlayerCommandFrame& command)
 {
     auto* const player = FindPlayer(id);
     if (player == nullptr)
     {
-        return;
+        return false;
     }
 
+    if (player->hasReceivedCommand && !SequenceGreaterThan(command.sequence, player->command.sequence))
+    {
+        return false;
+    }
+
+    if (player->tool != command.selectedTool)
+    {
+        player->reloading = false;
+        player->reloadTimer = 0.0f;
+        player->reloadDuration = 0.0f;
+    }
     player->command = command;
+    player->hasReceivedCommand = true;
     player->tool = command.selectedTool;
+    return true;
 }
 
 void SessionRuntime::Tick(const float dt)
 {
+    const ScopedCrashContext crashContext("SessionRuntime::Tick");
     TickPlayers(dt);
     TickTruck(dt);
     world_.Tick(dt);
@@ -225,12 +317,22 @@ void SessionRuntime::Tick(const float dt)
 
 bool SessionRuntime::SaveNow() const
 {
+    const ScopedCrashContext crashContext("SessionRuntime::SaveNow");
     if (config_.savePath.empty())
     {
         return false;
     }
 
-    return world_.Save(config_.savePath);
+    LogInfo(
+        "SessionRuntime save requested path='", config_.savePath.string(),
+        "' tick=", tickIndex_,
+        " players=", players_.size());
+    const bool saved = world_.Save(config_.savePath);
+    if (!saved)
+    {
+        LogError("SessionRuntime save failed path='", config_.savePath.string(), "'.");
+    }
+    return saved;
 }
 
 bool SessionRuntime::LoadFromDisk()
@@ -297,13 +399,18 @@ void SessionRuntime::ResetActors()
         player.controller.Spawn(world_);
         player.tool = ToolType::Rifle;
         player.drivingTruck = false;
-        player.rifleCooldown = 0.0f;
+        ResetPlayerWeaponInventories(player);
+        player.fireCooldown = 0.0f;
         player.digCooldown = 0.0f;
+        player.reloadTimer = 0.0f;
+        player.reloadDuration = 0.0f;
         player.weaponCycle = 0.0f;
         player.footstepCooldown = 0.0f;
+        player.reloading = false;
         player.crosshairMaterial = world::MaterialId::Air;
         player.lastAppliedCommandSequence = 0;
         player.command = {};
+        player.hasReceivedCommand = false;
     }
 }
 
@@ -316,10 +423,18 @@ void SessionRuntime::TickPlayers(const float dt)
 {
     for (auto& [id, player] : players_)
     {
-        player.rifleCooldown = std::max(0.0f, player.rifleCooldown - dt);
+        player.fireCooldown = std::max(0.0f, player.fireCooldown - dt);
         player.digCooldown = std::max(0.0f, player.digCooldown - dt);
         player.weaponCycle = std::max(0.0f, player.weaponCycle - dt * WeaponCycleDecayRate(player.tool));
         player.footstepCooldown = std::max(0.0f, player.footstepCooldown - dt);
+        if (player.reloading)
+        {
+            player.reloadTimer = std::max(0.0f, player.reloadTimer - dt);
+            if (player.reloadTimer <= 0.0f)
+            {
+                CompleteReload(player);
+            }
+        }
 
         if (player.command.interactPressed)
         {
@@ -381,29 +496,66 @@ void SessionRuntime::TickPlayers(const float dt)
 
         if (!player.drivingTruck && player.command.quickGrenadePressed)
         {
+            player.reloading = false;
+            player.reloadTimer = 0.0f;
+            player.reloadDuration = 0.0f;
             SpawnGrenade(player);
         }
 
         if (!player.drivingTruck)
         {
+            if (player.command.reloadPressed)
+            {
+                StartReload(player);
+            }
+
             switch (player.tool)
             {
             case ToolType::Grenade:
                 if (player.command.primaryPressed)
                 {
+                    player.reloading = false;
+                    player.reloadTimer = 0.0f;
+                    player.reloadDuration = 0.0f;
                     SpawnGrenade(player);
                 }
                 break;
             case ToolType::Rifle:
-                if (player.command.primaryDown && player.rifleCooldown <= 0.0f)
+            case ToolType::Smg:
+            {
+                const WeaponDefinition definition = GetWeaponDefinition(player.tool);
+                const bool wantsFire = definition.automatic ? player.command.primaryDown : player.command.primaryPressed;
+                if (wantsFire && player.fireCooldown <= 0.0f)
                 {
-                    FireRifle(player);
-                    player.rifleCooldown = 0.14f;
+                    if (player.reloading)
+                    {
+                        player.reloading = false;
+                        player.reloadTimer = 0.0f;
+                        player.reloadDuration = 0.0f;
+                    }
+
+                    PlayerState::WeaponInventory& inventory = ActiveWeaponInventory(player);
+                    if (inventory.ammoInMagazine > 0)
+                    {
+                        FireWeapon(player);
+                        player.fireCooldown = definition.fireCooldownSeconds;
+                    }
+                    else
+                    {
+                        StartReload(player);
+                        player.fireCooldown = 0.12f;
+                        player.weaponCycle = std::max(player.weaponCycle, 0.22f);
+                        QueueAudioCue({190.0f, 0.03f, 0.05f, 0.05f, -40.0f});
+                    }
                 }
                 break;
+            }
             case ToolType::Dig:
                 if (player.command.primaryDown && player.digCooldown <= 0.0f)
                 {
+                    player.reloading = false;
+                    player.reloadTimer = 0.0f;
+                    player.reloadDuration = 0.0f;
                     UseDigTool(player);
                     player.digCooldown = kDigRepeatCooldownSeconds;
                 }
@@ -444,30 +596,90 @@ void SessionRuntime::UpdatePlayerCrosshair(PlayerState& player)
     player.crosshairMaterial = sightHit.hit ? sightHit.material : world::MaterialId::Air;
 }
 
-void SessionRuntime::FireRifle(PlayerState& player)
+void SessionRuntime::FireWeapon(PlayerState& player)
 {
+    PlayerState::WeaponInventory& inventory = ActiveWeaponInventory(player);
+    if (inventory.ammoInMagazine <= 0)
+    {
+        return;
+    }
+
+    --inventory.ammoInMagazine;
     const Vec3 sightOrigin = CurrentAimPosition(player);
     const Vec3 sightDirection = CurrentForwardVector(player);
     const world::RaycastHit sightHit = world_.Raycast({sightOrigin, sightDirection}, 140.0f);
-    const Vec3 origin = BuildRifleMuzzlePosition(player);
+    const Vec3 origin = BuildGunMuzzlePosition(player);
     Vec3 direction = Normalize((sightHit.hit ? sightHit.position : (sightOrigin + sightDirection * 140.0f)) - origin);
     if (LengthSquared(direction) <= 1.0e-6f)
     {
         direction = sightDirection;
     }
+    const WeaponDefinition definition = GetWeaponDefinition(player.tool);
+    const CartridgeDefinition cartridge = GetCartridgeDefinition(definition.cartridge);
     player.weaponCycle = 1.0f;
 
     Bullet bullet{};
     bullet.ownerId = player.id;
     bullet.position = origin;
     bullet.previousPosition = origin;
-    bullet.velocity = direction * 112.0f;
+    bullet.velocity = direction * cartridge.muzzleVelocity;
     bullet.ttl = 8.0f;
     bullets_.push_back(bullet);
 
-    QueueAudioCue({74.0f, 0.11f, 0.26f, 0.18f, -36.0f});
-    QueueAudioCue({238.0f, 0.06f, 0.18f, 0.14f, 18.0f});
-    QueueAudioCue({820.0f, 0.03f, 0.08f, 0.30f, -140.0f});
+    const float yawKick = DegreesToRadians(cartridge.recoilYawDegrees * definition.recoilYawMultiplier * RecoilNoise(player, tickIndex_));
+    const float pitchKick = DegreesToRadians(cartridge.recoilPitchDegrees * definition.recoilPitchMultiplier);
+    player.controller.AddViewKick(yawKick, pitchKick);
+
+    if (player.tool == ToolType::Smg)
+    {
+        QueueAudioCue({118.0f, 0.06f, 0.16f, 0.16f, -22.0f});
+        QueueAudioCue({360.0f, 0.03f, 0.10f, 0.12f, 24.0f});
+    }
+    else
+    {
+        QueueAudioCue({74.0f, 0.11f, 0.26f, 0.18f, -36.0f});
+        QueueAudioCue({238.0f, 0.06f, 0.18f, 0.14f, 18.0f});
+        QueueAudioCue({820.0f, 0.03f, 0.08f, 0.30f, -140.0f});
+    }
+}
+
+void SessionRuntime::StartReload(PlayerState& player)
+{
+    const WeaponDefinition definition = GetWeaponDefinition(player.tool);
+    if (!definition.usesMagazine || !IsFirearmTool(player.tool))
+    {
+        return;
+    }
+
+    PlayerState::WeaponInventory& inventory = ActiveWeaponInventory(player);
+    if (player.reloading || inventory.reserveAmmo <= 0 || inventory.ammoInMagazine >= definition.magazineCapacity)
+    {
+        return;
+    }
+
+    player.reloading = true;
+    player.reloadTimer = definition.reloadDurationSeconds;
+    player.reloadDuration = definition.reloadDurationSeconds;
+    player.fireCooldown = std::max(player.fireCooldown, 0.18f);
+    QueueAudioCue(player.tool == ToolType::Smg
+        ? AudioCue{148.0f, 0.08f, 0.08f, 0.14f, 18.0f}
+        : AudioCue{112.0f, 0.10f, 0.09f, 0.08f, -10.0f});
+}
+
+void SessionRuntime::CompleteReload(PlayerState& player)
+{
+    const WeaponDefinition definition = GetWeaponDefinition(player.tool);
+    PlayerState::WeaponInventory& inventory = ActiveWeaponInventory(player);
+    const int missingRounds = std::max(definition.magazineCapacity - inventory.ammoInMagazine, 0);
+    const int roundsToLoad = std::min(missingRounds, inventory.reserveAmmo);
+    inventory.ammoInMagazine += roundsToLoad;
+    inventory.reserveAmmo -= roundsToLoad;
+    player.reloading = false;
+    player.reloadTimer = 0.0f;
+    player.reloadDuration = 0.0f;
+    QueueAudioCue(player.tool == ToolType::Smg
+        ? AudioCue{210.0f, 0.05f, 0.06f, 0.06f, 28.0f}
+        : AudioCue{166.0f, 0.06f, 0.06f, 0.04f, 16.0f});
 }
 
 void SessionRuntime::UseDigTool(PlayerState& player)
@@ -544,6 +756,7 @@ void SessionRuntime::SpawnGrenade(const PlayerState& player)
     const Vec3 forward = CurrentForwardVector(player);
     const Vec3 right = RightFromForward(forward);
     const model::Basis3 heldItemBasis = BuildHeldItemBasis(
+        ToolType::Grenade,
         CurrentAimPosition(player),
         forward,
         player.controller.WalkCycleRadians(),

@@ -3,10 +3,31 @@
 #include "core/log.hpp"
 
 #include <steam/isteamgameserver.h>
+#include <steam/isteamnetworkingutils.h>
 #include <steam/steam_gameserver.h>
 
 namespace df::steam
 {
+namespace
+{
+void SteamNetworkingDebugOutput(const ESteamNetworkingSocketsDebugOutputType type, const char* const message)
+{
+    const std::string_view text = message != nullptr ? std::string_view(message) : std::string_view{};
+    if (type <= k_ESteamNetworkingSocketsDebugOutputType_Error)
+    {
+        LogError("SteamNetworking: ", text);
+    }
+    else if (type == k_ESteamNetworkingSocketsDebugOutputType_Warning)
+    {
+        LogWarning("SteamNetworking: ", text);
+    }
+    else
+    {
+        LogInfo("SteamNetworking: ", text);
+    }
+}
+}
+
 SteamServerContext::~SteamServerContext()
 {
     Shutdown();
@@ -39,6 +60,11 @@ bool SteamServerContext::Initialize(const Config& config)
         failureMessage_ = "SteamGameServer interface was unavailable after initialization.";
         SteamGameServer_Shutdown();
         return false;
+    }
+
+    if (SteamNetworkingUtils() != nullptr)
+    {
+        SteamNetworkingUtils()->SetDebugOutputFunction(k_ESteamNetworkingSocketsDebugOutputType_Msg, SteamNetworkingDebugOutput);
     }
 
     SteamGameServer()->SetProduct(config_.product.c_str());

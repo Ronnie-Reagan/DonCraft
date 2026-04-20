@@ -22,6 +22,16 @@ struct ColorVertex2D
 
 struct FrameRenderData
 {
+    struct ScopedView
+    {
+        bool enabled = false;
+        Mat4 worldToClip{};
+        int viewportX = 0;
+        int viewportY = 0;
+        int viewportWidth = 0;
+        int viewportHeight = 0;
+    };
+
     Mat4 worldToClip{};
     Vec4 clearColor = MakeColor(0.08f, 0.1f, 0.14f, 1.0f);
     std::uint64_t terrainMeshVersion = 0;
@@ -31,8 +41,11 @@ struct FrameRenderData
     std::vector<ColorVertex3D> translucentTerrainTriangleStorage;
     std::vector<ColorVertex3D> dynamicTriangles;
     std::vector<ColorVertex3D> dynamicTranslucentTriangles;
+    std::vector<ColorVertex3D> viewModelTriangles;
+    std::vector<ColorVertex3D> viewModelPostScopeTriangles;
     std::vector<ColorVertex3D> effectTriangles;
     std::vector<ColorVertex3D> debugLines;
     std::vector<ColorVertex2D> overlayTriangles;
+    ScopedView scopedView{};
 };
 }

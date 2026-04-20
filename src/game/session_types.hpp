@@ -19,6 +19,7 @@ enum class ToolType : std::uint8_t
     Rifle = 0,
     Grenade = 1,
     Dig = 2,
+    Smg = 3,
 };
 
 using PlayerId = std::uint32_t;
@@ -34,5 +35,6 @@ struct PlayerCommandFrame
     bool secondaryDown = false;
     bool quickGrenadePressed = false;
     bool interactPressed = false;
+    bool reloadPressed = false;
 };
 }

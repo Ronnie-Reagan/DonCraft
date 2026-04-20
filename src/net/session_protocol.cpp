@@ -1,6 +1,7 @@
 #include "net/session_protocol.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <stdexcept>
 
@@ -59,43 +60,30 @@ auto ReadControlState(ByteReader& reader) -> game::ControlState
     return control;
 }
 
-void WriteWorldSnapshot(ByteWriter& writer, const world::DenseWorldSnapshot& snapshot)
+void WriteWorldSettings(ByteWriter& writer, const world::WorldGenerationSettings& settings)
 {
-    writer.WritePod(snapshot.settings.worldWidth);
-    writer.WritePod(snapshot.settings.worldHeight);
-    writer.WritePod(snapshot.settings.worldDepth);
-    writer.WritePod(snapshot.settings.activeChunkSize);
-    writer.WritePod(snapshot.settings.seed);
-    writer.WritePod(snapshot.settings.cellSize);
-    writer.WritePod(snapshot.settings.terrainRelief);
-    writer.WritePod(snapshot.settings.waterLevel);
-    writer.WritePod(static_cast<std::uint32_t>(snapshot.cells.size()));
-    if (!snapshot.cells.empty())
-    {
-        writer.WriteBytes(std::as_bytes(std::span(snapshot.cells)));
-    }
+    writer.WritePod(settings.worldWidth);
+    writer.WritePod(settings.worldHeight);
+    writer.WritePod(settings.worldDepth);
+    writer.WritePod(settings.activeChunkSize);
+    writer.WritePod(settings.seed);
+    writer.WritePod(settings.cellSize);
+    writer.WritePod(settings.terrainRelief);
+    writer.WritePod(settings.waterLevel);
 }
 
-auto ReadWorldSnapshot(ByteReader& reader) -> world::DenseWorldSnapshot
+auto ReadWorldSettings(ByteReader& reader) -> world::WorldGenerationSettings
 {
-    world::DenseWorldSnapshot snapshot{};
-    snapshot.settings.worldWidth = reader.ReadPod<int>();
-    snapshot.settings.worldHeight = reader.ReadPod<int>();
-    snapshot.settings.worldDepth = reader.ReadPod<int>();
-    snapshot.settings.activeChunkSize = reader.ReadPod<int>();
-    snapshot.settings.seed = reader.ReadPod<std::uint32_t>();
-    snapshot.settings.cellSize = reader.ReadPod<float>();
-    snapshot.settings.terrainRelief = reader.ReadPod<float>();
-    snapshot.settings.waterLevel = reader.ReadPod<float>();
-
-    const std::uint32_t cellCount = reader.ReadPod<std::uint32_t>();
-    snapshot.cells.resize(cellCount);
-    if (cellCount > 0)
-    {
-        const auto cellBytes = reader.ReadBytes(cellCount);
-        std::memcpy(snapshot.cells.data(), cellBytes.data(), cellBytes.size());
-    }
-    return snapshot;
+    world::WorldGenerationSettings settings{};
+    settings.worldWidth = reader.ReadPod<int>();
+    settings.worldHeight = reader.ReadPod<int>();
+    settings.worldDepth = reader.ReadPod<int>();
+    settings.activeChunkSize = reader.ReadPod<int>();
+    settings.seed = reader.ReadPod<std::uint32_t>();
+    settings.cellSize = reader.ReadPod<float>();
+    settings.terrainRelief = reader.ReadPod<float>();
+    settings.waterLevel = reader.ReadPod<float>();
+    return settings;
 }
 
 void WriteChunkDelta(ByteWriter& writer, const ChunkDelta& delta)
@@ -131,6 +119,12 @@ void WriteActorSnapshot(ByteWriter& writer, const ActorSnapshot& snapshot)
     writer.WritePod(snapshot.walkCycleRadians);
     writer.WritePod(snapshot.yawRadians);
     writer.WritePod(snapshot.pitchRadians);
+    writer.WritePod(snapshot.weaponCycle);
+    writer.WritePod(snapshot.ammoInMagazine);
+    writer.WritePod(snapshot.reserveAmmo);
+    writer.WriteBool(snapshot.reloading);
+    writer.WritePod(snapshot.reloadSecondsRemaining);
+    writer.WritePod(snapshot.reloadSecondsTotal);
     writer.WritePod(snapshot.lastAppliedCommandSequence);
 }
 
@@ -155,6 +149,12 @@ auto ReadActorSnapshot(ByteReader& reader) -> ActorSnapshot
     snapshot.walkCycleRadians = reader.ReadPod<float>();
     snapshot.yawRadians = reader.ReadPod<float>();
     snapshot.pitchRadians = reader.ReadPod<float>();
+    snapshot.weaponCycle = reader.ReadPod<float>();
+    snapshot.ammoInMagazine = reader.ReadPod<int>();
+    snapshot.reserveAmmo = reader.ReadPod<int>();
+    snapshot.reloading = reader.ReadBool();
+    snapshot.reloadSecondsRemaining = reader.ReadPod<float>();
+    snapshot.reloadSecondsTotal = reader.ReadPod<float>();
     snapshot.lastAppliedCommandSequence = reader.ReadPod<std::uint32_t>();
     return snapshot;
 }
@@ -238,6 +238,13 @@ auto DenseIndex(const world::WorldGenerationSettings& settings, const int x, con
     return static_cast<std::size_t>(x) +
            static_cast<std::size_t>(y) * static_cast<std::size_t>(settings.worldWidth) +
            static_cast<std::size_t>(z) * static_cast<std::size_t>(settings.worldWidth) * static_cast<std::size_t>(settings.worldHeight);
+}
+
+auto ExpectedWorldCellCount(const world::WorldGenerationSettings& settings) -> std::size_t
+{
+    return static_cast<std::size_t>(std::max(settings.worldWidth, 0)) *
+           static_cast<std::size_t>(std::max(settings.worldHeight, 0)) *
+           static_cast<std::size_t>(std::max(settings.worldDepth, 0));
 }
 }
 
@@ -334,6 +341,7 @@ auto EncodeCommandFrame(const game::PlayerCommandFrame& frame) -> std::vector<st
     writer.WriteBool(frame.secondaryDown);
     writer.WriteBool(frame.quickGrenadePressed);
     writer.WriteBool(frame.interactPressed);
+    writer.WriteBool(frame.reloadPressed);
     return writer.TakeData();
 }
 
@@ -349,6 +357,7 @@ auto DecodeCommandFrame(const std::span<const std::byte> bytes) -> game::PlayerC
     frame.secondaryDown = reader.ReadBool();
     frame.quickGrenadePressed = reader.ReadBool();
     frame.interactPressed = reader.ReadBool();
+    frame.reloadPressed = reader.ReadBool();
     if (!reader.Empty())
     {
         throw std::runtime_error("PlayerCommandFrame had trailing bytes.");
@@ -356,11 +365,36 @@ auto DecodeCommandFrame(const std::span<const std::byte> bytes) -> game::PlayerC
     return frame;
 }
 
+auto EncodeClientStateFrame(const ActorSnapshot& snapshot) -> std::vector<std::byte>
+{
+    ByteWriter writer;
+    WriteActorSnapshot(writer, snapshot);
+    return writer.TakeData();
+}
+
+auto DecodeClientStateFrame(const std::span<const std::byte> bytes) -> ActorSnapshot
+{
+    ByteReader reader(bytes);
+    ActorSnapshot snapshot = ReadActorSnapshot(reader);
+    if (!reader.Empty())
+    {
+        throw std::runtime_error("ClientStateFrame had trailing bytes.");
+    }
+    return snapshot;
+}
+
 auto EncodeWorldSnapshotMessage(const WorldSnapshotMessage& message) -> std::vector<std::byte>
 {
     ByteWriter writer;
     writer.WritePod(message.serverTick);
-    WriteWorldSnapshot(writer, message.world);
+    WriteWorldSettings(writer, message.settings);
+    writer.WritePod(message.totalCellCount);
+    writer.WritePod(message.cellOffset);
+    writer.WritePod(static_cast<std::uint32_t>(message.cells.size()));
+    if (!message.cells.empty())
+    {
+        writer.WriteBytes(std::as_bytes(std::span(message.cells)));
+    }
     return writer.TakeData();
 }
 
@@ -369,12 +403,71 @@ auto DecodeWorldSnapshotMessage(const std::span<const std::byte> bytes) -> World
     ByteReader reader(bytes);
     WorldSnapshotMessage message{};
     message.serverTick = reader.ReadPod<std::uint64_t>();
-    message.world = ReadWorldSnapshot(reader);
+    message.settings = ReadWorldSettings(reader);
+    message.totalCellCount = reader.ReadPod<std::uint32_t>();
+    message.cellOffset = reader.ReadPod<std::uint32_t>();
+    const std::uint32_t cellCount = reader.ReadPod<std::uint32_t>();
+    message.cells.resize(cellCount);
+    if (cellCount > 0u)
+    {
+        const auto cellBytes = reader.ReadBytes(cellCount);
+        std::memcpy(message.cells.data(), cellBytes.data(), cellBytes.size());
+    }
+    if (message.cellOffset > message.totalCellCount ||
+        static_cast<std::size_t>(message.totalCellCount - message.cellOffset) < message.cells.size())
+    {
+        throw std::runtime_error("WorldSnapshotMessage segment exceeded the advertised cell range.");
+    }
     if (!reader.Empty())
     {
         throw std::runtime_error("WorldSnapshotMessage had trailing bytes.");
     }
     return message;
+}
+
+auto BuildWorldSnapshotMessages(
+    const std::uint64_t serverTick,
+    const world::DenseWorldSnapshot& snapshot,
+    const std::size_t maxCellsPerMessage) -> std::vector<WorldSnapshotMessage>
+{
+    const std::size_t expectedCellCount = ExpectedWorldCellCount(snapshot.settings);
+    const std::size_t totalCellCount = snapshot.cells.size();
+    if (totalCellCount != expectedCellCount)
+    {
+        throw std::runtime_error("World snapshot cell payload size did not match the advertised world dimensions.");
+    }
+    const std::size_t boundedMaxCells = std::max<std::size_t>(1u, maxCellsPerMessage);
+
+    std::vector<WorldSnapshotMessage> messages;
+    if (totalCellCount == 0u)
+    {
+        messages.push_back({
+            .serverTick = serverTick,
+            .settings = snapshot.settings,
+            .totalCellCount = 0u,
+            .cellOffset = 0u,
+            .cells = {},
+        });
+        return messages;
+    }
+
+    messages.reserve((totalCellCount + boundedMaxCells - 1u) / boundedMaxCells);
+    for (std::size_t cellOffset = 0u; cellOffset < totalCellCount; cellOffset += boundedMaxCells)
+    {
+        const std::size_t segmentCellCount = std::min(boundedMaxCells, totalCellCount - cellOffset);
+        WorldSnapshotMessage message{};
+        message.serverTick = serverTick;
+        message.settings = snapshot.settings;
+        message.totalCellCount = static_cast<std::uint32_t>(totalCellCount);
+        message.cellOffset = static_cast<std::uint32_t>(cellOffset);
+        message.cells.insert(
+            message.cells.end(),
+            snapshot.cells.begin() + static_cast<std::ptrdiff_t>(cellOffset),
+            snapshot.cells.begin() + static_cast<std::ptrdiff_t>(cellOffset + segmentCellCount));
+        messages.push_back(std::move(message));
+    }
+
+    return messages;
 }
 
 auto EncodeChunkDeltaBatchMessage(const ChunkDeltaBatchMessage& message) -> std::vector<std::byte>
@@ -405,6 +498,44 @@ auto DecodeChunkDeltaBatchMessage(const std::span<const std::byte> bytes) -> Chu
         throw std::runtime_error("ChunkDeltaBatchMessage had trailing bytes.");
     }
     return message;
+}
+
+auto BuildChunkDeltaBatches(
+    const std::span<const ChunkDelta> deltas,
+    const std::uint64_t serverTick,
+    const std::size_t maxPayloadBytes) -> std::vector<ChunkDeltaBatchMessage>
+{
+    const std::size_t boundedMaxPayload = std::max<std::size_t>(1u, maxPayloadBytes);
+
+    std::vector<ChunkDeltaBatchMessage> batches;
+    ChunkDeltaBatchMessage currentBatch{};
+    currentBatch.serverTick = serverTick;
+    std::size_t currentPayloadBytes = sizeof(std::uint64_t) + sizeof(std::uint32_t);
+
+    for (const ChunkDelta& delta : deltas)
+    {
+        const std::size_t encodedDeltaBytes = EncodeChunkDelta(delta).size();
+        const std::size_t deltaPayloadBytes = sizeof(std::uint32_t) + encodedDeltaBytes;
+        const bool wouldOverflow = !currentBatch.deltas.empty() &&
+                                   currentPayloadBytes + deltaPayloadBytes > boundedMaxPayload;
+        if (wouldOverflow)
+        {
+            batches.push_back(std::move(currentBatch));
+            currentBatch = {};
+            currentBatch.serverTick = serverTick;
+            currentPayloadBytes = sizeof(std::uint64_t) + sizeof(std::uint32_t);
+        }
+
+        currentBatch.deltas.push_back(delta);
+        currentPayloadBytes += deltaPayloadBytes;
+    }
+
+    if (!currentBatch.deltas.empty())
+    {
+        batches.push_back(std::move(currentBatch));
+    }
+
+    return batches;
 }
 
 auto EncodeActorSnapshotFrame(const ActorSnapshotFrame& frame) -> std::vector<std::byte>

@@ -15,6 +15,17 @@ enum class LogLevel
 };
 
 void LogMessage(LogLevel level, std::string_view message);
+void SetCrashContext(const char* context);
+
+class ScopedCrashContext
+{
+public:
+    explicit ScopedCrashContext(const char* context);
+    ~ScopedCrashContext();
+
+private:
+    const char* previous_ = nullptr;
+};
 
 template <typename... Args>
 void Log(LogLevel level, Args&&... args)
