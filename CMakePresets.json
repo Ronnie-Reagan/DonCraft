@@ -18,7 +18,8 @@
       "cacheVariables": {
         "Don_Craft_ENABLE_TESTS": "ON",
         "Don_Craft_BUILD_CLIENT": "ON",
-        "Don_Craft_BUILD_SERVER": "ON"
+        "Don_Craft_BUILD_SERVER": "ON",
+        "Don_Craft_BUILD_LAUNCHER": "ON"
       }
     },
     {

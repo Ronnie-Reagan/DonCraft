@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +47,14 @@ class ResolvedTestPreset:
     name: str
     configure_preset: str
     configuration: str | None
+
+
+CLIENT_TARGET = "Don_Craft_client"
+SERVER_TARGET = "Don_Craft_server"
+LAUNCHER_TARGET = "DonCraftLauncher"
+DEFAULT_GITHUB_REPO = "Ronnie-Reagan/DonCraft"
+DEFAULT_UPDATE_BRANCH = "main"
+DEFAULT_UPDATE_CHANNEL = "alpha"
 
 
 def find_cmake() -> str:
@@ -453,6 +463,10 @@ def build_effective_cache_variables(
         effective["Don_Craft_BUILD_SERVER"] = "ON"
     elif args.no_build_server:
         effective["Don_Craft_BUILD_SERVER"] = "OFF"
+    if args.build_launcher:
+        effective["Don_Craft_BUILD_LAUNCHER"] = "ON"
+    elif args.no_build_launcher:
+        effective["Don_Craft_BUILD_LAUNCHER"] = "OFF"
     if args.enable_tests:
         effective["Don_Craft_ENABLE_TESTS"] = "ON"
     elif args.disable_tests:
@@ -569,9 +583,9 @@ def infer_targets(
 
     inferred_targets: list[str] = []
     if effective_cache_variables.get("Don_Craft_BUILD_CLIENT", "ON") == "ON":
-        inferred_targets.append("Don_Craft_client")
+        inferred_targets.append(CLIENT_TARGET)
     if effective_cache_variables.get("Don_Craft_BUILD_SERVER", "ON") == "ON":
-        inferred_targets.append("Don_Craft_server")
+        inferred_targets.append(SERVER_TARGET)
     if inferred_targets:
         return inferred_targets
     if effective_cache_variables.get("Don_Craft_ENABLE_TESTS", "ON") == "ON":
@@ -602,18 +616,181 @@ def find_built_executable(build_dir: Path, config: str, target: str) -> Path | N
     return None
 
 
-def stage_runtime_package(runtime_dir: Path, package_dir: Path) -> Path:
+def copy_runtime_file(source: Path, destination: Path) -> None:
+    if not source.exists():
+        raise FileNotFoundError(f"Required runtime file was not found: {source.name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def copy_runtime_file_if_present(source: Path, destination: Path) -> bool:
+    if not source.exists():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return True
+
+
+def copy_shader_payload(runtime_dir: Path, package_dir: Path) -> None:
+    shader_dir = runtime_dir / "shaders"
+    if not shader_dir.exists():
+        return
+
+    for shader_file in sorted(shader_dir.rglob("*.spv")):
+        if shader_file.is_file():
+            relative_path = shader_file.relative_to(runtime_dir)
+            copy_runtime_file(shader_file, package_dir / relative_path)
+
+
+def stage_runtime_package(runtime_dir: Path, package_dir: Path, target_name: str, executable: Path) -> Path:
     if runtime_dir.resolve() == package_dir.resolve():
-        return runtime_dir
+        raise ValueError("Filtered runtime packaging cannot be staged over the build output directory.")
 
     if package_dir.exists():
         shutil.rmtree(package_dir)
-    package_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(runtime_dir, package_dir)
-    packaged_steam_appid = package_dir / "steam_appid.txt"
-    if packaged_steam_appid.exists():
-        packaged_steam_appid.unlink()
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    copy_runtime_file(executable, package_dir / executable.name)
+
+    if target_name == CLIENT_TARGET:
+        copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
+        copy_runtime_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
+        copy_runtime_file_if_present(runtime_dir / "SDL3.dll", package_dir / "SDL3.dll")
+        copy_shader_payload(runtime_dir, package_dir)
+    elif target_name == SERVER_TARGET:
+        copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
+        copy_runtime_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
+    else:
+        copy_shader_payload(runtime_dir, package_dir)
+
     return package_dir
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_git_text(source_dir: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(source_dir),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    return completed.stdout.strip()
+
+
+def infer_github_repo(source_dir: Path, explicit_repo: str) -> str:
+    if explicit_repo.strip():
+        repo = explicit_repo.strip().removeprefix("https://github.com/").removesuffix(".git")
+        if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            return repo
+        raise ValueError(f"Expected --github-repo in owner/name form, got: {explicit_repo}")
+
+    try:
+        remote_url = run_git_text(source_dir, "remote", "get-url", "origin")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return DEFAULT_GITHUB_REPO
+
+    patterns = (
+        r"^https://github\.com/([^/]+/[^/]+?)(?:\.git)?$",
+        r"^https://[^@]+@github\.com/([^/]+/[^/]+?)(?:\.git)?$",
+        r"^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, remote_url)
+        if match:
+            return match.group(1)
+
+    return DEFAULT_GITHUB_REPO
+
+
+def git_commit_version(source_dir: Path) -> str:
+    try:
+        return run_git_text(source_dir, "rev-parse", "--short=12", "HEAD")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "uncommitted"
+
+
+def ensure_relative_to_source(path: Path, source_dir: Path) -> Path:
+    try:
+        return path.resolve().relative_to(source_dir.resolve())
+    except ValueError as error:
+        raise ValueError(f"Distribution directory must stay inside the repository: {path}") from error
+
+
+def relative_posix(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def write_update_channel(
+    staged_runtime_dir: Path,
+    source_dir: Path,
+    dist_dir: Path,
+    channel: str,
+    github_repo: str,
+    branch: str,
+    version: str,
+) -> tuple[Path, str]:
+    channel_root = dist_dir / "update" / channel
+    files_root = channel_root / "files"
+    if channel_root.exists():
+        shutil.rmtree(channel_root)
+    files_root.mkdir(parents=True, exist_ok=True)
+
+    entries: list[dict[str, str | int]] = []
+    for source_file in sorted(path for path in staged_runtime_dir.rglob("*") if path.is_file()):
+        relative_path = relative_posix(source_file, staged_runtime_dir)
+        destination = files_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, destination)
+        entries.append(
+            {
+                "path": relative_path,
+                "size": destination.stat().st_size,
+                "sha256": sha256_file(destination),
+            }
+        )
+
+    if not entries:
+        raise ValueError(f"No files were staged for update channel from {staged_runtime_dir}")
+
+    channel_relative = ensure_relative_to_source(channel_root, source_dir).as_posix()
+    raw_base_url = f"https://raw.githubusercontent.com/{github_repo}/{branch}/{channel_relative}/files/"
+    manifest_url = f"https://raw.githubusercontent.com/{github_repo}/{branch}/{channel_relative}/manifest.json"
+    manifest = {
+        "schema": 1,
+        "product": "DonCraft",
+        "channel": channel,
+        "version": version,
+        "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "base_url": raw_base_url,
+        "entrypoint": "Don_Craft_client.exe",
+        "files": entries,
+    }
+    manifest_path = channel_root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest_path, manifest_url
+
+
+def stage_launcher_distribution(build_dir: Path, config: str, dist_dir: Path) -> Path | None:
+    launcher = find_built_executable(build_dir, config, LAUNCHER_TARGET)
+    if launcher is None:
+        return None
+
+    launcher_dir = dist_dir / "launcher" / "windows-x64"
+    if launcher_dir.exists():
+        shutil.rmtree(launcher_dir)
+    launcher_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(launcher, launcher_dir / launcher.name)
+    return launcher_dir / launcher.name
 
 
 def normalize_optional_cache_path(value: str) -> str:
@@ -718,6 +895,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force Don_Craft_BUILD_SERVER=OFF for this run.",
     )
+    launcher_group = parser.add_mutually_exclusive_group()
+    launcher_group.add_argument(
+        "--build-launcher",
+        action="store_true",
+        help="Force Don_Craft_BUILD_LAUNCHER=ON for this run.",
+    )
+    launcher_group.add_argument(
+        "--no-build-launcher",
+        action="store_true",
+        help="Force Don_Craft_BUILD_LAUNCHER=OFF for this run.",
+    )
     tests_group = parser.add_mutually_exclusive_group()
     tests_group.add_argument(
         "--enable-tests",
@@ -772,6 +960,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip staging a packaged runtime directory after the build completes.",
     )
+    parser.add_argument(
+        "--dist-dir",
+        default=str(source_dir / "dist"),
+        help="Tracked distribution directory for the launcher and GitHub update channel. Defaults to dist/.",
+    )
+    parser.add_argument(
+        "--update-channel",
+        default=DEFAULT_UPDATE_CHANNEL,
+        help=f"Update channel directory name under dist/update/. Defaults to {DEFAULT_UPDATE_CHANNEL}.",
+    )
+    parser.add_argument(
+        "--update-branch",
+        default=DEFAULT_UPDATE_BRANCH,
+        help=f"GitHub branch used for raw update URLs. Defaults to {DEFAULT_UPDATE_BRANCH}.",
+    )
+    parser.add_argument(
+        "--github-repo",
+        default="",
+        help=f"GitHub repository in owner/name form. Defaults to origin, then {DEFAULT_GITHUB_REPO}.",
+    )
+    parser.add_argument(
+        "--no-dist",
+        action="store_true",
+        help="Skip writing dist/launcher and dist/update artifacts.",
+    )
     return parser.parse_args()
 
 
@@ -779,6 +992,8 @@ def main() -> int:
     args = parse_args()
     source_dir = Path(args.source_dir).resolve()
     metrics_csv = None if args.no_metrics else Path(args.metrics_csv).resolve()
+    dist_dir = Path(args.dist_dir).expanduser().resolve()
+    github_repo = DEFAULT_GITHUB_REPO
 
     if not (source_dir / "CMakeLists.txt").exists():
         print(f"Source directory does not contain CMakeLists.txt: {source_dir}", file=sys.stderr)
@@ -788,6 +1003,9 @@ def main() -> int:
         return 1
 
     try:
+        if not args.no_dist and not args.configure_only:
+            github_repo = infer_github_repo(source_dir, args.github_repo)
+            ensure_relative_to_source(dist_dir, source_dir)
         cmake = find_cmake()
         presets = load_cmake_presets(source_dir)
         configure_preset = resolve_configure_preset(presets, source_dir, args.configure_preset)
@@ -847,6 +1065,7 @@ def main() -> int:
         config = "Release"
 
     package_requested = not args.no_package and not args.configure_only and bool(primary_targets)
+    dist_requested = not args.no_dist and not args.configure_only
 
     run_label = args.run_label.strip()
     if not run_label:
@@ -866,6 +1085,9 @@ def main() -> int:
     print(f"Config: {config}")
     print(f"Target: {target_display}")
     print(f"Metrics CSV: {metrics_csv if metrics_csv is not None else 'disabled'}")
+    print(f"Distribution dir: {dist_dir if dist_requested else 'disabled'}")
+    if dist_requested:
+        print(f"GitHub update channel: {github_repo}@{args.update_branch}/{args.update_channel}")
     print(f"Run label: {run_label}")
     if override_defines:
         print("Override cache variables:")
@@ -1063,6 +1285,8 @@ def main() -> int:
         print(f"Build completed in {total_duration:.3f}s")
         return 0
 
+    client_package_dir: Path | None = None
+
     for target_name in primary_targets:
         executable = find_built_executable(configure_preset.binary_dir, config, target_name)
         if executable is None:
@@ -1077,8 +1301,40 @@ def main() -> int:
                 package_dir = base_package_dir if len(primary_targets) == 1 else base_package_dir / target_name
             else:
                 package_dir = source_dir / "build" / "package" / config / target_name
-            staged_dir = stage_runtime_package(executable.parent, package_dir)
+            try:
+                staged_dir = stage_runtime_package(executable.parent, package_dir, target_name, executable)
+            except (FileNotFoundError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
             print(f"Packaged runtime ({target_name}): {staged_dir}")
+            if target_name == CLIENT_TARGET:
+                client_package_dir = staged_dir
+
+    if dist_requested:
+        launcher_path = stage_launcher_distribution(configure_preset.binary_dir, config, dist_dir)
+        if launcher_path is not None:
+            print(f"Launcher distribution: {launcher_path}")
+        else:
+            print("Launcher distribution skipped: DonCraftLauncher executable was not found.")
+
+        if client_package_dir is not None:
+            try:
+                manifest_path, manifest_url = write_update_channel(
+                    staged_runtime_dir=client_package_dir,
+                    source_dir=source_dir,
+                    dist_dir=dist_dir,
+                    channel=args.update_channel.strip() or DEFAULT_UPDATE_CHANNEL,
+                    github_repo=github_repo,
+                    branch=args.update_branch.strip() or DEFAULT_UPDATE_BRANCH,
+                    version=git_commit_version(source_dir),
+                )
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            print(f"GitHub update manifest: {manifest_path}")
+            print(f"Launcher manifest URL: {manifest_url}")
+        elif package_requested:
+            print("GitHub update channel skipped: client runtime package was not built.")
 
     print(f"Total Time Taken: {total_duration:.3f}s")
     return 0

@@ -135,7 +135,28 @@ By default, staged runtime packages are written under:
 - `build/package/<config>/Don_Craft_client/`
 - `build/package/<config>/Don_Craft_server/`
 
-The build output keeps `steam_api64.dll` and a local development `steam_appid.txt` beside both executables for local runs. Staged packages strip `steam_appid.txt`.
+The build output keeps `steam_api64.dll` and a local development `steam_appid.txt` beside both executables for local runs. Staged packages include `steam_appid.txt` when CMake created it, and otherwise only include runtime files for that target.
+
+### Launcher and GitHub updates
+
+Release builds also produce `DonCraftLauncher.exe`. The Python build helper stages the tracked distribution tree by default:
+
+- `dist/launcher/windows-x64/DonCraftLauncher.exe`
+- `dist/update/alpha/manifest.json`
+- `dist/update/alpha/files/`
+
+The launcher downloads `dist/update/alpha/manifest.json` from the GitHub `main` branch, validates every runtime file by SHA-256, updates `DonCraftRuntime/` beside the launcher, and then starts `Don_Craft_client.exe`. This keeps the launcher compatible with Steam: set the Steam launch executable to `DonCraftLauncher.exe`; the launcher waits for the game process and forwards normal launch arguments.
+
+For an alpha update, run a release build, commit the rewritten `dist/` tree, and push `main`:
+
+```powershell
+python build_DonCraft.py --configure-preset vs2022-release --fresh --clean-first
+git add dist
+git commit -m "Publish alpha build"
+git push origin main
+```
+
+Use `--no-dist` for local builds that should not rewrite the tracked launcher/update payloads. The generated manifest uses repository-relative file paths only; it does not include local build directories or Windows user paths.
 
 ## Running the client
 

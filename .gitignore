@@ -62,5 +62,14 @@ server_world.bin
 tools/
 local/
 
+# Tracked GitHub auto-update payloads. The build script clears and rewrites
+# this tree with only launcher/runtime files intended for distribution.
+!/dist/
+!/dist/**
+/dist/**/*.pdb
+/dist/**/*.ilk
+/dist/**/*.exp
+/dist/**/*.lib
+
 # Temp ignoration
 src/app/application_session.cpp

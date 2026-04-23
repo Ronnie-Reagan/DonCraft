@@ -12,7 +12,9 @@ option(Don_Craft_ENABLE_TESTS "Build the self-check executable and enable CTest.
 option(Don_Craft_CREATE_LOCAL_STEAM_APPID "Copy steam_appid.txt=480 beside local developer builds." ON)
 option(Don_Craft_BUILD_CLIENT "Build the SDL3/Vulkan/Steam client target." ON)
 option(Don_Craft_BUILD_SERVER "Build the headless Steam dedicated server target." ON)
+option(Don_Craft_BUILD_LAUNCHER "Build the Windows auto-update launcher target." ON)
 set(Don_Craft_SDL3_SOURCE_DIR "C:/SDL3-3.4.4" CACHE PATH "Path to an SDL3 source tree to build as a subproject. If empty or invalid, a packaged SDL3 install will be searched.")
+set(Don_Craft_UPDATE_MANIFEST_URL "https://raw.githubusercontent.com/Ronnie-Reagan/DonCraft/main/dist/update/alpha/manifest.json" CACHE STRING "Default GitHub raw manifest URL used by DonCraftLauncher.")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +35,20 @@ function(df_configure_target target_name)
         target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endfunction()
+
+if(WIN32 AND Don_Craft_BUILD_LAUNCHER)
+    add_executable(DonCraftLauncher WIN32
+        src/launcher/launcher_main.cpp
+    )
+    target_compile_definitions(DonCraftLauncher PRIVATE
+        DON_CRAFT_DEFAULT_UPDATE_MANIFEST_URL="${Don_Craft_UPDATE_MANIFEST_URL}"
+    )
+    target_link_libraries(DonCraftLauncher PRIVATE winhttp bcrypt shell32)
+    set_target_properties(DonCraftLauncher PROPERTIES
+        VS_DEBUGGER_WORKING_DIRECTORY "$(TargetDir)"
+    )
+    df_configure_target(DonCraftLauncher)
+endif()
 
 add_library(df_core STATIC
     src/core/assert.hpp

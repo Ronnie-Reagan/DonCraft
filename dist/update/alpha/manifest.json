@@ -87,10 +87,15 @@
       "path": "steam_api64.dll",
       "sha256": "eb17909a76668cf9ae0b92a618a34a50f6c73d3a6787cb4dd8ce36a8b10bfb75",
       "size": 317080
+    },
+    {
+      "path": "steam_appid.txt",
+      "sha256": "e949c123a0b46184369ad161d6cfed2433c734e3143268a23cd30cb82568f6f2",
+      "size": 5
     }
   ],
-  "generated_utc": "2026-04-23T09:24:29+00:00",
+  "generated_utc": "2026-04-23T09:36:27+00:00",
   "product": "DonCraft",
   "schema": 1,
-  "version": "b7483b6e5380"
+  "version": "a7c077cae819"
 }
