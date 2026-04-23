@@ -1,0 +1,96 @@
+{
+  "base_url": "https://raw.githubusercontent.com/Ronnie-Reagan/DonCraft/main/dist/update/alpha/files/",
+  "channel": "alpha",
+  "entrypoint": "Don_Craft_client.exe",
+  "files": [
+    {
+      "path": "Don_Craft_client.exe",
+      "sha256": "c560d523607e2062ab99e0d78b6776fde21793453d31e6fae238141f0db19c00",
+      "size": 760320
+    },
+    {
+      "path": "SDL3.dll",
+      "sha256": "0dbf840835de3d05296d3d8f47d60ec46577c05039a309d02024a16fe46626e5",
+      "size": 2701824
+    },
+    {
+      "path": "shaders/mpm_advect_particles.comp.spv",
+      "sha256": "392172f0892508d96b65b96a9e739525b2e2cbade5bd804a4cf20d092f3151a0",
+      "size": 5920
+    },
+    {
+      "path": "shaders/mpm_clear_nodes.comp.spv",
+      "sha256": "6f78d736d18f61e8d0559b959658266e0d6c7da997804e1420337fabebbc7630",
+      "size": 2620
+    },
+    {
+      "path": "shaders/mpm_scatter_nodes.comp.spv",
+      "sha256": "d805fb4205318c7a0bfa6e367e3ca57963daaf6c06180e65907f7fc255d055a1",
+      "size": 6120
+    },
+    {
+      "path": "shaders/mpm_update_nodes.comp.spv",
+      "sha256": "52dadec6d0ae2a728287bc9d2a6b72a4903706ca7326bed87438d2e3e667d4e4",
+      "size": 5084
+    },
+    {
+      "path": "shaders/oit_composite.frag.spv",
+      "sha256": "2dc9421f84683ecbdf30517d79f7f6287151a0b5429846a5bc0d59801cfc0368",
+      "size": 1588
+    },
+    {
+      "path": "shaders/oit_composite.vert.spv",
+      "sha256": "27e8a46d7497a38ffd3eda53b7b0297f8874d605f52b460f1cc1828534577d84",
+      "size": 1400
+    },
+    {
+      "path": "shaders/oit_weighted_shadowed.frag.spv",
+      "sha256": "680eaa173f998ea75303bd9bac6dccaef1c002225ba3d544bebaceabd23b8f3f",
+      "size": 5684
+    },
+    {
+      "path": "shaders/oit_weighted_unshadowed.frag.spv",
+      "sha256": "b441a17e0757f2b7b67feeacd358c73f7c91d168fab63ff826491bcecdde1baf",
+      "size": 1908
+    },
+    {
+      "path": "shaders/overlay_2d.frag.spv",
+      "sha256": "1c02e9e532696a91253bdd093ed4acf67675420c0dce85d5b1b6df7865a4582e",
+      "size": 452
+    },
+    {
+      "path": "shaders/overlay_2d.vert.spv",
+      "sha256": "e650bda1a8ad74a58f37a05b91a691819768be1a25848eb6502f340994fea14d",
+      "size": 1052
+    },
+    {
+      "path": "shaders/shadow_depth.vert.spv",
+      "sha256": "a4cf7266596efb761e9845c77a97be3133e5d26649b9617a3568c8fcf6240da0",
+      "size": 1160
+    },
+    {
+      "path": "shaders/world_3d.frag.spv",
+      "sha256": "e650a84040fce8298494814e3675e9a7b08083c1b7f5fdfd4d85d6d1957aa69a",
+      "size": 4520
+    },
+    {
+      "path": "shaders/world_3d.vert.spv",
+      "sha256": "393870e43942d319cc40fe9b99c6bcfcfcb763d90c57abda59939e327007aea5",
+      "size": 1512
+    },
+    {
+      "path": "shaders/world_unshadowed.frag.spv",
+      "sha256": "1c02e9e532696a91253bdd093ed4acf67675420c0dce85d5b1b6df7865a4582e",
+      "size": 452
+    },
+    {
+      "path": "steam_api64.dll",
+      "sha256": "eb17909a76668cf9ae0b92a618a34a50f6c73d3a6787cb4dd8ce36a8b10bfb75",
+      "size": 317080
+    }
+  ],
+  "generated_utc": "2026-04-23T09:24:29+00:00",
+  "product": "DonCraft",
+  "schema": 1,
+  "version": "b7483b6e5380"
+}
