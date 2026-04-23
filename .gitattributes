@@ -1,0 +1,2 @@
+dist/update/**/files/** -text
+dist/launcher/** -text

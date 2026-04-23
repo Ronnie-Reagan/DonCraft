@@ -631,6 +631,19 @@ def copy_runtime_file_if_present(source: Path, destination: Path) -> bool:
     return True
 
 
+def copy_steam_appid_file_if_present(source: Path, destination: Path) -> bool:
+    if not source.exists():
+        return False
+
+    appid_text = source.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    if not appid_text.endswith(b"\n"):
+        appid_text += b"\n"
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(appid_text)
+    return True
+
+
 def copy_shader_payload(runtime_dir: Path, package_dir: Path) -> None:
     shader_dir = runtime_dir / "shaders"
     if not shader_dir.exists():
@@ -654,12 +667,12 @@ def stage_runtime_package(runtime_dir: Path, package_dir: Path, target_name: str
 
     if target_name == CLIENT_TARGET:
         copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
-        copy_runtime_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
+        copy_steam_appid_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
         copy_runtime_file_if_present(runtime_dir / "SDL3.dll", package_dir / "SDL3.dll")
         copy_shader_payload(runtime_dir, package_dir)
     elif target_name == SERVER_TARGET:
         copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
-        copy_runtime_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
+        copy_steam_appid_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
     else:
         copy_shader_payload(runtime_dir, package_dir)
 
@@ -776,7 +789,8 @@ def write_update_channel(
         "files": entries,
     }
     manifest_path = channel_root / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with manifest_path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest_path, manifest_url
 
 
