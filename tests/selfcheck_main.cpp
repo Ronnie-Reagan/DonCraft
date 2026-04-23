@@ -1383,6 +1383,86 @@ int main()
         {
             df::world::DemoWorld world;
             df::world::WorldGenerationSettings settings = world.GenerationSettings();
+            settings.worldWidth = 16;
+            settings.worldHeight = 16;
+            settings.worldDepth = 16;
+            settings.activeChunkSize = 8;
+            world.SetGenerationSettings(settings);
+            world.Reset();
+
+            const int waterX = settings.worldWidth / 2;
+            const int waterZ = settings.worldDepth / 2;
+            const int startY = settings.worldHeight - 2;
+            for (int y = 1; y <= startY; ++y)
+            {
+                world.EditCell(waterX, y, waterZ, df::world::MaterialId::Air);
+            }
+            world.EditCell(waterX, startY, waterZ, df::world::MaterialId::ShallowWater);
+
+            world.Tick(0.07f);
+
+            bool fellFarEnough = false;
+            for (int y = startY - 2; y >= std::max(0, startY - 6); --y)
+            {
+                if (world.MaterialAtCell(waterX, y, waterZ) == df::world::MaterialId::ShallowWater)
+                {
+                    fellFarEnough = true;
+                    break;
+                }
+            }
+
+            allPassed &= Expect(
+                world.MaterialAtCell(waterX, startY, waterZ) == df::world::MaterialId::Air && fellFarEnough,
+                "Water fall pass no longer clears a shaft quickly enough during a single update.");
+        }
+
+        {
+            df::world::DemoWorld world;
+            df::world::WorldGenerationSettings settings = world.GenerationSettings();
+            settings.worldWidth = 16;
+            settings.worldHeight = 16;
+            settings.worldDepth = 16;
+            settings.activeChunkSize = 8;
+            world.SetGenerationSettings(settings);
+            world.Reset();
+
+            const int corridorX = settings.worldWidth / 2 - 3;
+            const int corridorY = settings.worldHeight / 2;
+            const int corridorZ = settings.worldDepth / 2;
+            for (int offset = -2; offset <= 3; ++offset)
+            {
+                world.EditCell(corridorX + offset, corridorY - 1, corridorZ, df::world::MaterialId::BrittleConcrete);
+                world.EditCell(corridorX + offset, corridorY - 1, corridorZ - 1, df::world::MaterialId::BrittleConcrete);
+                world.EditCell(corridorX + offset, corridorY - 1, corridorZ + 1, df::world::MaterialId::BrittleConcrete);
+                world.EditCell(corridorX + offset, corridorY, corridorZ, df::world::MaterialId::Air);
+                world.EditCell(corridorX + offset, corridorY, corridorZ - 1, df::world::MaterialId::BrittleConcrete);
+                world.EditCell(corridorX + offset, corridorY, corridorZ + 1, df::world::MaterialId::BrittleConcrete);
+            }
+            world.EditCell(corridorX - 2, corridorY, corridorZ, df::world::MaterialId::BrittleConcrete);
+            world.EditCell(corridorX + 3, corridorY, corridorZ, df::world::MaterialId::BrittleConcrete);
+            world.EditCell(corridorX - 1, corridorY, corridorZ, df::world::MaterialId::ShallowWater);
+            world.EditCell(corridorX, corridorY, corridorZ, df::world::MaterialId::ShallowWater);
+
+            world.Tick(0.10f);
+
+            bool advancedSurfaceFlow = false;
+            for (int x = corridorX + 1; x <= corridorX + 3; ++x)
+            {
+                if (world.MaterialAtCell(x, corridorY, corridorZ) == df::world::MaterialId::ShallowWater)
+                {
+                    advancedSurfaceFlow = true;
+                    break;
+                }
+            }
+
+            allPassed &= Expect(
+                world.MaterialAtCell(corridorX, corridorY, corridorZ) == df::world::MaterialId::Air && advancedSurfaceFlow,
+                "Water spread pass did not advance a one-neighbor surface flow through the corridor.");
+        }
+
+        {
+            df::world::DemoWorld world;
+            df::world::WorldGenerationSettings settings = world.GenerationSettings();
             settings.worldWidth = 8;
             settings.worldHeight = 8;
             settings.worldDepth = 8;

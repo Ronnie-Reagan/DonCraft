@@ -8,6 +8,12 @@
 
 namespace df::game::movement
 {
+inline auto SnapDownToGround(
+    const world::DemoWorld& world,
+    Vec3& position,
+    const Vec3& halfExtents,
+    float maxDrop) -> bool;
+
 inline auto MoveToward(const float current, const float target, const float maxDelta) -> float
 {
     if (current < target)
@@ -49,7 +55,14 @@ inline auto TryStepMove(
             return false;
         }
 
-        position = candidate;
+        Vec3 settled = candidate;
+        if (stepHeight > 0.1f)
+        {
+            const float maxDrop = std::max(stepHeight * 0.38f, 0.05f);
+            (void)SnapDownToGround(world, settled, halfExtents, maxDrop);
+        }
+
+        position = settled;
         return true;
     };
 
@@ -58,9 +71,9 @@ inline auto TryStepMove(
         return true;
     }
 
-    if (stepHeight > 0.0f)
+    if (stepHeight > 0.1f)
     {
-        for (const float fraction : {1.0f, 0.75f, 0.5f})
+        for (const float fraction : {0.35f, 0.7f, 1.0f})
         {
             if (tryMove(moveDelta, stepHeight * fraction))
             {

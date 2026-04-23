@@ -51,6 +51,7 @@ private:
         VkDeviceSize capacity = 0;
         void* mapped = nullptr;
         bool hostCoherent = false;
+        VkBufferUsageFlags usage = 0;
     };
 
     struct ImageResource
@@ -117,7 +118,7 @@ private:
     [[nodiscard]] VkFormat ChooseDepthFormat() const;
     [[nodiscard]] VkShaderModule LoadShaderModule(std::string_view filename) const;
 
-    void EnsureBufferCapacity(BufferResource& buffer, VkDeviceSize minimumSize);
+    void EnsureBufferCapacity(BufferResource& buffer, VkDeviceSize minimumSize, VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     void DestroyBuffer(BufferResource& buffer);
 
     [[nodiscard]] std::vector<const char*> GetRequiredInstanceExtensions() const;
@@ -146,6 +147,7 @@ private:
     VkDescriptorSet shadowDescriptorSet_ = VK_NULL_HANDLE;
     VkSampler shadowSampler_ = VK_NULL_HANDLE;
     VkSampler sceneSampler_ = VK_NULL_HANDLE;
+    BufferResource sceneUniformBuffer_{};
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;

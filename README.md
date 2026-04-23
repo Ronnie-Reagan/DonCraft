@@ -195,13 +195,13 @@ Launch `Don_Craft_server.exe` from the build output. The server is headless and 
 Example:
 
 ```powershell
-.\Don_Craft_server.exe `
-  --name "DonCraft Dedicated" `
-  --save ".\server_world.bin" `
-  --game-port 27035 `
-  --query-port 27036 `
-  --max-players 8 `
-  --autosave 20 `
+Don_Craft_server.exe ^
+  --name "DonCraft Dedicated" ^
+  --save ".\server_world.bin" ^
+  --game-port 8080 ^
+  --query-port 8081 ^
+  --max-players 8 ^
+  --autosave 20 ^
   --visibility public
 ```
 

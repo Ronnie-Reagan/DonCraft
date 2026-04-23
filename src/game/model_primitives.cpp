@@ -5,30 +5,6 @@
 
 namespace df::game::model
 {
-namespace
-{
-const Vec3 kLightDirection = Normalize(Vec3{0.28f, 0.88f, 0.36f});
-
-auto LitColor(const Vec4& baseColor, const Vec3& a, const Vec3& b, const Vec3& c) -> Vec4
-{
-    const Vec3 normal = Normalize(Cross(b - a, c - a));
-    if (LengthSquared(normal) <= 1.0e-6f)
-    {
-        return baseColor;
-    }
-
-    const float diffuse = std::max(0.0f, Dot(normal, kLightDirection));
-    const float sky = Clamp(normal.y * 0.5f + 0.5f, 0.0f, 1.0f);
-    const float light = 0.34f + 0.44f * diffuse + 0.22f * sky;
-    return {
-        Clamp(baseColor.x * light, 0.0f, 1.0f),
-        Clamp(baseColor.y * light, 0.0f, 1.0f),
-        Clamp(baseColor.z * light, 0.0f, 1.0f),
-        baseColor.w,
-    };
-}
-}
-
 auto RotateAroundAxis(const Vec3& value, const Vec3& axis, const float radians) -> Vec3
 {
     const Vec3 normalizedAxis = Normalize(axis);
@@ -83,15 +59,16 @@ auto TransformVector(const Basis3& basis, const Vec3& localVector) -> Vec3
 
 void AppendTriangle(std::vector<render::ColorVertex3D>& triangles, const Vec3& a, const Vec3& b, const Vec3& c, const Vec4& color)
 {
-    if (LengthSquared(Cross(b - a, c - a)) <= 1.0e-8f)
+    const Vec3 normal = Normalize(Cross(b - a, c - a));
+    if (LengthSquared(normal) <= 1.0e-8f)
     {
         return;
     }
 
-    const Vec4 litColor = LitColor(color, a, b, c);
-    triangles.push_back({a, litColor});
-    triangles.push_back({b, litColor});
-    triangles.push_back({c, litColor});
+    const Vec4 material = render::MakeSceneMaterial(-1.0f, 0.72f, 0.0f, render::kSurfaceShadingFlat);
+    triangles.push_back({a, color, normal, material});
+    triangles.push_back({b, color, normal, material});
+    triangles.push_back({c, color, normal, material});
 }
 
 void AppendQuad(std::vector<render::ColorVertex3D>& triangles, const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d, const Vec4& color)

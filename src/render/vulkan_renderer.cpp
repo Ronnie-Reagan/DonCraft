@@ -44,6 +44,14 @@ struct ScenePushConstants
     Mat4 worldToShadowClip{};
 };
 
+struct SceneUniformData
+{
+    Vec4 cameraPositionTime{};
+    Vec4 sunDirectionAmbient{};
+    Vec4 fogColorDensity{};
+    Vec4 horizonColorSun{};
+};
+
 [[nodiscard]] auto VulkanError(const char* message, const VkResult result) -> std::runtime_error
 {
     std::ostringstream stream;
@@ -490,6 +498,19 @@ void VulkanRenderer::Draw(const FrameRenderData& frameData)
         uploadVertices(frame.effectVertexBuffer, frameData.effectTriangles.data(), frameData.effectTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.lineVertexBuffer, frameData.debugLines.data(), frameData.debugLines.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.overlayVertexBuffer, frameData.overlayTriangles.data(), frameData.overlayTriangles.size(), sizeof(ColorVertex2D));
+
+        const SceneUniformData sceneData{
+            Vec4{frameData.cameraPosition.x, frameData.cameraPosition.y, frameData.cameraPosition.z, 0.0f},
+            Vec4{kShadowLightDirection.x, kShadowLightDirection.y, kShadowLightDirection.z, 0.28f},
+            Vec4{frameData.clearColor.x, frameData.clearColor.y, frameData.clearColor.z, 0.0032f},
+            Vec4{
+                Clamp(frameData.clearColor.x * 0.65f + 0.14f, 0.0f, 1.0f),
+                Clamp(frameData.clearColor.y * 0.62f + 0.12f, 0.0f, 1.0f),
+                Clamp(frameData.clearColor.z * 0.56f + 0.10f, 0.0f, 1.0f),
+                1.15f,
+            },
+        };
+        std::memcpy(sceneUniformBuffer_.mapped, &sceneData, sizeof(sceneData));
     }
 
     {
@@ -750,7 +771,7 @@ void VulkanRenderer::CreateCommandPool()
 
 void VulkanRenderer::CreateDescriptorResources()
 {
-    const std::array<VkDescriptorSetLayoutBinding, 3> bindings = {{
+    const std::array<VkDescriptorSetLayoutBinding, 4> bindings = {{
         VkDescriptorSetLayoutBinding{
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -769,6 +790,12 @@ void VulkanRenderer::CreateDescriptorResources()
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         },
+        VkDescriptorSetLayoutBinding{
+            .binding = 3,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
     }};
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -777,15 +804,22 @@ void VulkanRenderer::CreateDescriptorResources()
     layoutInfo.pBindings = bindings.data();
     CheckVk(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorSetLayout_), "Failed to create the scene descriptor set layout.");
 
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = static_cast<std::uint32_t>(bindings.size());
+    const std::array<VkDescriptorPoolSize, 2> poolSizes = {{
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 3,
+        },
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+        },
+    }};
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
     CheckVk(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_), "Failed to create the shadow descriptor pool.");
 
     VkDescriptorSetAllocateInfo allocateInfo{};
@@ -815,10 +849,14 @@ void VulkanRenderer::CreateDescriptorResources()
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     CheckVk(vkCreateSampler(device_, &samplerInfo, nullptr, &sceneSampler_), "Failed to create the scene color sampler.");
+
+    EnsureBufferCapacity(sceneUniformBuffer_, sizeof(SceneUniformData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 }
 
 void VulkanRenderer::DestroyDescriptorResources()
 {
+    DestroyBuffer(sceneUniformBuffer_);
+
     if (sceneSampler_ != VK_NULL_HANDLE)
     {
         vkDestroySampler(device_, sceneSampler_, nullptr);
@@ -920,7 +958,8 @@ void VulkanRenderer::UpdateSceneDescriptorSet()
         sceneSampler_ == VK_NULL_HANDLE ||
         shadowImage_.view == VK_NULL_HANDLE ||
         oitAccumulationImage_.view == VK_NULL_HANDLE ||
-        oitRevealageImage_.view == VK_NULL_HANDLE)
+        oitRevealageImage_.view == VK_NULL_HANDLE ||
+        sceneUniformBuffer_.buffer == VK_NULL_HANDLE)
     {
         return;
     }
@@ -942,9 +981,14 @@ void VulkanRenderer::UpdateSceneDescriptorSet()
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
     }};
+    const VkDescriptorBufferInfo sceneBufferInfo{
+        .buffer = sceneUniformBuffer_.buffer,
+        .offset = 0,
+        .range = sizeof(SceneUniformData),
+    };
 
-    std::array<VkWriteDescriptorSet, 3> writes{};
-    for (std::uint32_t bindingIndex = 0; bindingIndex < writes.size(); ++bindingIndex)
+    std::array<VkWriteDescriptorSet, 4> writes{};
+    for (std::uint32_t bindingIndex = 0; bindingIndex < 3; ++bindingIndex)
     {
         writes[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[bindingIndex].dstSet = shadowDescriptorSet_;
@@ -953,6 +997,12 @@ void VulkanRenderer::UpdateSceneDescriptorSet()
         writes[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[bindingIndex].pImageInfo = &imageInfos[bindingIndex];
     }
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = shadowDescriptorSet_;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[3].pBufferInfo = &sceneBufferInfo;
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -1451,9 +1501,11 @@ void VulkanRenderer::CreatePipelines()
     };
 
     const VkVertexInputBindingDescription worldBindingDescription{0, sizeof(ColorVertex3D), VK_VERTEX_INPUT_RATE_VERTEX};
-    const std::array<VkVertexInputAttributeDescription, 2> worldAttributes = {{
+    const std::array<VkVertexInputAttributeDescription, 4> worldAttributes = {{
         VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, position))},
         VkVertexInputAttributeDescription{1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, color))},
+        VkVertexInputAttributeDescription{2, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, normal))},
+        VkVertexInputAttributeDescription{3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, material))},
     }};
     const std::array<VkVertexInputAttributeDescription, 1> shadowAttributes = {{
         VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex3D, position))},
@@ -2129,14 +2181,14 @@ VkShaderModule VulkanRenderer::LoadShaderModule(const std::string_view filename)
     return CreateShaderModule(device_, ReadBinaryFile(shaderPath));
 }
 
-void VulkanRenderer::EnsureBufferCapacity(BufferResource& buffer, const VkDeviceSize minimumSize)
+void VulkanRenderer::EnsureBufferCapacity(BufferResource& buffer, const VkDeviceSize minimumSize, const VkBufferUsageFlags usage)
 {
     if (minimumSize == 0)
     {
         return;
     }
 
-    if (buffer.buffer != VK_NULL_HANDLE && buffer.capacity >= minimumSize)
+    if (buffer.buffer != VK_NULL_HANDLE && buffer.capacity >= minimumSize && buffer.usage == usage)
     {
         return;
     }
@@ -2148,7 +2200,7 @@ void VulkanRenderer::EnsureBufferCapacity(BufferResource& buffer, const VkDevice
     VkBufferCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     createInfo.size = capacity;
-    createInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    createInfo.usage = usage;
     createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     CheckVk(vkCreateBuffer(device_, &createInfo, nullptr, &buffer.buffer), "Failed to create a vertex buffer.");
@@ -2169,6 +2221,7 @@ void VulkanRenderer::EnsureBufferCapacity(BufferResource& buffer, const VkDevice
 
     buffer.capacity = capacity;
     buffer.hostCoherent = true;
+    buffer.usage = usage;
 }
 
 void VulkanRenderer::DestroyBuffer(BufferResource& buffer)
@@ -2193,6 +2246,7 @@ void VulkanRenderer::DestroyBuffer(BufferResource& buffer)
 
     buffer.capacity = 0;
     buffer.hostCoherent = false;
+    buffer.usage = 0;
 }
 
 std::vector<const char*> VulkanRenderer::GetRequiredInstanceExtensions() const

@@ -5,8 +5,8 @@
   "files": [
     {
       "path": "Don_Craft_client.exe",
-      "sha256": "c560d523607e2062ab99e0d78b6776fde21793453d31e6fae238141f0db19c00",
-      "size": 760320
+      "sha256": "ec3b9ff19ad2bfa747fec7bae0e3c10b9215dbe26c6388349006dc6b7de027cd",
+      "size": 764416
     },
     {
       "path": "SDL3.dll",
@@ -45,8 +45,8 @@
     },
     {
       "path": "shaders/oit_weighted_shadowed.frag.spv",
-      "sha256": "680eaa173f998ea75303bd9bac6dccaef1c002225ba3d544bebaceabd23b8f3f",
-      "size": 5684
+      "sha256": "842fd32c8436c922a2ab0811cee03699d21efe0ceda5408981d95466e1713cd6",
+      "size": 31696
     },
     {
       "path": "shaders/oit_weighted_unshadowed.frag.spv",
@@ -70,13 +70,13 @@
     },
     {
       "path": "shaders/world_3d.frag.spv",
-      "sha256": "e650a84040fce8298494814e3675e9a7b08083c1b7f5fdfd4d85d6d1957aa69a",
-      "size": 4520
+      "sha256": "d55164aa300cd51058628625e6698c34ccae73c94c2126b6bda45af55585a247",
+      "size": 30596
     },
     {
       "path": "shaders/world_3d.vert.spv",
-      "sha256": "393870e43942d319cc40fe9b99c6bcfcfcb763d90c57abda59939e327007aea5",
-      "size": 1512
+      "sha256": "2dfcab04a7c80716755ea8a1527d218e477543bafe3bcc07cfa6530d48f4c49a",
+      "size": 1796
     },
     {
       "path": "shaders/world_unshadowed.frag.spv",
@@ -94,8 +94,8 @@
       "size": 4
     }
   ],
-  "generated_utc": "2026-04-23T09:43:28+00:00",
+  "generated_utc": "2026-04-23T16:25:14+00:00",
   "product": "DonCraft",
   "schema": 1,
-  "version": "1a3f93bd1072"
+  "version": "046b8664a0d1"
 }

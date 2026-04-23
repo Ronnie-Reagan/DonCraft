@@ -109,17 +109,28 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     const Vec3 halfExtents = CollisionHalfExtents();
     constexpr float kFootToCenterHeight = 0.86f;
     constexpr Vec3 kFootHalfExtents{0.12f, 0.08f, 0.19f};
-    const float stepHeight = wasGrounded ? std::max(0.32f, world.CellSize() * 1.35f) : 0.0f;
+    const float stepHeight = wasGrounded ? std::max(0.16f, world.CellSize() * 0.70f) : 0.0f;
     const Vec3 horizontalDelta{velocity_.x * dt, 0.0f, velocity_.z * dt};
-    if (!movement::TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
+    const float horizontalDistance = Length(horizontalDelta);
+    const int horizontalSubsteps = std::clamp(
+        static_cast<int>(std::ceil(horizontalDistance / std::max(world.CellSize() * 0.45f, 0.10f))),
+        1,
+        6);
+    const Vec3 horizontalSubstepDelta = horizontalDelta / static_cast<float>(horizontalSubsteps);
+    for (int substepIndex = 0; substepIndex < horizontalSubsteps; ++substepIndex)
     {
+        if (movement::TryStepMove(world, position_, horizontalSubstepDelta, halfExtents, stepHeight))
+        {
+            continue;
+        }
+
         const float previousX = position_.x;
         const float previousZ = position_.z;
-        if (!movement::TryStepMove(world, position_, Vec3{horizontalDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{horizontalSubstepDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
         {
             velocity_.x = 0.0f;
         }
-        if (!movement::TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalDelta.z}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalSubstepDelta.z}, halfExtents, stepHeight))
         {
             velocity_.z = 0.0f;
         }
@@ -131,12 +142,16 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
         {
             velocity_.z = 0.0f;
         }
+        if (position_.x == previousX && position_.z == previousZ)
+        {
+            break;
+        }
     }
 
     if (wasGrounded && velocity_.y <= 0.0f)
     {
         Vec3 snappedPosition = position_;
-        if (movement::SnapDownToGround(world, snappedPosition, halfExtents, stepHeight + world.CellSize() * 0.55f))
+        if (movement::SnapDownToGround(world, snappedPosition, halfExtents, stepHeight * 0.45f + world.CellSize() * 0.12f))
         {
             position_.y = snappedPosition.y;
         }
@@ -219,11 +234,13 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     {
         groundedTargetCenterY /= static_cast<float>(groundedFeet);
         const float supportDelta = groundedTargetCenterY - position_.y;
-        const float maxSupportRise = wasGrounded ? stepHeight + world.CellSize() * 0.35f : 0.18f;
-        const float maxSupportDrop = wasGrounded ? stepHeight + world.CellSize() * 0.55f : std::max(0.18f, world.CellSize() * 0.45f);
+        const float maxSupportRise = wasGrounded ? stepHeight + world.CellSize() * 0.12f : 0.12f;
+        const float maxSupportDrop = wasGrounded ? stepHeight + world.CellSize() * 0.24f : std::max(0.12f, world.CellSize() * 0.28f);
         if (supportDelta >= -maxSupportDrop && supportDelta <= maxSupportRise)
         {
-            position_.y = groundedTargetCenterY;
+            position_.y = wasGrounded
+                ? Lerp(position_.y, groundedTargetCenterY, 0.72f)
+                : groundedTargetCenterY;
             velocity_.y = 0.0f;
             onGround_ = true;
         }
@@ -263,10 +280,12 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
         if (velocity_.y <= 0.0f && groundedFeet > 0)
         {
             groundedTargetCenterY /= static_cast<float>(groundedFeet);
-            const float catchDistance = wasGrounded ? (stepHeight + world.CellSize() * 0.55f) : std::max(0.18f, world.CellSize() * 0.45f);
+            const float catchDistance = wasGrounded ? (stepHeight + world.CellSize() * 0.26f) : std::max(0.12f, world.CellSize() * 0.28f);
             if ((position_.y - groundedTargetCenterY) >= -0.05f && (position_.y - groundedTargetCenterY) <= catchDistance)
             {
-                position_.y = groundedTargetCenterY;
+                position_.y = wasGrounded
+                    ? Lerp(position_.y, groundedTargetCenterY, 0.72f)
+                    : groundedTargetCenterY;
                 velocity_.y = 0.0f;
                 onGround_ = true;
             }

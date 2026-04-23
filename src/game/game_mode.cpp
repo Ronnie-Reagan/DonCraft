@@ -809,7 +809,8 @@ auto GameMode::BuildRenderData(const int viewportWidth, const int viewportHeight
     lastViewportHeight_ = viewportHeight;
     const float aspect = static_cast<float>(viewportWidth) / static_cast<float>(std::max(viewportHeight, 1));
     const Vec3 cameraPosition = CurrentCameraPosition();
-    data.clearColor = MakeColor(0.53f, 0.73f, 0.92f, 1.0f);
+    data.clearColor = MakeColor(0.62f, 0.76f, 0.90f, 1.0f);
+    data.cameraPosition = cameraPosition;
     data.worldToClip =
         PerspectiveMatrix(DegreesToRadians(70.0f), aspect, 0.1f, 200.0f) *
         LookAtMatrix(cameraPosition, CurrentViewTarget(), kWorldUp);

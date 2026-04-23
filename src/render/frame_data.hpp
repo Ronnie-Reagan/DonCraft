@@ -8,10 +8,25 @@
 
 namespace df::render
 {
+inline constexpr float kSurfaceShadingFlat = 0.0f;
+inline constexpr float kSurfaceShadingTerrain = 1.0f;
+inline constexpr float kSurfaceShadingWater = 2.0f;
+
+[[nodiscard]] inline auto MakeSceneMaterial(
+    const float materialId,
+    const float param0 = 0.0f,
+    const float param1 = 0.0f,
+    const float shadingModel = kSurfaceShadingFlat) -> Vec4
+{
+    return {materialId, param0, param1, shadingModel};
+}
+
 struct ColorVertex3D
 {
     Vec3 position{};
     Vec4 color{};
+    Vec3 normal{};
+    Vec4 material{};
 };
 
 struct ColorVertex2D
@@ -33,6 +48,7 @@ struct FrameRenderData
     };
 
     Mat4 worldToClip{};
+    Vec3 cameraPosition{};
     Vec4 clearColor = MakeColor(0.08f, 0.1f, 0.14f, 1.0f);
     std::uint64_t terrainMeshVersion = 0;
     std::span<const ColorVertex3D> terrainTriangles;

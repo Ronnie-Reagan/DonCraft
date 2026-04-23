@@ -125,16 +125,27 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
 
     const Vec3 halfExtents = BodyHalfExtents();
     const Vec3 horizontalDelta{velocity_.x * dt, 0.0f, velocity_.z * dt};
-    const float stepHeight = grounded_ ? 0.52f + averageSink_ * world.CellSize() * 0.45f : 0.0f;
-    if (!movement::TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
+    const float stepHeight = grounded_ ? 0.24f + averageSink_ * world.CellSize() * 0.20f : 0.0f;
+    const float horizontalDistance = Length(horizontalDelta);
+    const int horizontalSubsteps = std::clamp(
+        static_cast<int>(std::ceil(horizontalDistance / std::max(world.CellSize() * 0.60f, 0.14f))),
+        1,
+        6);
+    const Vec3 horizontalSubstepDelta = horizontalDelta / static_cast<float>(horizontalSubsteps);
+    for (int substepIndex = 0; substepIndex < horizontalSubsteps; ++substepIndex)
     {
+        if (movement::TryStepMove(world, position_, horizontalSubstepDelta, halfExtents, stepHeight))
+        {
+            continue;
+        }
+
         const float previousX = position_.x;
         const float previousZ = position_.z;
-        if (!movement::TryStepMove(world, position_, Vec3{horizontalDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{horizontalSubstepDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
         {
             velocity_.x = 0.0f;
         }
-        if (!movement::TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalDelta.z}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalSubstepDelta.z}, halfExtents, stepHeight))
         {
             velocity_.z = 0.0f;
         }
@@ -145,6 +156,10 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
         if (position_.z == previousZ)
         {
             velocity_.z = 0.0f;
+        }
+        if (position_.x == previousX && position_.z == previousZ)
+        {
+            break;
         }
     }
 
@@ -163,8 +178,8 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
         position_.y = candidate.y;
     }
 
-    const float wheelRadius = 0.32f;
-    constexpr float suspensionTravel = 0.18f;
+    const float wheelRadius = 0.50f;
+    constexpr float suspensionTravel = 0.25f;
     const float wheelAngularDelta = (wheelRadius > 0.001f ? nextForwardSpeed / wheelRadius : 0.0f) * dt;
     for (float& wheelSpinRadians : wheelSpinRadians_)
     {

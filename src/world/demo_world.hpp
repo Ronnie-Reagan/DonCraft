@@ -227,6 +227,8 @@ private:
     void SetCellUnchecked(int x, int y, int z, MaterialId material);
     [[nodiscard]] auto IsRenderable(MaterialId material) const -> bool;
     [[nodiscard]] auto IsBlocking(MaterialId material) const -> bool;
+    [[nodiscard]] auto SampleSurfaceDensity(const Vec3& worldPosition, bool waterSurface) const -> float;
+    [[nodiscard]] auto SampleSurfaceNormal(const Vec3& worldPosition, bool waterSurface) const -> Vec3;
 
     void ResetTransientState();
     void ResizeStorage();
@@ -254,6 +256,9 @@ private:
         std::vector<ChunkCoord>* changedChunks = nullptr) -> bool;
     [[nodiscard]] auto CanWaterSpreadLaterally(int x, int y, int z) const -> bool;
     [[nodiscard]] auto CountAdjacentWater(int x, int y, int z) const -> int;
+    [[nodiscard]] auto HasSupportedLateralAirNeighbor(int x, int y, int z) const -> bool;
+    [[nodiscard]] auto TryCascadeWaterFall(int x, int y, int z, std::vector<ChunkCoord>& changedChunks) -> bool;
+    [[nodiscard]] auto TryStrideWaterSpread(int x, int y, int z, std::vector<ChunkCoord>& changedChunks) -> bool;
     [[nodiscard]] auto ComputeLooseSimulationRegions() const -> std::vector<LooseSimulationBounds>;
     void SimulateDrySandPass(const LooseSimulationBounds& bounds);
     void SimulateWetMudPass(const LooseSimulationBounds& bounds);

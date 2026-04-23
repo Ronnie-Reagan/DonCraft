@@ -21,6 +21,7 @@
 #include <limits>
 #include <span>
 #include <system_error>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -39,11 +40,15 @@ constexpr int kMinActiveChunkSizeCells = 8;
 constexpr int kMaxActiveChunkSizeCells = 128;
 constexpr float kDrySandTravelSpeedMetersPerSecond = 4.0f;
 constexpr float kWetMudTravelSpeedMetersPerSecond = 1.3f;
-constexpr float kWaterFallSpeedMetersPerSecond = 5.8f;
-constexpr float kWaterSpreadSpeedMetersPerSecond = 1.7f;
+constexpr float kWaterFallSpeedMetersPerSecond = 8.0f;
+constexpr float kWaterSpreadSpeedMetersPerSecond = 4.0f;
+constexpr int kMaxWaterFallPassesPerTick = 2;
+constexpr int kMaxWaterSpreadPassesPerTick = 2;
+constexpr int kWaterFallCascadeMovesPerPass = 4;
+constexpr int kWaterSpreadStrideMovesPerPass = 4;
 constexpr std::uint32_t kWaterBacktrackCooldownPasses = 4u;
 constexpr int kLooseSimulationPaddingCells = 1;
-constexpr float kMpmSimulationIntervalSeconds = 1.0f / 60.0f;
+constexpr float kMpmSimulationIntervalSeconds = 1.0f / 120.0f;
 constexpr int kMpmSliceBudgetPerAxisPass = 16;
 constexpr std::size_t kMpmParticleWarningThreshold = 8192u;
 constexpr float kSurfaceIsoLevel = 0.5f;
@@ -928,7 +933,7 @@ void DemoWorld::Tick(const float dt)
         int waterFallSteps = 0;
         {
             const ScopedProfileSection scope(profiler_, "World Water Fall");
-            while (waterFallAccumulator_ >= cellSize_ && waterFallSteps < 4)
+            while (waterFallAccumulator_ >= cellSize_ && waterFallSteps < kMaxWaterFallPassesPerTick)
             {
                 for (const LooseSimulationBounds& bounds : looseRegions)
                 {
@@ -942,7 +947,7 @@ void DemoWorld::Tick(const float dt)
         int waterSpreadSteps = 0;
         {
             const ScopedProfileSection scope(profiler_, "World Water Spread");
-            while (waterSpreadAccumulator_ >= cellSize_ && waterSpreadSteps < 2)
+            while (waterSpreadAccumulator_ >= cellSize_ && waterSpreadSteps < kMaxWaterSpreadPassesPerTick)
             {
                 ++waterSpreadPass_;
                 for (const LooseSimulationBounds& bounds : looseRegions)
@@ -1287,6 +1292,7 @@ bool DemoWorld::OverlapsBlocking(const Vec3& center, const Vec3& halfExtents) co
         return true;
     }
 
+    bool hasNearbyBlockingCells = false;
     for (int z = minCell.z; z <= maxCell.z; ++z)
     {
         for (int y = minCell.y; y <= maxCell.y; ++y)
@@ -1303,6 +1309,38 @@ bool DemoWorld::OverlapsBlocking(const Vec3& center, const Vec3& halfExtents) co
                 }
 
                 if (IsBlocking(GetCell(x, y, z)))
+                {
+                    hasNearbyBlockingCells = true;
+                }
+            }
+        }
+    }
+
+    if (!hasNearbyBlockingCells)
+    {
+        return false;
+    }
+
+    const float targetSpacing = std::max(cellSize_ * 0.45f, 0.08f);
+    const int samplesX = std::clamp(static_cast<int>(std::ceil((halfExtents.x * 2.0f) / targetSpacing)), 1, 5);
+    const int samplesY = std::clamp(static_cast<int>(std::ceil((halfExtents.y * 2.0f) / targetSpacing)), 1, 7);
+    const int samplesZ = std::clamp(static_cast<int>(std::ceil((halfExtents.z * 2.0f) / targetSpacing)), 1, 5);
+
+    for (int sampleZ = 0; sampleZ <= samplesZ; ++sampleZ)
+    {
+        const float tz = static_cast<float>(sampleZ) / static_cast<float>(samplesZ);
+        for (int sampleY = 0; sampleY <= samplesY; ++sampleY)
+        {
+            const float ty = static_cast<float>(sampleY) / static_cast<float>(samplesY);
+            for (int sampleX = 0; sampleX <= samplesX; ++sampleX)
+            {
+                const float tx = static_cast<float>(sampleX) / static_cast<float>(samplesX);
+                const Vec3 samplePosition{
+                    Lerp(minimum.x, maximum.x, tx),
+                    Lerp(minimum.y, maximum.y, ty),
+                    Lerp(minimum.z, maximum.z, tz),
+                };
+                if (SampleSurfaceDensity(samplePosition, false) >= (kSurfaceIsoLevel + 0.035f))
                 {
                     return true;
                 }
@@ -1322,6 +1360,7 @@ auto DemoWorld::Raycast(const Ray& ray, const float maxDistance) const -> Raycas
         return hit;
     }
 
+    Vec3 previousPosition = ray.origin;
     Int3 previousCell = WorldToCell(ray.origin);
     for (float distance = 0.0f; distance <= maxDistance; distance += cellSize_ * 0.2f)
     {
@@ -1341,29 +1380,55 @@ auto DemoWorld::Raycast(const Ray& ray, const float maxDistance) const -> Raycas
         const MaterialId material = GetCell(cell.x, cell.y, cell.z);
         if (material != MaterialId::Air)
         {
-            hit.hit = true;
-            hit.position = samplePosition;
-            hit.cell = cell;
-            hit.material = material;
-            hit.distance = distance;
+            const bool waterSurface = material == MaterialId::ShallowWater;
+            Vec3 outsidePoint = previousPosition;
+            Vec3 insidePoint = samplePosition;
+            for (int iteration = 0; iteration < 10; ++iteration)
+            {
+                const Vec3 midpoint = (outsidePoint + insidePoint) * 0.5f;
+                if (SampleSurfaceDensity(midpoint, waterSurface) >= kSurfaceIsoLevel)
+                {
+                    insidePoint = midpoint;
+                }
+                else
+                {
+                    outsidePoint = midpoint;
+                }
+            }
 
-            const Int3 delta{
-                cell.x - previousCell.x,
-                cell.y - previousCell.y,
-                cell.z - previousCell.z,
-            };
-            hit.normal = Normalize(Vec3{
-                delta.x != 0 ? -static_cast<float>(delta.x) : 0.0f,
-                delta.y != 0 ? -static_cast<float>(delta.y) : 0.0f,
-                delta.z != 0 ? -static_cast<float>(delta.z) : 0.0f,
-            });
-            if (LengthSquared(hit.normal) <= 0.0f)
+            hit.hit = true;
+            hit.position = insidePoint;
+            hit.material = material;
+            hit.normal = SampleSurfaceNormal(hit.position, waterSurface);
+            if (LengthSquared(hit.normal) <= 1.0e-6f)
+            {
+                const Int3 delta{
+                    cell.x - previousCell.x,
+                    cell.y - previousCell.y,
+                    cell.z - previousCell.z,
+                };
+                hit.normal = Normalize(Vec3{
+                    delta.x != 0 ? -static_cast<float>(delta.x) : 0.0f,
+                    delta.y != 0 ? -static_cast<float>(delta.y) : 0.0f,
+                    delta.z != 0 ? -static_cast<float>(delta.z) : 0.0f,
+                });
+            }
+            if (LengthSquared(hit.normal) <= 1.0e-6f)
             {
                 hit.normal = -direction;
             }
+
+            const Vec3 materialProbe = hit.position - hit.normal * std::max(cellSize_ * 0.18f, 0.03f);
+            hit.cell = WorldToCell(materialProbe);
+            if (!InBounds(hit.cell.x, hit.cell.y, hit.cell.z))
+            {
+                hit.cell = cell;
+            }
+            hit.distance = Length(hit.position - ray.origin);
             return hit;
         }
 
+        previousPosition = samplePosition;
         previousCell = cell;
     }
 
@@ -1830,8 +1895,6 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
     const float fullDetailDistance = std::min(clampedDrawDistance, std::max(chunkWorldSpan * 4.0f, 100.0f));
     const float coarseDetailDistance = std::min(clampedDrawDistance, std::max(chunkWorldSpan * 8.0f, 250.0f));
     const Vec3 worldMinimum = WorldMin();
-    const Vec3 lightDirection = Normalize(Vec3{0.28f, 0.88f, 0.36f});
-    const Vec3 waterHighlightDirection = Normalize(lightDirection + Vec3{0.0f, 1.0f, 0.0f});
 
     struct ColumnCoord
     {
@@ -2030,59 +2093,33 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         return MaterialId::Air;
     };
 
-    const auto shadeApproximateSurface = [this, &lightDirection, &waterHighlightDirection](
-                                             const MaterialId material,
-                                             const Vec3& normal,
-                                             const bool translucent,
-                                             const float waterDepth) -> Vec4
+    const auto buildApproximateSurfaceAppearance = [this](
+                                                      const MaterialId material,
+                                                      const bool translucent,
+                                                      const float waterDepth) -> std::pair<Vec4, Vec4>
     {
-        Vec3 resolvedNormal = normal;
-        if (LengthSquared(resolvedNormal) <= 1.0e-6f)
-        {
-            resolvedNormal = Vec3{0.0f, 1.0f, 0.0f};
-        }
-        else
-        {
-            resolvedNormal = Normalize(resolvedNormal);
-        }
-
+        Vec4 color = GetMaterialProperties(material).color;
         if (translucent)
         {
-            const float diffuse = std::max(0.0f, Dot(resolvedNormal, lightDirection));
-            const float horizonFactor = Clamp(1.0f - resolvedNormal.y, 0.0f, 1.0f);
             const float depthFactor = Clamp(waterDepth / std::max(cellSize_ * 4.0f, 0.001f), 0.0f, 1.0f);
-            const float highlight = std::pow(std::max(0.0f, Dot(resolvedNormal, waterHighlightDirection)), 24.0f);
-
-            const Vec3 shallowColor{0.18f, 0.56f, 0.74f};
-            const Vec3 deepColor{0.07f, 0.28f, 0.58f};
-            Vec3 waterColor = {
-                Lerp(shallowColor.x, deepColor.x, depthFactor),
-                Lerp(shallowColor.y, deepColor.y, depthFactor),
-                Lerp(shallowColor.z, deepColor.z, depthFactor),
-            };
-
-            const float light = 0.28f + 0.34f * diffuse + 0.18f * horizonFactor + 0.20f * Clamp(resolvedNormal.y * 0.5f + 0.5f, 0.0f, 1.0f);
-            waterColor *= light;
-            waterColor += Vec3{1.0f, 1.0f, 1.0f} * (0.03f + 0.08f * horizonFactor + 0.10f * highlight);
-
+            color.w = Clamp(0.24f + 0.24f * depthFactor, 0.22f, 0.72f);
             return {
-                Clamp(waterColor.x, 0.0f, 1.0f),
-                Clamp(waterColor.y, 0.0f, 1.0f),
-                Clamp(waterColor.z, 0.0f, 1.0f),
-                Clamp(0.24f + 0.20f * depthFactor + 0.12f * horizonFactor, 0.20f, 0.60f),
+                color,
+                render::MakeSceneMaterial(
+                    static_cast<float>(material),
+                    waterDepth,
+                    0.0f,
+                    render::kSurfaceShadingWater),
             };
         }
 
-        const Vec4 baseColor = GetMaterialProperties(material).color;
-        const float diffuse = std::max(0.0f, Dot(resolvedNormal, lightDirection));
-        const float skyFactor = Clamp(resolvedNormal.y * 0.5f + 0.5f, 0.0f, 1.0f);
-        const float bounce = Clamp(0.35f + 0.65f * resolvedNormal.y, 0.15f, 1.0f);
-        const float light = 0.18f + 0.47f * diffuse + 0.20f * skyFactor + 0.15f * bounce;
         return {
-            Clamp(baseColor.x * light, 0.0f, 1.0f),
-            Clamp(baseColor.y * light, 0.0f, 1.0f),
-            Clamp(baseColor.z * light, 0.0f, 1.0f),
-            baseColor.w,
+            color,
+            render::MakeSceneMaterial(
+                static_cast<float>(material),
+                0.0f,
+                0.0f,
+                render::kSurfaceShadingTerrain),
         };
     };
 
@@ -2120,20 +2157,37 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         const Vec3 b = worldMinimum + Vec3{static_cast<float>(patchMaxX) * cellSize_, h10, static_cast<float>(patchMinZ) * cellSize_};
         const Vec3 c = worldMinimum + Vec3{static_cast<float>(patchMaxX) * cellSize_, h11, static_cast<float>(patchMaxZ) * cellSize_};
         const Vec3 d = worldMinimum + Vec3{static_cast<float>(patchMinX) * cellSize_, h01, static_cast<float>(patchMaxZ) * cellSize_};
-        const Vec3 normal = Normalize(Cross(b - a, d - a) + Cross(c - b, d - b));
+        Vec3 normal = Normalize(Cross(b - a, d - a) + Cross(c - b, d - b));
+        if (LengthSquared(normal) <= 1.0e-6f)
+        {
+            normal = Vec3{0.0f, 1.0f, 0.0f};
+        }
 
         const float solidHeight = sampleCornerHeight(solidSurfaceHeightMap_, (patchMinX + patchMaxX) / 2, (patchMinZ + patchMaxZ) / 2);
         const float waterDepth = field == SurfaceField::Water && std::isfinite(solidHeight)
             ? std::max(((h00 + h10 + h01 + h11) * 0.25f) - solidHeight, cellSize_ * 0.10f)
             : cellSize_ * 0.10f;
-        const Vec4 color = shadeApproximateSurface(material, normal, field == SurfaceField::Water, waterDepth);
+        const auto [color, surfaceMaterial] = buildApproximateSurfaceAppearance(material, field == SurfaceField::Water, waterDepth);
 
-        triangles.push_back({a, color});
-        triangles.push_back({b, color});
-        triangles.push_back({c, color});
-        triangles.push_back({a, color});
-        triangles.push_back({c, color});
-        triangles.push_back({d, color});
+        Vec3 adjustedA = a;
+        Vec3 adjustedB = b;
+        Vec3 adjustedC = c;
+        Vec3 adjustedD = d;
+        if (field == SurfaceField::Water)
+        {
+            const Vec3 waterBias = normal * (cellSize_ * 0.04f);
+            adjustedA += waterBias;
+            adjustedB += waterBias;
+            adjustedC += waterBias;
+            adjustedD += waterBias;
+        }
+
+        triangles.push_back({adjustedA, color, normal, surfaceMaterial});
+        triangles.push_back({adjustedB, color, normal, surfaceMaterial});
+        triangles.push_back({adjustedC, color, normal, surfaceMaterial});
+        triangles.push_back({adjustedA, color, normal, surfaceMaterial});
+        triangles.push_back({adjustedC, color, normal, surfaceMaterial});
+        triangles.push_back({adjustedD, color, normal, surfaceMaterial});
 
         if (showWireframe)
         {
@@ -2240,6 +2294,110 @@ bool DemoWorld::InBounds(const int x, const int y, const int z) const
     return x >= 0 && x < width_ &&
            y >= 0 && y < height_ &&
            z >= 0 && z < depth_;
+}
+
+auto DemoWorld::SampleSurfaceDensity(const Vec3& worldPosition, const bool waterSurface) const -> float
+{
+    const Vec3 worldMinimum = WorldMin();
+    const Vec3 localPosition = (worldPosition - worldMinimum) / cellSize_;
+
+    int x0 = static_cast<int>(std::floor(localPosition.x));
+    int y0 = static_cast<int>(std::floor(localPosition.y));
+    int z0 = static_cast<int>(std::floor(localPosition.z));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    int z1 = z0 + 1;
+
+    if (x1 < 0 || y1 < 0 || z1 < 0 || x0 > width_ || y0 > height_ || z0 > depth_)
+    {
+        return 0.0f;
+    }
+
+    float tx = localPosition.x - static_cast<float>(x0);
+    float ty = localPosition.y - static_cast<float>(y0);
+    float tz = localPosition.z - static_cast<float>(z0);
+
+    const auto clampCornerRange = [](int& lower, int& upper, float& factor, const int minimum, const int maximum)
+    {
+        if (lower < minimum)
+        {
+            lower = upper = minimum;
+            factor = 0.0f;
+            return;
+        }
+        if (upper > maximum)
+        {
+            lower = upper = maximum;
+            factor = 0.0f;
+        }
+    };
+
+    clampCornerRange(x0, x1, tx, 0, width_);
+    clampCornerRange(y0, y1, ty, 0, height_);
+    clampCornerRange(z0, z1, tz, 0, depth_);
+
+    const auto sampleCornerDensity = [this, waterSurface](const int gx, const int gy, const int gz) -> float
+    {
+        float filledWeight = 0.0f;
+        for (int sampleZ = gz - 1; sampleZ <= gz; ++sampleZ)
+        {
+            for (int sampleY = gy - 1; sampleY <= gy; ++sampleY)
+            {
+                for (int sampleX = gx - 1; sampleX <= gx; ++sampleX)
+                {
+                    if (!InBounds(sampleX, sampleY, sampleZ))
+                    {
+                        continue;
+                    }
+
+                    if (SurfaceFieldContainsMaterial(GetCell(sampleX, sampleY, sampleZ), waterSurface ? SurfaceField::Water : SurfaceField::Solid))
+                    {
+                        filledWeight += 1.0f;
+                    }
+                }
+            }
+        }
+
+        return filledWeight / 8.0f;
+    };
+
+    const float d000 = sampleCornerDensity(x0, y0, z0);
+    const float d100 = sampleCornerDensity(x1, y0, z0);
+    const float d010 = sampleCornerDensity(x0, y1, z0);
+    const float d110 = sampleCornerDensity(x1, y1, z0);
+    const float d001 = sampleCornerDensity(x0, y0, z1);
+    const float d101 = sampleCornerDensity(x1, y0, z1);
+    const float d011 = sampleCornerDensity(x0, y1, z1);
+    const float d111 = sampleCornerDensity(x1, y1, z1);
+
+    const float d00 = Lerp(d000, d100, tx);
+    const float d10 = Lerp(d010, d110, tx);
+    const float d01 = Lerp(d001, d101, tx);
+    const float d11 = Lerp(d011, d111, tx);
+    const float d0 = Lerp(d00, d10, ty);
+    const float d1 = Lerp(d01, d11, ty);
+    return Lerp(d0, d1, tz);
+}
+
+auto DemoWorld::SampleSurfaceNormal(const Vec3& worldPosition, const bool waterSurface) const -> Vec3
+{
+    const float epsilon = std::max(cellSize_ * 0.28f, 0.02f);
+    const Vec3 xOffset{epsilon, 0.0f, 0.0f};
+    const Vec3 yOffset{0.0f, epsilon, 0.0f};
+    const Vec3 zOffset{0.0f, 0.0f, epsilon};
+
+    Vec3 gradient{
+        SampleSurfaceDensity(worldPosition + xOffset, waterSurface) - SampleSurfaceDensity(worldPosition - xOffset, waterSurface),
+        SampleSurfaceDensity(worldPosition + yOffset, waterSurface) - SampleSurfaceDensity(worldPosition - yOffset, waterSurface),
+        SampleSurfaceDensity(worldPosition + zOffset, waterSurface) - SampleSurfaceDensity(worldPosition - zOffset, waterSurface),
+    };
+
+    if (LengthSquared(gradient) <= 1.0e-6f)
+    {
+        return Vec3{0.0f, 1.0f, 0.0f};
+    }
+
+    return Normalize(-gradient);
 }
 
 auto DemoWorld::WorldToCell(const Vec3& position) const -> Int3
@@ -2524,7 +2682,205 @@ auto DemoWorld::CanWaterSpreadLaterally(const int x, const int y, const int z) c
         return true;
     }
 
-    return CountAdjacentWater(x, y, z) >= 2;
+    return CountAdjacentWater(x, y, z) >= 1;
+}
+
+auto DemoWorld::HasSupportedLateralAirNeighbor(const int x, const int y, const int z) const -> bool
+{
+    constexpr std::array<Int3, 4> kDirections = {
+        Int3{1, 0, 0},
+        Int3{-1, 0, 0},
+        Int3{0, 0, 1},
+        Int3{0, 0, -1},
+    };
+
+    for (const Int3& direction : kDirections)
+    {
+        const int targetX = x + direction.x;
+        const int targetZ = z + direction.z;
+        if (!InBounds(targetX, y, targetZ))
+        {
+            continue;
+        }
+        if (GetCell(targetX, y, targetZ) != MaterialId::Air)
+        {
+            continue;
+        }
+        if (y > 0 && GetCell(targetX, y - 1, targetZ) == MaterialId::Air)
+        {
+            continue;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+auto DemoWorld::TryCascadeWaterFall(
+    const int x,
+    const int y,
+    const int z,
+    std::vector<ChunkCoord>& changedChunks) -> bool
+{
+    int currentX = x;
+    int currentY = y;
+    int currentZ = z;
+    bool movedAny = false;
+
+    for (int step = 0; step < kWaterFallCascadeMovesPerPass && currentY > 0; ++step)
+    {
+        if (GetCell(currentX, currentY, currentZ) != MaterialId::ShallowWater)
+        {
+            break;
+        }
+
+        if (TryMoveCell(currentX, currentY, currentZ, currentX, currentY - 1, currentZ, false, 0, &changedChunks))
+        {
+            movedAny = true;
+            --currentY;
+            continue;
+        }
+
+        bool movedThisStep = false;
+        const auto directions = WaterFallDirections(
+            currentX,
+            currentZ,
+            generationSettings_.seed ^ 0x9a11c34du,
+            simulationStep_ + static_cast<std::uint64_t>(step));
+        for (const Int3& direction : directions)
+        {
+            if (!TryMoveCell(currentX, currentY, currentZ, currentX + direction.x, currentY - 1, currentZ + direction.z, false, 0, &changedChunks))
+            {
+                continue;
+            }
+
+            currentX += direction.x;
+            --currentY;
+            currentZ += direction.z;
+            movedAny = true;
+            movedThisStep = true;
+            break;
+        }
+
+        if (!movedThisStep)
+        {
+            break;
+        }
+    }
+
+    return movedAny;
+}
+
+auto DemoWorld::TryStrideWaterSpread(
+    const int x,
+    const int y,
+    const int z,
+    std::vector<ChunkCoord>& changedChunks) -> bool
+{
+    int currentX = x;
+    int currentY = y;
+    int currentZ = z;
+    bool movedAny = false;
+    std::int8_t preferredDirectionCode = 0;
+
+    for (int step = 0; step < kWaterSpreadStrideMovesPerPass; ++step)
+    {
+        if (GetCell(currentX, currentY, currentZ) != MaterialId::ShallowWater)
+        {
+            break;
+        }
+        if (currentY > 0 && GetCell(currentX, currentY - 1, currentZ) == MaterialId::Air)
+        {
+            break;
+        }
+        if (!HasSupportedLateralAirNeighbor(currentX, currentY, currentZ))
+        {
+            break;
+        }
+        if (!movedAny && !CanWaterSpreadLaterally(currentX, currentY, currentZ))
+        {
+            break;
+        }
+
+        const std::size_t sourceIndex = CellIndex(currentX, currentY, currentZ);
+        const auto directions = WaterSpreadDirections(
+            currentX,
+            currentZ,
+            generationSettings_.seed,
+            waterSpreadPass_ + static_cast<std::uint32_t>(step));
+        bool movedThisStep = false;
+        const auto tryDirection = [this, &changedChunks, currentY, sourceIndex, &currentX, &currentZ, &movedAny, &movedThisStep, &preferredDirectionCode](
+                                      const Int3& direction) -> bool
+        {
+            const int targetX = currentX + direction.x;
+            const int targetZ = currentZ + direction.z;
+            if (!InBounds(targetX, currentY, targetZ))
+            {
+                return false;
+            }
+            if (GetCell(targetX, currentY, targetZ) != MaterialId::Air)
+            {
+                return false;
+            }
+            if (currentY > 0 && GetCell(targetX, currentY - 1, targetZ) == MaterialId::Air)
+            {
+                return false;
+            }
+
+            const std::int8_t directionCode = CardinalDirectionCode(direction);
+            if (directionCode != 0 &&
+                waterLastLateralDirection_[sourceIndex] == -directionCode &&
+                waterSpreadPass_ - waterLastLateralPass_[sourceIndex] <= kWaterBacktrackCooldownPasses)
+            {
+                return false;
+            }
+
+            if (!TryMoveCell(currentX, currentY, currentZ, targetX, currentY, targetZ, false, directionCode, &changedChunks))
+            {
+                return false;
+            }
+
+            currentX = targetX;
+            currentZ = targetZ;
+            movedAny = true;
+            movedThisStep = true;
+            preferredDirectionCode = directionCode;
+            return true;
+        };
+
+        if (preferredDirectionCode != 0)
+        {
+            const Int3 preferredDirection =
+                preferredDirectionCode == 1 ? Int3{1, 0, 0} :
+                preferredDirectionCode == -1 ? Int3{-1, 0, 0} :
+                preferredDirectionCode == 2 ? Int3{0, 0, 1} :
+                Int3{0, 0, -1};
+            static_cast<void>(tryDirection(preferredDirection));
+        }
+
+        if (!movedThisStep)
+        {
+            for (const Int3& direction : directions)
+            {
+                if (CardinalDirectionCode(direction) == preferredDirectionCode)
+                {
+                    continue;
+                }
+                if (tryDirection(direction))
+                {
+                    break;
+                }
+            }
+        }
+
+        if (!movedThisStep)
+        {
+            break;
+        }
+    }
+
+    return movedAny;
 }
 
 auto DemoWorld::ComputeLooseSimulationRegions() const -> std::vector<LooseSimulationBounds>
@@ -2698,19 +3054,7 @@ void DemoWorld::SimulateWaterFallPass(const LooseSimulationBounds& bounds)
                     continue;
                 }
 
-                if (TryMoveCell(x, y, z, x, y - 1, z, false, 0, &changedChunks))
-                {
-                    continue;
-                }
-
-                const auto directions = WaterFallDirections(x, z, generationSettings_.seed ^ 0x9a11c34du, simulationStep_);
-                for (const Int3& direction : directions)
-                {
-                    if (TryMoveCell(x, y, z, x + direction.x, y - 1, z + direction.z, false, 0, &changedChunks))
-                    {
-                        break;
-                    }
-                }
+                static_cast<void>(TryCascadeWaterFall(x, y, z, changedChunks));
             }
         }
     }
@@ -2742,43 +3086,16 @@ void DemoWorld::SimulateWaterSpreadPass(const LooseSimulationBounds& bounds)
                 {
                     continue;
                 }
+                if (!HasSupportedLateralAirNeighbor(x, y, z))
+                {
+                    continue;
+                }
                 if (!CanWaterSpreadLaterally(x, y, z))
                 {
                     continue;
                 }
 
-                const std::size_t sourceIndex = CellIndex(x, y, z);
-                const auto directions = WaterSpreadDirections(x, z, generationSettings_.seed, waterSpreadPass_);
-                for (const Int3& direction : directions)
-                {
-                    const int targetX = x + direction.x;
-                    const int targetZ = z + direction.z;
-                    if (!InBounds(targetX, y, targetZ))
-                    {
-                        continue;
-                    }
-                    if (GetCell(targetX, y, targetZ) != MaterialId::Air)
-                    {
-                        continue;
-                    }
-                    if (y > 0 && GetCell(targetX, y - 1, targetZ) == MaterialId::Air)
-                    {
-                        continue;
-                    }
-
-                    const std::int8_t directionCode = CardinalDirectionCode(direction);
-                    if (directionCode != 0 &&
-                        waterLastLateralDirection_[sourceIndex] == -directionCode &&
-                        waterSpreadPass_ - waterLastLateralPass_[sourceIndex] <= kWaterBacktrackCooldownPasses)
-                    {
-                        continue;
-                    }
-
-                    if (TryMoveCell(x, y, z, targetX, y, targetZ, false, directionCode, &changedChunks))
-                    {
-                        break;
-                    }
-                }
+                static_cast<void>(TryStrideWaterSpread(x, y, z, changedChunks));
             }
         }
     }
@@ -3795,8 +4112,6 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
     });
 
     const Vec3 worldMinimum = WorldMin();
-    const Vec3 lightDirection = Normalize(Vec3{0.28f, 0.88f, 0.36f});
-    const Vec3 waterHighlightDirection = Normalize(lightDirection + Vec3{0.0f, 1.0f, 0.0f});
     constexpr float kVertexQuantizeScale = 4096.0f;
 
     const auto sampleCornerDensity = [this](const int gx, const int gy, const int gz, const SurfaceField field) -> float
@@ -4132,6 +4447,7 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
                         const float surfaceHeight = sampleHeightMap(waterSurfaceHeightMap_, position);
                         const float floorHeight = sampleHeightMap(solidSurfaceHeightMap_, position);
                         vertex.waterDepth = std::max(surfaceHeight - floorHeight, cellSize_ * 0.15f);
+                        vertex.position += vertex.normal * (cellSize_ * 0.04f);
                     }
 
                     const std::uint32_t vertexIndex = static_cast<std::uint32_t>(builder.vertices.size());
@@ -4326,55 +4642,30 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
                     }
                 }
 
-                const auto shadeVertex = [&](const SurfaceMeshVertex& vertex) -> Vec4
+                const auto buildSurfaceAppearance = [&](const SurfaceMeshVertex& vertex) -> std::pair<Vec4, Vec4>
                 {
-                    Vec3 normal = vertex.normal;
-                    if (LengthSquared(normal) <= 1.0e-6f)
-                    {
-                        normal = Vec3{0.0f, 1.0f, 0.0f};
-                    }
-                    else
-                    {
-                        normal = Normalize(normal);
-                    }
-
                     if (field == SurfaceField::Water)
                     {
-                        const float diffuse = std::max(0.0f, Dot(normal, lightDirection));
-                        const float horizonFactor = Clamp(1.0f - normal.y, 0.0f, 1.0f);
                         const float depthFactor = Clamp(vertex.waterDepth / std::max(cellSize_ * 4.0f, 0.001f), 0.0f, 1.0f);
-                        const float highlight = std::pow(std::max(0.0f, Dot(normal, waterHighlightDirection)), 24.0f);
-
-                        const Vec3 shallowColor{0.18f, 0.56f, 0.74f};
-                        const Vec3 deepColor{0.07f, 0.28f, 0.58f};
-                        Vec3 waterColor = {
-                            Lerp(shallowColor.x, deepColor.x, depthFactor),
-                            Lerp(shallowColor.y, deepColor.y, depthFactor),
-                            Lerp(shallowColor.z, deepColor.z, depthFactor),
-                        };
-
-                        const float light = 0.28f + 0.34f * diffuse + 0.18f * horizonFactor + 0.20f * Clamp(normal.y * 0.5f + 0.5f, 0.0f, 1.0f);
-                        waterColor *= light;
-                        waterColor += Vec3{1.0f, 1.0f, 1.0f} * (0.03f + 0.08f * horizonFactor + 0.10f * highlight);
-
+                        Vec4 color = GetMaterialProperties(vertex.material).color;
+                        color.w = Clamp(0.24f + 0.24f * depthFactor, 0.22f, 0.72f);
                         return {
-                            Clamp(waterColor.x, 0.0f, 1.0f),
-                            Clamp(waterColor.y, 0.0f, 1.0f),
-                            Clamp(waterColor.z, 0.0f, 1.0f),
-                            Clamp(0.24f + 0.24f * depthFactor + 0.16f * horizonFactor, 0.22f, 0.72f),
+                            color,
+                            render::MakeSceneMaterial(
+                                static_cast<float>(vertex.material),
+                                vertex.waterDepth,
+                                0.0f,
+                                render::kSurfaceShadingWater),
                         };
                     }
 
-                    const Vec4 baseColor = GetMaterialProperties(vertex.material).color;
-                    const float diffuse = std::max(0.0f, Dot(normal, lightDirection));
-                    const float skyFactor = Clamp(normal.y * 0.5f + 0.5f, 0.0f, 1.0f);
-                    const float bounce = Clamp(0.35f + 0.65f * normal.y, 0.15f, 1.0f);
-                    const float light = 0.18f + 0.47f * diffuse + 0.20f * skyFactor + 0.15f * bounce;
                     return {
-                        Clamp(baseColor.x * light, 0.0f, 1.0f),
-                        Clamp(baseColor.y * light, 0.0f, 1.0f),
-                        Clamp(baseColor.z * light, 0.0f, 1.0f),
-                        baseColor.w,
+                        GetMaterialProperties(vertex.material).color,
+                        render::MakeSceneMaterial(
+                            static_cast<float>(vertex.material),
+                            0.0f,
+                            0.0f,
+                            render::kSurfaceShadingTerrain),
                     };
                 };
 
@@ -4386,9 +4677,13 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
                     const SurfaceMeshVertex& b = builder.vertices[builder.indices[triangleIndex + 1]];
                     const SurfaceMeshVertex& c = builder.vertices[builder.indices[triangleIndex + 2]];
 
-                    outputTriangles.push_back({a.position, shadeVertex(a)});
-                    outputTriangles.push_back({b.position, shadeVertex(b)});
-                    outputTriangles.push_back({c.position, shadeVertex(c)});
+                    const auto [colorA, materialA] = buildSurfaceAppearance(a);
+                    const auto [colorB, materialB] = buildSurfaceAppearance(b);
+                    const auto [colorC, materialC] = buildSurfaceAppearance(c);
+
+                    outputTriangles.push_back({a.position, colorA, a.normal, materialA});
+                    outputTriangles.push_back({b.position, colorB, b.normal, materialB});
+                    outputTriangles.push_back({c.position, colorC, c.normal, materialC});
                 }
 
                 return outputTriangles;

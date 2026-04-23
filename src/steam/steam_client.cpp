@@ -95,7 +95,7 @@ public:
     {
         Cancel();
 
-        if (SteamMatchmakingServers() == nullptr || appId == 480u)
+        if (SteamMatchmakingServers() == nullptr)
         {
             owner_.browserServerRefreshPending_ = false;
             return;
@@ -154,9 +154,9 @@ public:
         entry.port = details->m_NetAdr.GetConnectionPort();
         entry.currentPlayers = details->m_nPlayers;
         entry.maxPlayers = details->m_nMaxPlayers;
-        entry.joinable = details->m_bHadSuccessfulResponse && details->m_nPlayers < details->m_nMaxPlayers;
         entry.dedicated = true;
         entry.ownerSteamId = details->m_steamID.ConvertToUint64();
+        entry.joinable = details->m_bHadSuccessfulResponse && details->m_nPlayers < details->m_nMaxPlayers;
         if (entry.joinable)
         {
             owner_.browserEntries_.push_back(std::move(entry));

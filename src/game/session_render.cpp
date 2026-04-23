@@ -1000,7 +1000,8 @@ void GatherTerrainRenderData(
     const int viewportWidth,
     const int viewportHeight)
 {
-    data.clearColor = MakeColor(0.53f, 0.73f, 0.92f, 1.0f);
+    data.clearColor = MakeColor(0.62f, 0.76f, 0.90f, 1.0f);
+    data.cameraPosition = cameraPosition;
     data.worldToClip = BuildSessionWorldToClip(cameraPosition, aimPosition, forward, options, viewportWidth, viewportHeight);
 
     world.GatherRenderGeometrySmoothedCulled(

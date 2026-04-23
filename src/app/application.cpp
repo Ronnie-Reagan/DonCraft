@@ -173,11 +173,12 @@ void AppendHolosightReticle(
 auto BuildEmptyRenderData(const int viewportWidth, const int viewportHeight) -> render::FrameRenderData
 {
     render::FrameRenderData data{};
-    data.clearColor = MakeColor(0.08f, 0.10f, 0.14f, 1.0f);
+    data.clearColor = MakeColor(0.62f, 0.76f, 0.90f, 1.0f);
+    data.cameraPosition = Vec3{0.0f, 4.0f, -8.0f};
     const float aspect = static_cast<float>(viewportWidth) / static_cast<float>(std::max(viewportHeight, 1));
     data.worldToClip =
         PerspectiveMatrix(DegreesToRadians(70.0f), aspect, 0.1f, 200.0f) *
-        LookAtMatrix(Vec3{0.0f, 4.0f, -8.0f}, Vec3{0.0f, 0.5f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f});
+        LookAtMatrix(data.cameraPosition, Vec3{0.0f, 0.5f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f});
     return data;
 }
 
