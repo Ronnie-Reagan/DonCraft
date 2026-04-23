@@ -13,9 +13,11 @@
 
 namespace df::net
 {
-inline constexpr std::uint32_t kSessionProtocolVersion = 4u;
-inline constexpr std::size_t kMaxWorldSnapshotCellsPerMessage = 64u * 1024u;
-inline constexpr std::size_t kMaxChunkDeltaBatchPayloadBytes = 64u * 1024u;
+inline constexpr std::uint32_t kSessionProtocolVersion = 8u;
+inline constexpr std::size_t kMaxWorldSnapshotPayloadBytes = 768u;
+inline constexpr std::size_t kMaxWorldSnapshotCellsPerMessage = kMaxWorldSnapshotPayloadBytes;
+inline constexpr std::size_t kMaxChunkDeltaBatchPayloadBytes = 896u;
+inline constexpr std::size_t kMaxCommandBundleFrames = 8u;
 
 enum class MessageType : std::uint8_t
 {
@@ -27,6 +29,7 @@ enum class MessageType : std::uint8_t
     ActorSnapshotFrame = 6,
     Disconnect = 7,
     ClientStateFrame = 8,
+    CommandBundle = 9,
 };
 
 enum class BrowserEntryType : std::uint8_t
@@ -135,6 +138,16 @@ struct BeamSnapshot
     float ttl = 0.0f;
 };
 
+struct AudioCueSnapshot
+{
+    Vec3 position{};
+    float baseFrequency = 220.0f;
+    float durationSeconds = 0.1f;
+    float amplitude = 0.18f;
+    float noise = 0.0f;
+    float sweep = 0.0f;
+};
+
 struct ActorSnapshotFrame
 {
     std::uint64_t serverTick = 0;
@@ -143,14 +156,23 @@ struct ActorSnapshotFrame
     std::vector<GrenadeSnapshot> grenades;
     std::vector<BulletSnapshot> bullets;
     std::vector<BeamSnapshot> beams;
+    std::vector<AudioCueSnapshot> audioCues;
 };
 
 struct WorldSnapshotMessage
 {
+    enum class Encoding : std::uint8_t
+    {
+        Raw = 0,
+        Rle = 1,
+    };
+
     std::uint64_t serverTick = 0;
     world::WorldGenerationSettings settings{};
     std::uint32_t totalCellCount = 0;
     std::uint32_t cellOffset = 0;
+    std::uint32_t decodedCellCount = 0;
+    Encoding encoding = Encoding::Raw;
     std::vector<std::uint8_t> cells;
 };
 
@@ -183,16 +205,19 @@ struct DecodedMessage
 
 [[nodiscard]] auto EncodeCommandFrame(const game::PlayerCommandFrame& frame) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeCommandFrame(std::span<const std::byte> bytes) -> game::PlayerCommandFrame;
+[[nodiscard]] auto EncodeCommandBundle(std::span<const game::PlayerCommandFrame> frames) -> std::vector<std::byte>;
+[[nodiscard]] auto DecodeCommandBundle(std::span<const std::byte> bytes) -> std::vector<game::PlayerCommandFrame>;
 
 [[nodiscard]] auto EncodeClientStateFrame(const ActorSnapshot& snapshot) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeClientStateFrame(std::span<const std::byte> bytes) -> ActorSnapshot;
 
 [[nodiscard]] auto EncodeWorldSnapshotMessage(const WorldSnapshotMessage& message) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeWorldSnapshotMessage(std::span<const std::byte> bytes) -> WorldSnapshotMessage;
+[[nodiscard]] auto DecodeWorldSnapshotCells(const WorldSnapshotMessage& message) -> std::vector<std::uint8_t>;
 [[nodiscard]] auto BuildWorldSnapshotMessages(
     std::uint64_t serverTick,
     const world::DenseWorldSnapshot& snapshot,
-    std::size_t maxCellsPerMessage = kMaxWorldSnapshotCellsPerMessage) -> std::vector<WorldSnapshotMessage>;
+    std::size_t maxPayloadBytes = kMaxWorldSnapshotPayloadBytes) -> std::vector<WorldSnapshotMessage>;
 
 [[nodiscard]] auto EncodeChunkDeltaBatchMessage(const ChunkDeltaBatchMessage& message) -> std::vector<std::byte>;
 [[nodiscard]] auto DecodeChunkDeltaBatchMessage(std::span<const std::byte> bytes) -> ChunkDeltaBatchMessage;

@@ -13,8 +13,10 @@ class PlayerController
 public:
     void Spawn(const world::DemoWorld& world);
     void PlaceAt(const Vec3& position, float yawRadians, float pitchRadians);
+    void Translate(const Vec3& delta);
     void Tick(const ControlState& input, const world::DemoWorld& world, float dt);
     void AddViewKick(float yawRadiansDelta, float pitchRadiansDelta);
+    void ApplyViewDelta(float yawRadiansDelta, float pitchRadiansDelta);
 
     [[nodiscard]] auto Position() const -> Vec3
     {

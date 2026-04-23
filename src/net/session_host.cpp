@@ -9,7 +9,23 @@ namespace df::net
 namespace
 {
 constexpr float kClientHelloTimeoutSeconds = 8.0f;
-constexpr std::size_t kMaxReliableMessagesPerPeerPerTick = 1u;
+constexpr std::size_t kReliableFlushByteBudgetPerPeerPerTick = 12u * 1024u;
+constexpr std::size_t kMaxReliableQueueBytesPerPeer = 16u * 1024u * 1024u;
+constexpr std::size_t kMaxAudioCuesPerActorFrame = 8u;
+
+auto WorldSettingsMatchForDelta(
+    const world::WorldGenerationSettings& lhs,
+    const world::WorldGenerationSettings& rhs) -> bool
+{
+    return lhs.worldWidth == rhs.worldWidth &&
+           lhs.worldHeight == rhs.worldHeight &&
+           lhs.worldDepth == rhs.worldDepth &&
+           lhs.activeChunkSize == rhs.activeChunkSize &&
+           lhs.seed == rhs.seed &&
+           lhs.cellSize == rhs.cellSize &&
+           lhs.terrainRelief == rhs.terrainRelief &&
+           lhs.waterLevel == rhs.waterLevel;
+}
 }
 
 void SessionHost::Initialize(const Config& config, std::unique_ptr<ITransport> transport)
@@ -21,6 +37,11 @@ void SessionHost::Initialize(const Config& config, std::unique_ptr<ITransport> t
     nextRemotePlayerId_ = std::max<game::PlayerId>(2u, config_.localHostPlayerId + 1u);
     worldSnapshotCache_ = {};
     worldSnapshotVersion_ = 0;
+    cachedWorldDeltaBaselineVersion_ = 0;
+    cachedWorldDeltaTargetVersion_ = 0;
+    cachedWorldDeltas_.clear();
+    localAudioCues_.clear();
+    tickAudioCues_.clear();
 
     if (config_.localHostPlayerId != game::kInvalidPlayerId)
     {
@@ -43,6 +64,11 @@ void SessionHost::Shutdown()
     peers_.clear();
     worldSnapshotCache_ = {};
     worldSnapshotVersion_ = 0;
+    cachedWorldDeltaBaselineVersion_ = 0;
+    cachedWorldDeltaTargetVersion_ = 0;
+    cachedWorldDeltas_.clear();
+    localAudioCues_.clear();
+    tickAudioCues_.clear();
 }
 
 void SessionHost::Tick(const float dt)
@@ -56,6 +82,8 @@ void SessionHost::Tick(const float dt)
     }
 
     runtime_.Tick(dt);
+    tickAudioCues_ = runtime_.ConsumeAudioCues();
+    localAudioCues_.insert(localAudioCues_.end(), tickAudioCues_.begin(), tickAudioCues_.end());
 
     if (transport_ != nullptr)
     {
@@ -83,8 +111,22 @@ void SessionHost::RefreshWorldSnapshotCache()
         return;
     }
 
+    world::DenseWorldSnapshot previousSnapshot = std::move(worldSnapshotCache_);
+    const std::uint64_t previousVersion = worldSnapshotVersion_;
+
     worldSnapshotCache_ = runtime_.World().CaptureSnapshot();
     worldSnapshotVersion_ = currentVersion;
+    cachedWorldDeltas_.clear();
+    cachedWorldDeltaBaselineVersion_ = 0;
+    cachedWorldDeltaTargetVersion_ = 0;
+
+    if (!previousSnapshot.cells.empty() &&
+        WorldSettingsMatchForDelta(previousSnapshot.settings, worldSnapshotCache_.settings))
+    {
+        cachedWorldDeltas_ = BuildChunkDeltas(previousSnapshot, worldSnapshotCache_);
+        cachedWorldDeltaBaselineVersion_ = previousVersion;
+        cachedWorldDeltaTargetVersion_ = currentVersion;
+    }
 }
 
 auto SessionHost::BuildActorFrame() const -> ActorSnapshotFrame
@@ -97,7 +139,6 @@ auto SessionHost::BuildActorFrame() const -> ActorSnapshotFrame
         const game::SessionRuntime::PlayerState& player = entry.second;
         ActorSnapshot actor{};
         actor.id = player.id;
-        actor.name = player.name;
         actor.position = player.controller.Position();
         actor.cameraPosition = player.controller.CameraPosition();
         actor.forward = player.controller.ForwardVector();
@@ -164,19 +205,67 @@ auto SessionHost::BuildActorFrame() const -> ActorSnapshotFrame
         });
     }
 
+    const std::size_t audioCueCount = std::min(tickAudioCues_.size(), kMaxAudioCuesPerActorFrame);
+    frame.audioCues.reserve(audioCueCount);
+    for (std::size_t index = 0; index < audioCueCount; ++index)
+    {
+        const game::SessionRuntime::AudioCue& cue = tickAudioCues_[index];
+        frame.audioCues.push_back({
+            .position = cue.position,
+            .baseFrequency = cue.baseFrequency,
+            .durationSeconds = cue.durationSeconds,
+            .amplitude = cue.amplitude,
+            .noise = cue.noise,
+            .sweep = cue.sweep,
+        });
+    }
+
     return frame;
 }
 
-void SessionHost::QueueReliablePayload(RemotePeerState& peer, std::vector<std::byte> payload)
+auto SessionHost::ConsumeAudioCues() -> std::vector<game::SessionRuntime::AudioCue>
 {
+    std::vector<game::SessionRuntime::AudioCue> drained;
+    drained.swap(localAudioCues_);
+    return drained;
+}
+
+auto SessionHost::QueueReliablePayload(const PeerId peerId, RemotePeerState& peer, std::vector<std::byte> payload) -> bool
+{
+    if (payload.empty())
+    {
+        return true;
+    }
+
+    if (peer.reliableQueueBytes + payload.size() > kMaxReliableQueueBytesPerPeer)
+    {
+        LogWarning(
+            "Session host closing lagging peer=", peerId,
+            " because the reliable backlog exceeded the cap bytes=", peer.reliableQueueBytes + payload.size(),
+            " queued_messages=", peer.reliableQueue.size());
+        if (transport_ != nullptr)
+        {
+            transport_->Close(peerId, 1, "reliable backlog overflow");
+        }
+        return false;
+    }
+
+    peer.reliableQueueBytes += payload.size();
     peer.reliableQueue.push_back(std::move(payload));
+    return true;
 }
 
 void SessionHost::FlushReliableQueue(const PeerId peerId, RemotePeerState& peer)
 {
-    std::size_t sentCount = 0u;
-    while (!peer.reliableQueue.empty() && sentCount < kMaxReliableMessagesPerPeerPerTick)
+    std::size_t sentBytes = 0u;
+    while (!peer.reliableQueue.empty() && sentBytes < kReliableFlushByteBudgetPerPeerPerTick)
     {
+        const std::size_t messageBytes = peer.reliableQueue.front().size();
+        if (sentBytes > 0u && sentBytes + messageBytes > kReliableFlushByteBudgetPerPeerPerTick)
+        {
+            break;
+        }
+
         const bool sent = transport_->Send({
             .peerId = peerId,
             .payload = peer.reliableQueue.front(),
@@ -195,9 +284,10 @@ void SessionHost::FlushReliableQueue(const PeerId peerId, RemotePeerState& peer)
             break;
         }
 
+        peer.reliableQueueBytes -= messageBytes;
         peer.reliableQueue.pop_front();
         peer.reliableQueueBlocked = false;
-        ++sentCount;
+        sentBytes += messageBytes;
     }
 }
 
@@ -211,7 +301,7 @@ void SessionHost::SendWelcome(const PeerId peerId, RemotePeerState& peer, const 
     welcome.sessionName = config_.runtime.sessionName;
     welcome.maxPlayers = config_.runtime.maxPlayers;
 
-    QueueReliablePayload(peer, EncodeMessage(MessageType::Welcome, EncodeWelcome(welcome)));
+    (void)QueueReliablePayload(peerId, peer, EncodeMessage(MessageType::Welcome, EncodeWelcome(welcome)));
 }
 
 void SessionHost::SendWorldSnapshot(const PeerId peerId, RemotePeerState& peer, const world::DenseWorldSnapshot& snapshot)
@@ -225,7 +315,10 @@ void SessionHost::SendWorldSnapshot(const PeerId peerId, RemotePeerState& peer, 
         " world_cells=", snapshot.cells.size());
     for (const WorldSnapshotMessage& message : messages)
     {
-        QueueReliablePayload(peer, EncodeMessage(MessageType::WorldSnapshot, EncodeWorldSnapshotMessage(message)));
+        if (!QueueReliablePayload(peerId, peer, EncodeMessage(MessageType::WorldSnapshot, EncodeWorldSnapshotMessage(message))))
+        {
+            break;
+        }
     }
 }
 
@@ -240,6 +333,7 @@ void SessionHost::SendInitialState(const PeerId peerId, RemotePeerState& peer)
         " tick=", runtime_.TickIndex(),
         " world_cells=", peer.baselineWorld.cells.size());
     peer.reliableQueue.clear();
+    peer.reliableQueueBytes = 0u;
     peer.reliableQueueBlocked = false;
     SendWelcome(peerId, peer, peer.playerId);
     SendWorldSnapshot(peerId, peer, peer.baselineWorld);
@@ -258,9 +352,7 @@ void SessionHost::SendWorldDelta(const PeerId peerId, RemotePeerState& peer, con
     }
 
     if (peer.baselineWorld.cells.empty() ||
-        peer.baselineWorld.settings.worldWidth != current.settings.worldWidth ||
-        peer.baselineWorld.settings.worldHeight != current.settings.worldHeight ||
-        peer.baselineWorld.settings.worldDepth != current.settings.worldDepth)
+        !WorldSettingsMatchForDelta(peer.baselineWorld.settings, current.settings))
     {
         peer.baselineWorld = current;
         peer.baselineWorldVersion = worldSnapshotVersion_;
@@ -268,19 +360,34 @@ void SessionHost::SendWorldDelta(const PeerId peerId, RemotePeerState& peer, con
         return;
     }
 
-    const std::vector<ChunkDelta> deltas = BuildChunkDeltas(peer.baselineWorld, current);
-    if (deltas.empty())
+    std::vector<ChunkDelta> fallbackDeltas;
+    const std::vector<ChunkDelta>* deltas = nullptr;
+    if (peer.baselineWorldVersion == cachedWorldDeltaBaselineVersion_ &&
+        worldSnapshotVersion_ == cachedWorldDeltaTargetVersion_)
+    {
+        deltas = &cachedWorldDeltas_;
+    }
+    else
+    {
+        fallbackDeltas = BuildChunkDeltas(peer.baselineWorld, current);
+        deltas = &fallbackDeltas;
+    }
+
+    if (deltas->empty())
     {
         peer.baselineWorldVersion = worldSnapshotVersion_;
         return;
     }
 
-    const std::vector<ChunkDeltaBatchMessage> batches = BuildChunkDeltaBatches(deltas, runtime_.TickIndex());
+    const std::vector<ChunkDeltaBatchMessage> batches = BuildChunkDeltaBatches(*deltas, runtime_.TickIndex());
     for (const ChunkDeltaBatchMessage& batch : batches)
     {
-        QueueReliablePayload(peer, EncodeMessage(MessageType::ChunkDeltaBatch, EncodeChunkDeltaBatchMessage(batch)));
+        if (!QueueReliablePayload(peerId, peer, EncodeMessage(MessageType::ChunkDeltaBatch, EncodeChunkDeltaBatchMessage(batch))))
+        {
+            break;
+        }
     }
-    if (ApplyChunkDeltas(peer.baselineWorld, deltas))
+    if (ApplyChunkDeltas(peer.baselineWorld, *deltas))
     {
         peer.baselineWorldVersion = worldSnapshotVersion_;
     }
@@ -428,6 +535,13 @@ void SessionHost::ProcessPackets()
             else if (message.type == MessageType::CommandFrame)
             {
                 static_cast<void>(runtime_.SubmitCommand(peerIter->second.playerId, DecodeCommandFrame(message.payload)));
+            }
+            else if (message.type == MessageType::CommandBundle)
+            {
+                for (const game::PlayerCommandFrame& command : DecodeCommandBundle(message.payload))
+                {
+                    static_cast<void>(runtime_.SubmitCommand(peerIter->second.playerId, command));
+                }
             }
             else
             {

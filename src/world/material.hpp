@@ -19,9 +19,10 @@ enum class MaterialId : std::uint8_t
     Grass = 6,
     Gravel = 7,
     BasaltRock = 8,
+    WoodPlanks = 9,
 };
 
-inline constexpr std::size_t kMaterialCount = static_cast<std::size_t>(MaterialId::BasaltRock) + 1u;
+inline constexpr std::size_t kMaterialCount = static_cast<std::size_t>(MaterialId::WoodPlanks) + 1u;
 
 inline constexpr std::uint32_t kChunkSize = config::kChunkSize;
 inline constexpr std::uint32_t kChunkVolume = kChunkSize * kChunkSize * kChunkSize;
@@ -48,6 +49,8 @@ inline std::string_view ToString(const MaterialId material)
         return "Gravel";
     case MaterialId::BasaltRock:
         return "Basalt Rock";
+    case MaterialId::WoodPlanks:
+        return "Wood Planks";
     default:
         return "Unknown";
     }

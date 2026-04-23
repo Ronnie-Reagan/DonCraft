@@ -60,3 +60,7 @@ compile_commands.json
 plan.*
 server_world.bin
 tools/
+local/
+
+# Temp ignoration
+src/app/application_session.cpp

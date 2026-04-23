@@ -74,6 +74,8 @@ add_library(df_net STATIC
     src/net/transport.hpp
 )
 add_library(df_game STATIC
+    src/game/construction.cpp
+    src/game/construction.hpp
     src/game/control_state.hpp
     src/game/debug_hud.cpp
     src/game/debug_hud.hpp
@@ -212,6 +214,10 @@ if(Don_Craft_BUILD_CLIENT)
         assets/shaders/world_3d.vert
         assets/shaders/world_3d.frag
         assets/shaders/world_unshadowed.frag
+        assets/shaders/oit_weighted_shadowed.frag
+        assets/shaders/oit_weighted_unshadowed.frag
+        assets/shaders/oit_composite.vert
+        assets/shaders/oit_composite.frag
         assets/shaders/overlay_2d.vert
         assets/shaders/overlay_2d.frag
     )
@@ -340,9 +346,6 @@ if(Don_Craft_ENABLE_TESTS)
     )
     target_link_libraries(Don_Craft_selfcheck PRIVATE df_core df_world df_game df_net df_sim)
     df_configure_target(Don_Craft_selfcheck)
-set_target_properties(Don_Craft_client PROPERTIES
-    VS_DEBUGGER_WORKING_DIRECTORY "$(TargetDir)"
-)
 
     if(TARGET df_shaders)
         add_dependencies(Don_Craft_selfcheck df_shaders)

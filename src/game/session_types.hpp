@@ -20,6 +20,7 @@ enum class ToolType : std::uint8_t
     Grenade = 1,
     Dig = 2,
     Smg = 3,
+    Build = 4,
 };
 
 using PlayerId = std::uint32_t;
@@ -29,6 +30,9 @@ struct PlayerCommandFrame
 {
     std::uint32_t sequence = 0;
     ControlState control{};
+    float cumulativeLookYawDelta = 0.0f;
+    float cumulativeLookPitchDelta = 0.0f;
+    bool hasCumulativeLook = false;
     ToolType selectedTool = ToolType::Rifle;
     bool primaryDown = false;
     bool primaryPressed = false;
@@ -36,5 +40,10 @@ struct PlayerCommandFrame
     bool quickGrenadePressed = false;
     bool interactPressed = false;
     bool reloadPressed = false;
+    std::uint32_t jumpPressCount = 0;
+    std::uint32_t primaryPressCount = 0;
+    std::uint32_t quickGrenadePressCount = 0;
+    std::uint32_t interactPressCount = 0;
+    std::uint32_t reloadPressCount = 0;
 };
 }

@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -65,6 +66,7 @@ public:
         bool wasConnected = false;
         bool closedEventSent = false;
         int clientReliableSendFailuresRemaining = 0;
+        int clientUnreliableSendFailuresRemaining = 0;
         int serverToClientStateDelayTicks = 0;
         std::uint32_t clientHelloAttempts = 0;
         std::uint64_t hostPumpCount = 0;
@@ -175,6 +177,11 @@ public:
                 --shared_->clientReliableSendFailuresRemaining;
                 return false;
             }
+            if (!packet.reliable && shared_->clientUnreliableSendFailuresRemaining > 0)
+            {
+                --shared_->clientUnreliableSendFailuresRemaining;
+                return true;
+            }
             shared_->toServer.push_back(packet);
         }
 
@@ -283,6 +290,29 @@ int main()
             return world.DirtyChunkStateCount() == 0u;
         };
 
+        const auto FlushWorldMeshWithoutSimulation = [&](df::world::DemoWorld& world, const std::size_t maxPasses = 64u) -> bool
+        {
+            std::span<const df::render::ColorVertex3D> opaqueTriangles;
+            std::span<const df::render::ColorVertex3D> translucentTriangles;
+            std::vector<df::render::ColorVertex3D> debugLines;
+            for (std::size_t pass = 0; pass < maxPasses; ++pass)
+            {
+                world.GatherRenderGeometrySmoothed(opaqueTriangles, translucentTriangles, debugLines, false, false);
+                if (world.DirtyChunkStateCount() == 0u)
+                {
+                    return true;
+                }
+            }
+
+            df::LogError(
+                "FlushWorldMeshWithoutSimulation did not converge. dirty_chunks=", world.DirtyChunkStateCount(),
+                " tracked_chunks=", world.TrackedChunkStateCount(),
+                " terrain_version=", world.TerrainMeshVersion(),
+                " opaque_verts=", world.OpaqueTerrainVertexCount(),
+                " translucent_verts=", world.TranslucentTerrainVertexCount());
+            return world.DirtyChunkStateCount() == 0u;
+        };
+
         {
             df::ByteWriter writer;
             writer.WritePod<std::uint32_t>(12345u);
@@ -334,6 +364,75 @@ int main()
         }
 
         {
+            std::vector<df::game::PlayerCommandFrame> sourceCommands;
+            df::game::PlayerCommandFrame firstCommand{};
+            firstCommand.sequence = 7u;
+            firstCommand.control.moveForward = true;
+            firstCommand.control.lookYawDelta = 3.0f;
+            firstCommand.cumulativeLookYawDelta = 17.0f;
+            firstCommand.cumulativeLookPitchDelta = -4.0f;
+            firstCommand.hasCumulativeLook = true;
+            firstCommand.primaryPressCount = 1u;
+            sourceCommands.push_back(firstCommand);
+
+            df::game::PlayerCommandFrame secondCommand = firstCommand;
+            secondCommand.sequence = 8u;
+            secondCommand.control.lookYawDelta = 1.0f;
+            secondCommand.cumulativeLookYawDelta = 18.0f;
+            secondCommand.reloadPressCount = 1u;
+            sourceCommands.push_back(secondCommand);
+
+            const auto encodedBundle = df::net::EncodeCommandBundle(std::span<const df::game::PlayerCommandFrame>(
+                sourceCommands.data(),
+                sourceCommands.size()));
+            const auto decodedBundle = df::net::DecodeCommandBundle(encodedBundle);
+            allPassed &= Expect(decodedBundle.size() == sourceCommands.size(), "Command bundle roundtrip lost command frames.");
+            allPassed &= Expect(decodedBundle.back().sequence == 8u, "Command bundle roundtrip lost the newest sequence.");
+            allPassed &= Expect(std::abs(decodedBundle.front().cumulativeLookYawDelta - 17.0f) < 0.0001f, "Command bundle roundtrip lost cumulative mouse yaw.");
+            allPassed &= Expect(decodedBundle.front().hasCumulativeLook, "Command bundle roundtrip lost cumulative mouse support metadata.");
+            allPassed &= Expect(decodedBundle.back().reloadPressCount == 1u, "Command bundle roundtrip lost edge recovery counters.");
+        }
+
+        {
+            df::net::ActorSnapshotFrame sourceFrame{};
+            sourceFrame.serverTick = 42u;
+            sourceFrame.players.push_back({
+                .id = 7u,
+                .position = {1.0f, 2.0f, 3.0f},
+                .cameraPosition = {1.0f, 2.5f, 3.0f},
+                .forward = {0.0f, 0.0f, 1.0f},
+                .flatForward = {0.0f, 0.0f, 1.0f},
+                .tool = df::game::ToolType::Rifle,
+                .crosshairMaterial = df::world::MaterialId::BrittleConcrete,
+                .ammoInMagazine = 9,
+                .reserveAmmo = 27,
+                .lastAppliedCommandSequence = 123u,
+            });
+            sourceFrame.truck.position = {4.0f, 0.5f, -2.0f};
+            sourceFrame.truck.forward = {1.0f, 0.0f, 0.0f};
+            sourceFrame.audioCues.push_back({
+                .position = {6.0f, 1.0f, -3.0f},
+                .baseFrequency = 180.0f,
+                .durationSeconds = 0.08f,
+                .amplitude = 0.22f,
+                .noise = 0.35f,
+                .sweep = -24.0f,
+            });
+
+            const auto encoded = df::net::EncodeActorSnapshotFrame(sourceFrame);
+            const auto decoded = df::net::DecodeActorSnapshotFrame(encoded);
+            allPassed &= Expect(decoded.serverTick == sourceFrame.serverTick, "Actor snapshot frame roundtrip lost the server tick.");
+            allPassed &= Expect(decoded.players.size() == 1u, "Actor snapshot frame roundtrip lost the player list.");
+            allPassed &= Expect(decoded.audioCues.size() == 1u, "Actor snapshot frame roundtrip lost the audio cue list.");
+            allPassed &= Expect(
+                decoded.audioCues.size() == 1u &&
+                std::abs(decoded.audioCues.front().position.x - sourceFrame.audioCues.front().position.x) < 0.0001f &&
+                std::abs(decoded.audioCues.front().position.y - sourceFrame.audioCues.front().position.y) < 0.0001f &&
+                std::abs(decoded.audioCues.front().position.z - sourceFrame.audioCues.front().position.z) < 0.0001f,
+                "Actor snapshot frame roundtrip changed the audio cue position.");
+        }
+
+        {
             df::world::MaterialField field;
             field.SetCell(0, 0, 0, df::world::MaterialId::DrySand);
             field.SetCell(40, 1, 1, df::world::MaterialId::WetMud);
@@ -375,6 +474,7 @@ int main()
             {
                 const auto encoded = df::net::EncodeWorldSnapshotMessage(segment);
                 const auto decoded = df::net::DecodeWorldSnapshotMessage(encoded);
+                const auto decodedCells = df::net::DecodeWorldSnapshotCells(decoded);
 
                 if (decoded.cellOffset == 0u)
                 {
@@ -386,12 +486,14 @@ int main()
 
                 allPassed &= Expect(decoded.serverTick == 77u, "World snapshot message roundtrip lost the server tick.");
                 allPassed &= Expect(static_cast<std::size_t>(decoded.cellOffset) == nextCellOffset, "World snapshot message roundtrip changed the segment offset.");
+                allPassed &= Expect(decoded.cells.size() <= 257u, "World snapshot segment exceeded the requested payload budget.");
+                allPassed &= Expect(decodedCells.size() == decoded.decodedCellCount, "World snapshot segment decoded to an unexpected number of cells.");
 
                 std::copy(
-                    decoded.cells.begin(),
-                    decoded.cells.end(),
+                    decodedCells.begin(),
+                    decodedCells.end(),
                     decodedSnapshot.cells.begin() + static_cast<std::ptrdiff_t>(decoded.cellOffset));
-                nextCellOffset += decoded.cells.size();
+                nextCellOffset += decodedCells.size();
             }
 
             allPassed &= Expect(decodedServerTick == 77u, "World snapshot message segmentation lost the transfer tick.");
@@ -401,6 +503,25 @@ int main()
             df::world::DemoWorld replica;
             allPassed &= Expect(replica.ApplySnapshot(decodedSnapshot), "Applying a decoded world snapshot failed.");
             allPassed &= Expect(replica.MaterialAtCell(3, 4, 5) == df::world::MaterialId::BrittleConcrete, "Applied world snapshot lost the edited cell.");
+        }
+
+        {
+            df::world::DenseWorldSnapshot snapshot{};
+            snapshot.settings.worldWidth = 64;
+            snapshot.settings.worldHeight = 1;
+            snapshot.settings.worldDepth = 1;
+            snapshot.settings.activeChunkSize = 8;
+            snapshot.cells.assign(64u, static_cast<std::uint8_t>(df::world::MaterialId::CompactedSoil));
+
+            const auto segments = df::net::BuildWorldSnapshotMessages(91u, snapshot, 32u);
+            allPassed &= Expect(!segments.empty(), "RLE snapshot test produced no world snapshot segments.");
+            allPassed &= Expect(
+                std::all_of(segments.begin(), segments.end(), [](const df::net::WorldSnapshotMessage& segment)
+                {
+                    return segment.encoding == df::net::WorldSnapshotMessage::Encoding::Rle &&
+                           segment.cells.size() < segment.decodedCellCount;
+                }),
+                "World snapshot RLE compression did not engage for a long repeated run.");
         }
 
         {
@@ -465,6 +586,50 @@ int main()
         }
 
         {
+            const std::filesystem::path tempFile = std::filesystem::temp_directory_path() / "Don_Craft_session_runtime_new_over_existing.bin";
+
+            df::game::SessionRuntime savedRuntime;
+            df::game::SessionRuntime::Config savedConfig{};
+            savedConfig.mode = df::game::SessionMode::Offline;
+            savedConfig.savePath = tempFile;
+            savedConfig.loadExistingWorld = false;
+            savedConfig.autosaveEnabled = false;
+            savedConfig.generationSettings.worldWidth = 24;
+            savedConfig.generationSettings.worldHeight = 18;
+            savedConfig.generationSettings.worldDepth = 24;
+            savedConfig.generationSettings.activeChunkSize = 8;
+            savedConfig.generationSettings.seed = 111u;
+            savedRuntime.Initialize(savedConfig);
+            savedRuntime.MutableWorld().EditCell(4, 5, 6, df::world::MaterialId::BrittleConcrete);
+            allPassed &= Expect(savedRuntime.SaveNow(), "Session runtime failed to create the existing-save fixture.");
+            savedRuntime.Shutdown();
+
+            df::game::SessionRuntime newRuntime;
+            df::game::SessionRuntime::Config newConfig{};
+            newConfig.mode = df::game::SessionMode::Offline;
+            newConfig.savePath = tempFile;
+            newConfig.loadExistingWorld = false;
+            newConfig.autosaveEnabled = false;
+            newConfig.generationSettings.worldWidth = 36;
+            newConfig.generationSettings.worldHeight = 14;
+            newConfig.generationSettings.worldDepth = 32;
+            newConfig.generationSettings.activeChunkSize = 8;
+            newConfig.generationSettings.seed = 222u;
+            newRuntime.Initialize(newConfig);
+            allPassed &= Expect(newRuntime.World().WorldWidthCells() == 36, "New-world startup loaded an existing save width instead of selected settings.");
+            allPassed &= Expect(newRuntime.World().WorldHeightCells() == 14, "New-world startup loaded an existing save height instead of selected settings.");
+            allPassed &= Expect(newRuntime.World().WorldDepthCells() == 32, "New-world startup loaded an existing save depth instead of selected settings.");
+            allPassed &= Expect(newRuntime.World().GenerationSettings().seed == 222u, "New-world startup loaded an existing save seed instead of selected settings.");
+            allPassed &= Expect(
+                newRuntime.World().MaterialAtCell(4, 5, 6) != df::world::MaterialId::BrittleConcrete,
+                "New-world startup preserved an edited cell from the existing save.");
+            newRuntime.Shutdown();
+
+            std::error_code removeError;
+            std::filesystem::remove(tempFile, removeError);
+        }
+
+        {
             df::game::SessionRuntime runtime;
             df::game::SessionRuntime::Config config{};
             config.mode = df::game::SessionMode::Offline;
@@ -491,6 +656,66 @@ int main()
             allPassed &= Expect(!acceptedStale, "Session runtime accepted an out-of-order stale command.");
             allPassed &= Expect(player != nullptr && player->command.sequence == 10u, "Session runtime stale command handling rolled back the current command sequence.");
             allPassed &= Expect(player != nullptr && player->command.control.moveForward, "Session runtime stale command handling replaced the active control state.");
+            const float yawBeforeLookRecovery = player != nullptr ? player->controller.YawRadians() : 0.0f;
+            df::game::PlayerCommandFrame recoveredLookCommand{};
+            recoveredLookCommand.sequence = 11u;
+            recoveredLookCommand.control.lookYawDelta = 3.0f;
+            recoveredLookCommand.cumulativeLookYawDelta = 11.0f;
+            recoveredLookCommand.hasCumulativeLook = true;
+            const bool acceptedRecoveredLook = runtime.SubmitCommand(1u, recoveredLookCommand);
+            runtime.Tick(1.0f / 60.0f);
+            const df::game::SessionRuntime::PlayerState* const playerAfterLookRecovery = runtime.FindPlayer(1u);
+            const float recoveredYawDelta = playerAfterLookRecovery != nullptr
+                ? playerAfterLookRecovery->controller.YawRadians() - yawBeforeLookRecovery
+                : 0.0f;
+            allPassed &= Expect(acceptedRecoveredLook, "Session runtime rejected the cumulative look recovery command.");
+            allPassed &= Expect(
+                std::abs(recoveredYawDelta - 11.0f * 0.0026f) < 0.0005f,
+                "Session runtime did not recover mouse look from cumulative command deltas after a dropped input frame.");
+
+            const float yawBeforeBundledLook = playerAfterLookRecovery != nullptr ? playerAfterLookRecovery->controller.YawRadians() : 0.0f;
+            df::game::PlayerCommandFrame bundledLookCommand{};
+            bundledLookCommand.sequence = 12u;
+            bundledLookCommand.control.lookYawDelta = 9.0f;
+            bundledLookCommand.cumulativeLookYawDelta = 20.0f;
+            bundledLookCommand.hasCumulativeLook = true;
+            const bool acceptedBundledLook = runtime.SubmitCommand(1u, bundledLookCommand);
+            df::game::PlayerCommandFrame bundledLookFollowup = bundledLookCommand;
+            bundledLookFollowup.sequence = 13u;
+            bundledLookFollowup.control.lookYawDelta = 5.0f;
+            bundledLookFollowup.cumulativeLookYawDelta = 25.0f;
+            const bool acceptedBundledLookFollowup = runtime.SubmitCommand(1u, bundledLookFollowup);
+            runtime.Tick(1.0f / 60.0f);
+            const df::game::SessionRuntime::PlayerState* const playerAfterBundledLook = runtime.FindPlayer(1u);
+            const float bundledLookYawDelta = playerAfterBundledLook != nullptr
+                ? playerAfterBundledLook->controller.YawRadians() - yawBeforeBundledLook
+                : 0.0f;
+            allPassed &= Expect(acceptedBundledLook && acceptedBundledLookFollowup, "Session runtime rejected bundled cumulative look frames.");
+            allPassed &= Expect(
+                std::abs(bundledLookYawDelta - 14.0f * 0.0026f) < 0.0005f,
+                "Session runtime did not aggregate cumulative mouse look when multiple command frames arrived before one tick.");
+
+            if (df::game::SessionRuntime::PlayerState* const mutablePlayer = runtime.FindPlayer(1u))
+            {
+                mutablePlayer->tool = df::game::ToolType::Rifle;
+                auto& rifleInventory = mutablePlayer->weaponInventories[df::game::ToToolIndex(df::game::ToolType::Rifle)];
+                rifleInventory.ammoInMagazine = 0;
+                rifleInventory.reserveAmmo = 5;
+            }
+
+            df::game::PlayerCommandFrame bundledEdgeCommand{};
+            bundledEdgeCommand.sequence = 14u;
+            bundledEdgeCommand.reloadPressCount = 1u;
+            const bool acceptedBundledEdge = runtime.SubmitCommand(1u, bundledEdgeCommand);
+            df::game::PlayerCommandFrame bundledFollowupCommand = bundledEdgeCommand;
+            bundledFollowupCommand.sequence = 15u;
+            const bool acceptedBundledFollowup = runtime.SubmitCommand(1u, bundledFollowupCommand);
+            runtime.Tick(1.0f / 60.0f);
+            const df::game::SessionRuntime::PlayerState* const playerAfterBundledEdge = runtime.FindPlayer(1u);
+            allPassed &= Expect(acceptedBundledEdge && acceptedBundledFollowup, "Session runtime rejected bundled command edge frames.");
+            allPassed &= Expect(
+                playerAfterBundledEdge != nullptr && playerAfterBundledEdge->reloading,
+                "Session runtime lost a one-shot input edge when multiple command frames arrived before one tick.");
             runtime.Shutdown();
         }
 
@@ -643,7 +868,23 @@ int main()
 
             shared->serverToClientStateDelayTicks = 0;
             df::game::PlayerCommandFrame flushCommand{};
-            for (std::uint32_t sequence = 210u; sequence < 226u; ++sequence)
+            for (std::uint32_t sequence = 210u; sequence < 212u; ++sequence)
+            {
+                flushCommand.sequence = sequence;
+                PumpSessionPair(host, client, flushCommand, 1);
+            }
+
+            const df::game::PlayerController* const renderedLocalDuringCorrection = client.RenderedLocalPlayer();
+            const df::game::PlayerController* const predictedLocalDuringCorrection = client.PredictedLocalPlayer();
+            allPassed &= Expect(renderedLocalDuringCorrection != nullptr, "Listen-host correction smoothing lost the rendered local player.");
+            allPassed &= Expect(predictedLocalDuringCorrection != nullptr, "Listen-host correction smoothing lost the predicted local player.");
+            allPassed &= Expect(
+                renderedLocalDuringCorrection != nullptr &&
+                predictedLocalDuringCorrection != nullptr &&
+                df::LengthSquared(renderedLocalDuringCorrection->Position() - predictedLocalDuringCorrection->Position()) > 0.0001f,
+                "Listen-host correction smoothing did not preserve a temporary visual offset after an authoritative correction.");
+
+            for (std::uint32_t sequence = 212u; sequence < 226u; ++sequence)
             {
                 flushCommand.sequence = sequence;
                 PumpSessionPair(host, client, flushCommand, 1);
@@ -659,9 +900,63 @@ int main()
                 df::LengthSquared(predictedLocalAfterFlush->Position() - correctedLocalActor->position) < 0.01f,
                 "Listen-host reconciliation did not converge after the delayed authoritative snapshots were delivered.");
 
+            shared->serverToClientStateDelayTicks = 72;
+            df::game::PlayerCommandFrame lagSpikeCommand{};
+            lagSpikeCommand.control.moveLeft = true;
+            for (std::uint32_t sequence = 400u; sequence < 520u; ++sequence)
+            {
+                lagSpikeCommand.sequence = sequence;
+                PumpSessionPair(host, client, lagSpikeCommand, 1);
+            }
+
+            const df::game::PlayerController* const predictedLocalDuringLagSpike = client.PredictedLocalPlayer();
+            const df::net::ActorSnapshot* const authoritativeLocalDuringLagSpike = FindActorById(client.ActorFrame(), client.LocalPlayerId());
+            allPassed &= Expect(predictedLocalDuringLagSpike != nullptr, "Listen-host lag-spike test lost the predicted local player.");
+            allPassed &= Expect(authoritativeLocalDuringLagSpike != nullptr, "Listen-host lag-spike test lost the authoritative local actor.");
+            allPassed &= Expect(
+                predictedLocalDuringLagSpike != nullptr &&
+                authoritativeLocalDuringLagSpike != nullptr &&
+                df::LengthSquared(predictedLocalDuringLagSpike->Position() - authoritativeLocalDuringLagSpike->position) > 0.001f,
+                "Listen-host lag-spike test did not preserve a backlog of unacknowledged local commands.");
+
+            shared->serverToClientStateDelayTicks = 0;
+            df::game::PlayerCommandFrame lagSpikeFlushCommand{};
+            for (std::uint32_t sequence = 520u; sequence < 700u; ++sequence)
+            {
+                lagSpikeFlushCommand.sequence = sequence;
+                PumpSessionPair(host, client, lagSpikeFlushCommand, 1);
+            }
+
+            const df::game::PlayerController* const predictedLocalAfterLagSpike = client.PredictedLocalPlayer();
+            const df::net::ActorSnapshot* const correctedLocalAfterLagSpike = FindActorById(client.ActorFrame(), client.LocalPlayerId());
+            allPassed &= Expect(predictedLocalAfterLagSpike != nullptr, "Listen-host lag-spike flush lost the predicted local player.");
+            allPassed &= Expect(correctedLocalAfterLagSpike != nullptr, "Listen-host lag-spike flush lost the authoritative local actor.");
+            allPassed &= Expect(
+                predictedLocalAfterLagSpike != nullptr &&
+                correctedLocalAfterLagSpike != nullptr &&
+                df::LengthSquared(predictedLocalAfterLagSpike->Position() - correctedLocalAfterLagSpike->position) < 0.02f,
+                "Listen-host reconciliation did not converge after a command history backlog longer than the old 64-slot buffer.");
+
+            allPassed &= Expect(
+                FlushWorldMeshWithoutSimulation(client.MutableWorld()),
+                "Listen-host client initial terrain mesh did not converge without local world simulation.");
+            const std::uint64_t clientMeshVersionBeforeReplicatedEdit = client.World().TerrainMeshVersion();
+
             host.MutableRuntime().MutableWorld().EditCell(2, 3, 4, df::world::MaterialId::BrittleConcrete);
             PumpSessionPair(host, client, idleCommand, 6);
             allPassed &= Expect(client.World().MaterialAtCell(2, 3, 4) == df::world::MaterialId::BrittleConcrete, "Listen-host loopback client did not receive terrain edits.");
+            {
+                std::span<const df::render::ColorVertex3D> opaqueTriangles;
+                std::span<const df::render::ColorVertex3D> translucentTriangles;
+                std::vector<df::render::ColorVertex3D> debugLines;
+                client.MutableWorld().GatherRenderGeometrySmoothed(opaqueTriangles, translucentTriangles, debugLines, false, false);
+            }
+            allPassed &= Expect(
+                client.World().TerrainMeshVersion() > clientMeshVersionBeforeReplicatedEdit,
+                "Listen-host loopback client did not rebuild the terrain mesh after a replicated edit.");
+            allPassed &= Expect(
+                client.World().DirtyChunkStateCount() == 0u,
+                "Listen-host loopback client left replicated terrain edits dirty after render-only client ticks.");
 
             clientTransportRaw->Close(1u, 0, "loopback closed");
             PumpSessionPair(host, client, idleCommand, 2);
@@ -682,6 +977,86 @@ int main()
             host.MutableRuntime().MutableWorld().EditCell(4, 4, 4, df::world::MaterialId::DrySand);
             PumpSessionPair(host, client, idleCommand, 6);
             allPassed &= Expect(client.World().MaterialAtCell(4, 4, 4) == df::world::MaterialId::DrySand, "Listen-host reconnect path did not resume terrain replication.");
+
+            static_cast<void>(client.ConsumeAudioCues());
+            df::game::PlayerCommandFrame fireCommand{};
+            fireCommand.sequence = 350u;
+            fireCommand.selectedTool = df::game::ToolType::Rifle;
+            fireCommand.primaryPressed = true;
+            fireCommand.primaryPressCount = 1u;
+            PumpSessionPair(host, client, fireCommand, 3);
+            const auto replicatedAudioCues = client.ConsumeAudioCues();
+            allPassed &= Expect(!replicatedAudioCues.empty(), "Listen-host client did not receive replicated audio cues.");
+            allPassed &= Expect(
+                !replicatedAudioCues.empty() &&
+                std::any_of(replicatedAudioCues.begin(), replicatedAudioCues.end(), [](const df::net::AudioCueSnapshot& cue)
+                {
+                    return std::isfinite(cue.position.x) &&
+                           std::isfinite(cue.position.y) &&
+                           std::isfinite(cue.position.z);
+                }),
+                "Listen-host client received an audio cue with an invalid position.");
+
+            client.Shutdown();
+            host.Shutdown();
+        }
+
+        {
+            const auto shared = std::make_shared<LoopbackTransport::SharedState>();
+            auto serverTransport = std::make_unique<LoopbackTransport>(shared, true);
+            auto clientTransport = std::make_unique<LoopbackTransport>(shared, false);
+            clientTransport->Connect();
+
+            df::net::SessionHost host;
+            df::net::SessionHost::Config hostConfig{};
+            hostConfig.runtime.mode = df::game::SessionMode::DedicatedServer;
+            hostConfig.runtime.autosaveEnabled = false;
+            hostConfig.runtime.loadExistingWorld = false;
+            hostConfig.runtime.sessionName = "Input Recovery";
+            hostConfig.runtime.generationSettings.worldWidth = 24;
+            hostConfig.runtime.generationSettings.worldHeight = 18;
+            hostConfig.runtime.generationSettings.worldDepth = 24;
+            hostConfig.runtime.generationSettings.activeChunkSize = 8;
+            host.Initialize(hostConfig, std::move(serverTransport));
+
+            df::net::SessionClient client;
+            client.Initialize({.playerName = "RecoverClient"}, std::move(clientTransport));
+
+            df::game::PlayerCommandFrame idleCommand{};
+            PumpSessionPair(host, client, idleCommand, 12);
+            allPassed &= Expect(client.IsReady(), "Input recovery test client never became ready.");
+
+            df::game::SessionRuntime::PlayerState* const remotePlayer = host.MutableRuntime().FindPlayer(client.LocalPlayerId());
+            allPassed &= Expect(remotePlayer != nullptr, "Input recovery test could not find the authoritative remote player.");
+            if (remotePlayer != nullptr)
+            {
+                remotePlayer->tool = df::game::ToolType::Rifle;
+                auto& rifleInventory = remotePlayer->weaponInventories[df::game::ToToolIndex(df::game::ToolType::Rifle)];
+                rifleInventory.ammoInMagazine = 0;
+                rifleInventory.reserveAmmo = 5;
+            }
+
+            shared->clientUnreliableSendFailuresRemaining = 1;
+            df::game::PlayerCommandFrame droppedReloadCommand{};
+            droppedReloadCommand.sequence = 1u;
+            droppedReloadCommand.selectedTool = df::game::ToolType::Rifle;
+            droppedReloadCommand.reloadPressed = true;
+            droppedReloadCommand.reloadPressCount = 1u;
+
+            client.Tick(1.0f / 60.0f, droppedReloadCommand);
+            host.Tick(1.0f / 60.0f);
+
+            df::game::PlayerCommandFrame recoveredReloadCommand{};
+            recoveredReloadCommand.sequence = 2u;
+            recoveredReloadCommand.selectedTool = df::game::ToolType::Rifle;
+            recoveredReloadCommand.reloadPressCount = 1u;
+
+            client.Tick(1.0f / 60.0f, recoveredReloadCommand);
+            host.Tick(1.0f / 60.0f);
+
+            allPassed &= Expect(
+                remotePlayer != nullptr && remotePlayer->reloading,
+                "Session runtime did not recover a dropped edge-triggered reload input from the command counters.");
 
             client.Shutdown();
             host.Shutdown();
@@ -753,6 +1128,46 @@ int main()
             PumpSessionPair(host, client, idleCommand, 20);
             allPassed &= Expect(shared->clientHelloAttempts >= 2u, "Session client did not retry the hello after the first reliable send failed.");
             allPassed &= Expect(client.IsReady(), "Session client did not recover from a failed initial hello send.");
+
+            client.Shutdown();
+            host.Shutdown();
+        }
+
+        {
+            const auto shared = std::make_shared<LoopbackTransport::SharedState>();
+            auto serverTransport = std::make_unique<LoopbackTransport>(shared, true);
+            auto clientTransport = std::make_unique<LoopbackTransport>(shared, false);
+            clientTransport->Connect();
+
+            df::net::SessionHost host;
+            df::net::SessionHost::Config hostConfig{};
+            hostConfig.runtime.mode = df::game::SessionMode::DedicatedServer;
+            hostConfig.runtime.autosaveEnabled = false;
+            hostConfig.runtime.loadExistingWorld = false;
+            hostConfig.runtime.sessionName = "Readiness Gate";
+            hostConfig.runtime.generationSettings.worldWidth = 96;
+            hostConfig.runtime.generationSettings.worldHeight = 32;
+            hostConfig.runtime.generationSettings.worldDepth = 96;
+            hostConfig.runtime.generationSettings.activeChunkSize = 8;
+            host.Initialize(hostConfig, std::move(serverTransport));
+
+            df::net::SessionClient client;
+            client.Initialize({
+                .playerName = "GateClient",
+                .connectTimeoutSeconds = 1.0f,
+                .handshakeTimeoutSeconds = 1.0f,
+                .helloResendIntervalSeconds = 0.01f,
+            }, std::move(clientTransport));
+
+            df::game::PlayerCommandFrame idleCommand{};
+            PumpSessionPair(host, client, idleCommand, 2);
+            allPassed &= Expect(!client.IsReady(), "Session client became ready before the initial world snapshot finished downloading.");
+            allPassed &= Expect(client.PredictedLocalPlayer() == nullptr, "Session client enabled prediction before the authoritative world was ready.");
+            allPassed &= Expect(client.RenderedLocalPlayer() == nullptr, "Session client exposed a renderable predicted player before the world snapshot completed.");
+
+            PumpSessionPair(host, client, idleCommand, 48);
+            allPassed &= Expect(client.IsReady(), "Session client did not become ready after the full world snapshot completed.");
+            allPassed &= Expect(client.PredictedLocalPlayer() != nullptr, "Session client never rebuilt the predicted local player after the world became ready.");
 
             client.Shutdown();
             host.Shutdown();

@@ -152,6 +152,21 @@ struct MaterialProperties
             .blastResistance = 0.72f,
         };
 
+    case MaterialId::WoodPlanks:
+        return {
+            .id = material,
+            .name = "Wood Planks",
+            .color = MakeColor(0.60f, 0.42f, 0.22f, 1.0f),
+            .blocksMovement = true,
+            .supportsTerrain = true,
+            .movementSlowdown = 1.0f,
+            .wheelGrip = 0.78f,
+            .wheelSink = 0.03f,
+            .digResistance = 0.28f,
+            .rifleResistance = 0.18f,
+            .blastResistance = 0.22f,
+        };
+
     case MaterialId::Air:
     default:
         return {};

@@ -16,6 +16,7 @@ namespace df::steam
 namespace
 {
 constexpr int kTransportLaneCount = 2;
+// SteamNetworkingSockets services lower numeric priorities first; keep state/input ahead of reliable world transfers.
 constexpr int kTransportLanePriorities[kTransportLaneCount] = {10, 0};
 constexpr uint16 kTransportLaneWeights[kTransportLaneCount] = {1, 1};
 

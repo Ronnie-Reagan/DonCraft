@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <deque>
 #include <memory>
 
 namespace df::net
@@ -28,7 +29,7 @@ public:
 
     [[nodiscard]] bool IsReady() const
     {
-        return localPlayerId_ != game::kInvalidPlayerId && worldReady_;
+        return localPlayerId_ != game::kInvalidPlayerId && worldReady_ && actorSnapshotReady_;
     }
 
     [[nodiscard]] auto SessionMode() const -> game::SessionMode
@@ -63,9 +64,16 @@ public:
 
     [[nodiscard]] auto BuildRenderActorFrame(float interpolationAlpha = 0.0f) const -> ActorSnapshotFrame;
 
+    [[nodiscard]] auto ConsumeAudioCues() -> std::vector<AudioCueSnapshot>;
+
     [[nodiscard]] auto PredictedLocalPlayer() const -> const game::PlayerController*
     {
         return predictedPlayerValid_ ? &predictedPlayer_ : nullptr;
+    }
+
+    [[nodiscard]] auto RenderedLocalPlayer() const -> const game::PlayerController*
+    {
+        return renderedPredictedPlayerValid_ ? &renderedPredictedPlayer_ : (predictedPlayerValid_ ? &predictedPlayer_ : nullptr);
     }
 
     [[nodiscard]] auto PeerInfos() const -> std::vector<PeerInfo>
@@ -105,17 +113,20 @@ private:
         bool active = false;
     };
 
-    static constexpr std::size_t kPendingCommandHistorySize = 64u;
-    static constexpr std::size_t kSnapshotHistorySize = 4u;
+    static constexpr std::size_t kPendingCommandHistorySize = 512u;
+    static constexpr std::size_t kSnapshotHistorySize = 32u;
 
     void ProcessPeerEvents();
     void ProcessPackets();
     void SendClientHello();
     void StorePendingCommand(const game::PlayerCommandFrame& command, float dt);
+    [[nodiscard]] auto BuildCommandBundle(const game::PlayerCommandFrame& currentCommand) const -> std::vector<game::PlayerCommandFrame>;
     void AdvancePredictedLocalPlayer(const game::ControlState& control, float dt);
     void ClearAcknowledgedPendingCommands(std::uint32_t lastAppliedSequence);
     void PushActorFrame(const ActorSnapshotFrame& frame);
     void RebuildPredictedLocalPlayer();
+    void RefreshRenderedPredictedPlayer();
+    void UpdatePredictionSmoothing(float dt);
     void ResetSessionState();
     void FailConnection(std::string_view reason);
     [[nodiscard]] auto FindActor(game::PlayerId id) const -> const ActorSnapshot*;
@@ -126,6 +137,7 @@ private:
     PeerId serverPeerId_ = kInvalidPeerId;
     bool helloSent_ = false;
     bool worldReady_ = false;
+    bool actorSnapshotReady_ = false;
     game::PlayerId localPlayerId_ = game::kInvalidPlayerId;
     game::SessionMode sessionMode_ = game::SessionMode::Client;
     std::string sessionName_;
@@ -140,8 +152,13 @@ private:
     ActorSnapshotFrame actorFrame_{};
     std::array<ActorSnapshotFrame, kSnapshotHistorySize> actorHistory_{};
     std::size_t actorHistoryCount_ = 0;
-    std::array<PendingCommand, kPendingCommandHistorySize> pendingCommands_{};
+    std::uint64_t lastAudioCueServerTick_ = 0;
+    std::vector<AudioCueSnapshot> pendingAudioCues_{};
+    std::deque<PendingCommand> pendingCommands_{};
     game::PlayerController predictedPlayer_{};
+    game::PlayerController renderedPredictedPlayer_{};
+    Vec3 predictedRenderOffset_{};
     bool predictedPlayerValid_ = false;
+    bool renderedPredictedPlayerValid_ = false;
 };
 }

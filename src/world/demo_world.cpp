@@ -22,6 +22,7 @@
 #include <span>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace df::world
 {
@@ -556,6 +557,7 @@ void DemoWorld::ResetTransientState()
     terrainTriangleCache_.clear();
     translucentTerrainTriangleCache_.clear();
     terrainWireCache_.clear();
+    globalMeshCacheDirty_ = true;
     simulationStep_ = 0;
     sandTravelAccumulator_ = 0.0f;
     mudTravelAccumulator_ = 0.0f;
@@ -713,6 +715,7 @@ void DemoWorld::MarkChunkMeshDirty(const ChunkCoord& chunk)
     }
 
     terrainDirty_ = true;
+    globalMeshCacheDirty_ = true;
 }
 
 void DemoWorld::MarkDirtyChunk(const ChunkCoord& chunk)
@@ -853,17 +856,41 @@ void DemoWorld::Reset()
     EnsureMpmBackend();
 }
 
+void DemoWorld::TickRenderState(const float dt)
+{
+    const ScopedCrashContext crashContext("DemoWorld::TickRenderState");
+    const float clampedDt = std::max(dt, 0.0f);
+    terrainRebuildCooldown_ = std::max(terrainRebuildCooldown_ - clampedDt, 0.0f);
+
+    for (auto& [chunk, state] : chunkRuntimeStates_)
+    {
+        static_cast<void>(chunk);
+        if (state.activityLifetime <= 0.0f)
+        {
+            continue;
+        }
+
+        state.activityLifetime = std::max(state.activityLifetime - clampedDt, 0.0f);
+        if (state.activityLifetime <= 0.0f && activeChunkCount_ > 0u)
+        {
+            --activeChunkCount_;
+        }
+    }
+
+    PruneRetiredChunkStates();
+}
+
 void DemoWorld::Tick(const float dt)
 {
     const ScopedCrashContext crashContext("DemoWorld::Tick");
     const ScopedProfileSection tickScope(profiler_, "World Tick Internal");
     terrainRebuildCooldown_ = std::max(terrainRebuildCooldown_ - dt, 0.0f);
-    std::optional<LooseSimulationBounds> looseBounds;
+    std::vector<LooseSimulationBounds> looseRegions;
     {
-        const ScopedProfileSection scope(profiler_, "World Loose Bounds");
-        looseBounds = ComputeLooseSimulationBounds();
+        const ScopedProfileSection scope(profiler_, "World Loose Regions");
+        looseRegions = ComputeLooseSimulationRegions();
     }
-    if (looseBounds.has_value())
+    if (!looseRegions.empty())
     {
         sandTravelAccumulator_ += dt * kDrySandTravelSpeedMetersPerSecond;
         mudTravelAccumulator_ += dt * kWetMudTravelSpeedMetersPerSecond;
@@ -875,7 +902,10 @@ void DemoWorld::Tick(const float dt)
             const ScopedProfileSection scope(profiler_, "World Sand");
             while (sandTravelAccumulator_ >= cellSize_ && sandSteps < 4)
             {
-                SimulateDrySandPass(*looseBounds);
+                for (const LooseSimulationBounds& bounds : looseRegions)
+                {
+                    SimulateDrySandPass(bounds);
+                }
                 sandTravelAccumulator_ -= cellSize_;
                 ++sandSteps;
             }
@@ -886,7 +916,10 @@ void DemoWorld::Tick(const float dt)
             const ScopedProfileSection scope(profiler_, "World Mud");
             while (mudTravelAccumulator_ >= cellSize_ && mudSteps < 2)
             {
-                SimulateWetMudPass(*looseBounds);
+                for (const LooseSimulationBounds& bounds : looseRegions)
+                {
+                    SimulateWetMudPass(bounds);
+                }
                 mudTravelAccumulator_ -= cellSize_;
                 ++mudSteps;
             }
@@ -897,7 +930,10 @@ void DemoWorld::Tick(const float dt)
             const ScopedProfileSection scope(profiler_, "World Water Fall");
             while (waterFallAccumulator_ >= cellSize_ && waterFallSteps < 4)
             {
-                SimulateWaterFallPass(*looseBounds);
+                for (const LooseSimulationBounds& bounds : looseRegions)
+                {
+                    SimulateWaterFallPass(bounds);
+                }
                 waterFallAccumulator_ -= cellSize_;
                 ++waterFallSteps;
             }
@@ -909,7 +945,10 @@ void DemoWorld::Tick(const float dt)
             while (waterSpreadAccumulator_ >= cellSize_ && waterSpreadSteps < 2)
             {
                 ++waterSpreadPass_;
-                SimulateWaterSpreadPass(*looseBounds);
+                for (const LooseSimulationBounds& bounds : looseRegions)
+                {
+                    SimulateWaterSpreadPass(bounds);
+                }
                 waterSpreadAccumulator_ -= cellSize_;
                 ++waterSpreadSteps;
             }
@@ -1072,6 +1111,47 @@ bool DemoWorld::ApplyCellEdits(const std::span<const CellMaterialEdit> edits)
     }
 
     return true;
+}
+
+void DemoWorld::ActivateSimulationRegion(const Vec3& center, const int radiusInChunks)
+{
+    if (width_ <= 0 || height_ <= 0 || depth_ <= 0)
+    {
+        return;
+    }
+
+    const Int3 cell = WorldToCell(center);
+    const int clampedX = std::clamp(cell.x, 0, width_ - 1);
+    const int clampedY = std::clamp(cell.y, 0, height_ - 1);
+    const int clampedZ = std::clamp(cell.z, 0, depth_ - 1);
+    const ChunkCoord originChunk = CellToChunkCoord(clampedX, clampedY, clampedZ);
+    const int chunkRadius = std::max(radiusInChunks, 0);
+    const int chunkSpan = std::max(activeChunkSize_, 1);
+    const int chunkCountX = std::max(1, (width_ + chunkSpan - 1) / chunkSpan);
+    const int chunkCountY = std::max(1, (height_ + chunkSpan - 1) / chunkSpan);
+    const int chunkCountZ = std::max(1, (depth_ + chunkSpan - 1) / chunkSpan);
+
+    for (int dz = -chunkRadius; dz <= chunkRadius; ++dz)
+    {
+        for (int dy = -chunkRadius; dy <= chunkRadius; ++dy)
+        {
+            for (int dx = -chunkRadius; dx <= chunkRadius; ++dx)
+            {
+                const ChunkCoord chunk{
+                    originChunk.x + dx,
+                    originChunk.y + dy,
+                    originChunk.z + dz,
+                };
+                if (chunk.x < 0 || chunk.y < 0 || chunk.z < 0 ||
+                    chunk.x >= chunkCountX || chunk.y >= chunkCountY || chunk.z >= chunkCountZ)
+                {
+                    continue;
+                }
+
+                TouchChunk(chunk);
+            }
+        }
+    }
 }
 
 bool DemoWorld::Load(const std::filesystem::path& path)
@@ -1661,9 +1741,9 @@ void DemoWorld::GatherRenderGeometrySmoothed(
     const bool showActiveChunks)
 {
     const bool meshCacheInitialized = !solidSurfaceHeightMap_.empty() && !waterSurfaceHeightMap_.empty();
-    if (terrainDirty_ && (!meshCacheInitialized || terrainRebuildCooldown_ <= 0.0f))
+    if ((terrainDirty_ || globalMeshCacheDirty_) && (!meshCacheInitialized || terrainRebuildCooldown_ <= 0.0f))
     {
-        RebuildMeshCache();
+        RebuildMeshCache(true);
     }
 
     opaqueTerrainTriangles = terrainTriangleCache_;
@@ -1737,7 +1817,7 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
     const bool meshCacheInitialized = !solidSurfaceHeightMap_.empty() && !waterSurfaceHeightMap_.empty();
     if (terrainDirty_ && (!meshCacheInitialized || terrainRebuildCooldown_ <= 0.0f))
     {
-        RebuildMeshCache();
+        RebuildMeshCache(false);
     }
 
     opaqueTerrainTriangles.clear();
@@ -1746,9 +1826,37 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
 
     const int chunkSpan = std::max(activeChunkSize_, 1);
     const float clampedDrawDistance = std::max(maxDistanceMeters, 1.0f);
+    const float chunkWorldSpan = static_cast<float>(chunkSpan) * cellSize_;
+    const float fullDetailDistance = std::min(clampedDrawDistance, std::max(chunkWorldSpan * 4.0f, 100.0f));
+    const float coarseDetailDistance = std::min(clampedDrawDistance, std::max(chunkWorldSpan * 8.0f, 250.0f));
+    const Vec3 worldMinimum = WorldMin();
+    const Vec3 lightDirection = Normalize(Vec3{0.28f, 0.88f, 0.36f});
+    const Vec3 waterHighlightDirection = Normalize(lightDirection + Vec3{0.0f, 1.0f, 0.0f});
+
+    struct ColumnCoord
+    {
+        int x = 0;
+        int z = 0;
+
+        auto operator==(const ColumnCoord&) const -> bool = default;
+    };
+
+    struct ColumnCoordHash
+    {
+        [[nodiscard]] auto operator()(const ColumnCoord& coord) const noexcept -> std::size_t
+        {
+            std::size_t seed = 0xcbf29ce484222325ull;
+            seed ^= static_cast<std::size_t>(coord.x) + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u);
+            seed ^= static_cast<std::size_t>(coord.z) + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u);
+            return seed;
+        }
+    };
 
     std::vector<ChunkCoord> visibleChunks;
     visibleChunks.reserve(chunkRuntimeStates_.size());
+    std::unordered_set<ColumnCoord, ColumnCoordHash> nearColumns;
+    std::unordered_map<ColumnCoord, float, ColumnCoordHash> farColumns;
+
     for (const auto& [chunk, state] : chunkRuntimeStates_)
     {
         if (state.opaqueTriangles.empty() && state.translucentTriangles.empty())
@@ -1756,7 +1864,7 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
             continue;
         }
 
-        const Vec3 minCorner = WorldMin() + Vec3{
+        const Vec3 minCorner = worldMinimum + Vec3{
             static_cast<float>(chunk.x * chunkSpan) * cellSize_,
             static_cast<float>(chunk.y * chunkSpan) * cellSize_,
             static_cast<float>(chunk.z * chunkSpan) * cellSize_,
@@ -1776,7 +1884,8 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         };
         const Vec3 center = (minCorner + maxCorner) * 0.5f;
         const float radius = Length(maxCorner - center);
-        if (Length(center - cameraPosition) - radius > clampedDrawDistance)
+        const float distanceToChunk = std::max(0.0f, Length(center - cameraPosition) - radius);
+        if (distanceToChunk > clampedDrawDistance)
         {
             continue;
         }
@@ -1784,7 +1893,25 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         {
             continue;
         }
+
+        const ColumnCoord column{chunk.x, chunk.z};
+        if (distanceToChunk > fullDetailDistance)
+        {
+            const auto existing = farColumns.find(column);
+            if (existing == farColumns.end() || distanceToChunk < existing->second)
+            {
+                farColumns[column] = distanceToChunk;
+            }
+            continue;
+        }
+
         visibleChunks.push_back(chunk);
+        nearColumns.insert(column);
+    }
+
+    for (const ColumnCoord& column : nearColumns)
+    {
+        farColumns.erase(column);
     }
 
     std::sort(visibleChunks.begin(), visibleChunks.end(), [](const ChunkCoord& lhs, const ChunkCoord& rhs)
@@ -1800,6 +1927,21 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         return lhs.x < rhs.x;
     });
 
+    std::vector<std::pair<ColumnCoord, float>> orderedFarColumns;
+    orderedFarColumns.reserve(farColumns.size());
+    for (const auto& entry : farColumns)
+    {
+        orderedFarColumns.push_back(entry);
+    }
+    std::sort(orderedFarColumns.begin(), orderedFarColumns.end(), [](const auto& lhs, const auto& rhs)
+    {
+        if (lhs.first.z != rhs.first.z)
+        {
+            return lhs.first.z < rhs.first.z;
+        }
+        return lhs.first.x < rhs.first.x;
+    });
+
     std::size_t totalOpaqueVertices = 0u;
     std::size_t totalTranslucentVertices = 0u;
     for (const ChunkCoord& chunk : visibleChunks)
@@ -1808,28 +1950,233 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         totalOpaqueVertices += state.opaqueTriangles.size();
         totalTranslucentVertices += state.translucentTriangles.size();
     }
-    opaqueTerrainTriangles.reserve(totalOpaqueVertices);
-    translucentTerrainTriangles.reserve(totalTranslucentVertices);
+    opaqueTerrainTriangles.reserve(totalOpaqueVertices + orderedFarColumns.size() * 384u);
+    translucentTerrainTriangles.reserve(totalTranslucentVertices + orderedFarColumns.size() * 192u);
     debugLines.reserve(showWireframe ? (totalOpaqueVertices + totalTranslucentVertices) * 2u : visibleChunks.size() * 24u);
+
+    const auto columnIndex = [this](const int x, const int z) -> std::size_t
+    {
+        return static_cast<std::size_t>(z * width_ + x);
+    };
+
+    const auto appendWireframe = [&debugLines](const std::vector<render::ColorVertex3D>& triangles, const Vec4& color)
+    {
+        for (std::size_t index = 0; index + 2 < triangles.size(); index += 3)
+        {
+            const Vec3& a = triangles[index + 0].position;
+            const Vec3& b = triangles[index + 1].position;
+            const Vec3& c = triangles[index + 2].position;
+            debugLines.push_back({a, color});
+            debugLines.push_back({b, color});
+            debugLines.push_back({b, color});
+            debugLines.push_back({c, color});
+            debugLines.push_back({c, color});
+            debugLines.push_back({a, color});
+        }
+    };
+
+    const auto sampleCornerHeight = [this, &columnIndex](const std::vector<float>& heights, const int cornerX, const int cornerZ) -> float
+    {
+        float accumulatedHeight = 0.0f;
+        float sampleWeight = 0.0f;
+        for (int sampleZ = cornerZ - 1; sampleZ <= cornerZ; ++sampleZ)
+        {
+            for (int sampleX = cornerX - 1; sampleX <= cornerX; ++sampleX)
+            {
+                if (sampleX < 0 || sampleX >= width_ || sampleZ < 0 || sampleZ >= depth_)
+                {
+                    continue;
+                }
+
+                const float candidateHeight = heights[columnIndex(sampleX, sampleZ)];
+                if (!std::isfinite(candidateHeight))
+                {
+                    continue;
+                }
+
+                accumulatedHeight += candidateHeight;
+                sampleWeight += 1.0f;
+            }
+        }
+
+        return sampleWeight > 0.0f ? accumulatedHeight / sampleWeight : -std::numeric_limits<float>::infinity();
+    };
+
+    const auto sampleTopMaterial = [this](const int x, const int z, const SurfaceField field) -> MaterialId
+    {
+        if (x < 0 || x >= width_ || z < 0 || z >= depth_)
+        {
+            return MaterialId::Air;
+        }
+
+        for (int y = height_ - 1; y >= 0; --y)
+        {
+            const MaterialId material = GetCell(x, y, z);
+            if (field == SurfaceField::Water)
+            {
+                if (material == MaterialId::ShallowWater)
+                {
+                    return material;
+                }
+                continue;
+            }
+
+            if (material != MaterialId::Air && material != MaterialId::ShallowWater)
+            {
+                return material;
+            }
+        }
+
+        return MaterialId::Air;
+    };
+
+    const auto shadeApproximateSurface = [this, &lightDirection, &waterHighlightDirection](
+                                             const MaterialId material,
+                                             const Vec3& normal,
+                                             const bool translucent,
+                                             const float waterDepth) -> Vec4
+    {
+        Vec3 resolvedNormal = normal;
+        if (LengthSquared(resolvedNormal) <= 1.0e-6f)
+        {
+            resolvedNormal = Vec3{0.0f, 1.0f, 0.0f};
+        }
+        else
+        {
+            resolvedNormal = Normalize(resolvedNormal);
+        }
+
+        if (translucent)
+        {
+            const float diffuse = std::max(0.0f, Dot(resolvedNormal, lightDirection));
+            const float horizonFactor = Clamp(1.0f - resolvedNormal.y, 0.0f, 1.0f);
+            const float depthFactor = Clamp(waterDepth / std::max(cellSize_ * 4.0f, 0.001f), 0.0f, 1.0f);
+            const float highlight = std::pow(std::max(0.0f, Dot(resolvedNormal, waterHighlightDirection)), 24.0f);
+
+            const Vec3 shallowColor{0.18f, 0.56f, 0.74f};
+            const Vec3 deepColor{0.07f, 0.28f, 0.58f};
+            Vec3 waterColor = {
+                Lerp(shallowColor.x, deepColor.x, depthFactor),
+                Lerp(shallowColor.y, deepColor.y, depthFactor),
+                Lerp(shallowColor.z, deepColor.z, depthFactor),
+            };
+
+            const float light = 0.28f + 0.34f * diffuse + 0.18f * horizonFactor + 0.20f * Clamp(resolvedNormal.y * 0.5f + 0.5f, 0.0f, 1.0f);
+            waterColor *= light;
+            waterColor += Vec3{1.0f, 1.0f, 1.0f} * (0.03f + 0.08f * horizonFactor + 0.10f * highlight);
+
+            return {
+                Clamp(waterColor.x, 0.0f, 1.0f),
+                Clamp(waterColor.y, 0.0f, 1.0f),
+                Clamp(waterColor.z, 0.0f, 1.0f),
+                Clamp(0.24f + 0.20f * depthFactor + 0.12f * horizonFactor, 0.20f, 0.60f),
+            };
+        }
+
+        const Vec4 baseColor = GetMaterialProperties(material).color;
+        const float diffuse = std::max(0.0f, Dot(resolvedNormal, lightDirection));
+        const float skyFactor = Clamp(resolvedNormal.y * 0.5f + 0.5f, 0.0f, 1.0f);
+        const float bounce = Clamp(0.35f + 0.65f * resolvedNormal.y, 0.15f, 1.0f);
+        const float light = 0.18f + 0.47f * diffuse + 0.20f * skyFactor + 0.15f * bounce;
+        return {
+            Clamp(baseColor.x * light, 0.0f, 1.0f),
+            Clamp(baseColor.y * light, 0.0f, 1.0f),
+            Clamp(baseColor.z * light, 0.0f, 1.0f),
+            baseColor.w,
+        };
+    };
+
+    const auto appendApproximatePatch = [&](std::vector<render::ColorVertex3D>& triangles,
+                                            const std::vector<float>& heights,
+                                            const SurfaceField field,
+                                            const int patchMinX,
+                                            const int patchMaxX,
+                                            const int patchMinZ,
+                                            const int patchMaxZ)
+    {
+        if (patchMinX >= patchMaxX || patchMinZ >= patchMaxZ)
+        {
+            return;
+        }
+
+        const float h00 = sampleCornerHeight(heights, patchMinX, patchMinZ);
+        const float h10 = sampleCornerHeight(heights, patchMaxX, patchMinZ);
+        const float h01 = sampleCornerHeight(heights, patchMinX, patchMaxZ);
+        const float h11 = sampleCornerHeight(heights, patchMaxX, patchMaxZ);
+        if (!std::isfinite(h00) || !std::isfinite(h10) || !std::isfinite(h01) || !std::isfinite(h11))
+        {
+            return;
+        }
+
+        const int sampleX = std::clamp((patchMinX + patchMaxX - 1) / 2, 0, width_ - 1);
+        const int sampleZ = std::clamp((patchMinZ + patchMaxZ - 1) / 2, 0, depth_ - 1);
+        const MaterialId material = sampleTopMaterial(sampleX, sampleZ, field);
+        if (material == MaterialId::Air)
+        {
+            return;
+        }
+
+        const Vec3 a = worldMinimum + Vec3{static_cast<float>(patchMinX) * cellSize_, h00, static_cast<float>(patchMinZ) * cellSize_};
+        const Vec3 b = worldMinimum + Vec3{static_cast<float>(patchMaxX) * cellSize_, h10, static_cast<float>(patchMinZ) * cellSize_};
+        const Vec3 c = worldMinimum + Vec3{static_cast<float>(patchMaxX) * cellSize_, h11, static_cast<float>(patchMaxZ) * cellSize_};
+        const Vec3 d = worldMinimum + Vec3{static_cast<float>(patchMinX) * cellSize_, h01, static_cast<float>(patchMaxZ) * cellSize_};
+        const Vec3 normal = Normalize(Cross(b - a, d - a) + Cross(c - b, d - b));
+
+        const float solidHeight = sampleCornerHeight(solidSurfaceHeightMap_, (patchMinX + patchMaxX) / 2, (patchMinZ + patchMaxZ) / 2);
+        const float waterDepth = field == SurfaceField::Water && std::isfinite(solidHeight)
+            ? std::max(((h00 + h10 + h01 + h11) * 0.25f) - solidHeight, cellSize_ * 0.10f)
+            : cellSize_ * 0.10f;
+        const Vec4 color = shadeApproximateSurface(material, normal, field == SurfaceField::Water, waterDepth);
+
+        triangles.push_back({a, color});
+        triangles.push_back({b, color});
+        triangles.push_back({c, color});
+        triangles.push_back({a, color});
+        triangles.push_back({c, color});
+        triangles.push_back({d, color});
+
+        if (showWireframe)
+        {
+            const Vec4 wireColor = field == SurfaceField::Water
+                ? MakeColor(0.05f, 0.16f, 0.24f, 0.55f)
+                : MakeColor(0.05f, 0.05f, 0.05f, 0.72f);
+            debugLines.push_back({a, wireColor});
+            debugLines.push_back({b, wireColor});
+            debugLines.push_back({b, wireColor});
+            debugLines.push_back({c, wireColor});
+            debugLines.push_back({c, wireColor});
+            debugLines.push_back({d, wireColor});
+            debugLines.push_back({d, wireColor});
+            debugLines.push_back({a, wireColor});
+        }
+    };
+
+    const auto appendFarColumnApproximation = [&](const ColumnCoord& column, const float distanceToColumn)
+    {
+        const int xBegin = column.x * chunkSpan;
+        const int xEnd = std::min(width_, xBegin + chunkSpan);
+        const int zBegin = column.z * chunkSpan;
+        const int zEnd = std::min(depth_, zBegin + chunkSpan);
+        if (xBegin >= xEnd || zBegin >= zEnd)
+        {
+            return;
+        }
+
+        const int stepCells = distanceToColumn > coarseDetailDistance ? 8 : 4;
+        for (int patchZ = zBegin; patchZ < zEnd; patchZ += stepCells)
+        {
+            const int patchMaxZ = std::min(patchZ + stepCells, zEnd);
+            for (int patchX = xBegin; patchX < xEnd; patchX += stepCells)
+            {
+                const int patchMaxX = std::min(patchX + stepCells, xEnd);
+                appendApproximatePatch(opaqueTerrainTriangles, solidSurfaceHeightMap_, SurfaceField::Solid, patchX, patchMaxX, patchZ, patchMaxZ);
+                appendApproximatePatch(translucentTerrainTriangles, waterSurfaceHeightMap_, SurfaceField::Water, patchX, patchMaxX, patchZ, patchMaxZ);
+            }
+        }
+    };
 
     if (showWireframe)
     {
-        const auto appendWireframe = [&debugLines](const std::vector<render::ColorVertex3D>& triangles, const Vec4& color)
-        {
-            for (std::size_t index = 0; index + 2 < triangles.size(); index += 3)
-            {
-                const Vec3& a = triangles[index + 0].position;
-                const Vec3& b = triangles[index + 1].position;
-                const Vec3& c = triangles[index + 2].position;
-                debugLines.push_back({a, color});
-                debugLines.push_back({b, color});
-                debugLines.push_back({b, color});
-                debugLines.push_back({c, color});
-                debugLines.push_back({c, color});
-                debugLines.push_back({a, color});
-            }
-        };
-
         for (const ChunkCoord& chunk : visibleChunks)
         {
             const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
@@ -1851,7 +2198,7 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
 
         const float intensity = Clamp(state.activityLifetime / kActiveChunkLifetimeSeconds, 0.2f, 1.0f);
         const Vec4 color = MakeColor(0.25f, 0.95f, 1.0f, intensity);
-        const Vec3 minCorner = WorldMin() + Vec3{
+        const Vec3 minCorner = worldMinimum + Vec3{
             static_cast<float>(chunk.x * chunkSpan) * cellSize_,
             static_cast<float>(chunk.y * chunkSpan) * cellSize_,
             static_cast<float>(chunk.z * chunkSpan) * cellSize_,
@@ -1862,6 +2209,11 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
             static_cast<float>(chunkSpan) * cellSize_,
         };
         AppendBoxLines(debugLines, minCorner, maxCorner, color);
+    }
+
+    for (const auto& [column, distanceToColumn] : orderedFarColumns)
+    {
+        appendFarColumnApproximation(column, distanceToColumn);
     }
 }
 
@@ -2175,11 +2527,10 @@ auto DemoWorld::CanWaterSpreadLaterally(const int x, const int y, const int z) c
     return CountAdjacentWater(x, y, z) >= 2;
 }
 
-auto DemoWorld::ComputeLooseSimulationBounds() const -> std::optional<LooseSimulationBounds>
+auto DemoWorld::ComputeLooseSimulationRegions() const -> std::vector<LooseSimulationBounds>
 {
     const int chunkSpan = std::max(activeChunkSize_, 1);
-    LooseSimulationBounds bounds{};
-    bool foundBounds = false;
+    std::vector<LooseSimulationBounds> regions;
 
     for (const auto& [chunk, state] : chunkRuntimeStates_)
     {
@@ -2195,32 +2546,55 @@ auto DemoWorld::ComputeLooseSimulationBounds() const -> std::optional<LooseSimul
         const int chunkMinZ = std::max(0, chunk.z * chunkSpan - kLooseSimulationPaddingCells);
         const int chunkMaxZ = std::min(depth_ - 1, chunk.z * chunkSpan + chunkSpan - 1 + kLooseSimulationPaddingCells);
 
-        if (!foundBounds)
-        {
-            bounds.minX = chunkMinX;
-            bounds.maxX = chunkMaxX;
-            bounds.minY = chunkMinY;
-            bounds.maxY = chunkMaxY;
-            bounds.minZ = chunkMinZ;
-            bounds.maxZ = chunkMaxZ;
-            foundBounds = true;
-            continue;
-        }
-
-        bounds.minX = std::min(bounds.minX, chunkMinX);
-        bounds.maxX = std::max(bounds.maxX, chunkMaxX);
-        bounds.minY = std::min(bounds.minY, chunkMinY);
-        bounds.maxY = std::max(bounds.maxY, chunkMaxY);
-        bounds.minZ = std::min(bounds.minZ, chunkMinZ);
-        bounds.maxZ = std::max(bounds.maxZ, chunkMaxZ);
+        regions.push_back({
+            chunkMinX,
+            chunkMaxX,
+            chunkMinY,
+            chunkMaxY,
+            chunkMinZ,
+            chunkMaxZ,
+        });
     }
 
-    if (!foundBounds)
+    const auto overlaps = [](const LooseSimulationBounds& lhs, const LooseSimulationBounds& rhs) -> bool
     {
-        return std::nullopt;
+        return lhs.minX <= rhs.maxX && lhs.maxX >= rhs.minX &&
+               lhs.minY <= rhs.maxY && lhs.maxY >= rhs.minY &&
+               lhs.minZ <= rhs.maxZ && lhs.maxZ >= rhs.minZ;
+    };
+    const auto mergeInto = [](LooseSimulationBounds& target, const LooseSimulationBounds& source)
+    {
+        target.minX = std::min(target.minX, source.minX);
+        target.maxX = std::max(target.maxX, source.maxX);
+        target.minY = std::min(target.minY, source.minY);
+        target.maxY = std::max(target.maxY, source.maxY);
+        target.minZ = std::min(target.minZ, source.minZ);
+        target.maxZ = std::max(target.maxZ, source.maxZ);
+    };
+
+    for (std::size_t index = 0; index < regions.size(); ++index)
+    {
+        bool mergedAny = true;
+        while (mergedAny)
+        {
+            mergedAny = false;
+            for (std::size_t other = index + 1; other < regions.size();)
+            {
+                if (!overlaps(regions[index], regions[other]))
+                {
+                    ++other;
+                    continue;
+                }
+
+                mergeInto(regions[index], regions[other]);
+                regions[other] = regions.back();
+                regions.pop_back();
+                mergedAny = true;
+            }
+        }
     }
 
-    return bounds;
+    return regions;
 }
 
 void DemoWorld::SimulateDrySandPass(const LooseSimulationBounds& bounds)
@@ -3275,7 +3649,7 @@ auto DemoWorld::LoadLegacyMaterialField(const std::filesystem::path& path) -> bo
     return true;
 }
 
-void DemoWorld::RebuildMeshCache()
+void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
 {
     const ScopedCrashContext crashContext("DemoWorld::RebuildMeshCache");
     if (meshWorkerCount_ == 0)
@@ -3289,9 +3663,12 @@ void DemoWorld::RebuildMeshCache()
 
     Stopwatch stopwatch;
 
-    terrainTriangleCache_.clear();
-    translucentTerrainTriangleCache_.clear();
-    terrainWireCache_.clear();
+    if (rebuildGlobalVertexCache)
+    {
+        terrainTriangleCache_.clear();
+        translucentTerrainTriangleCache_.clear();
+        terrainWireCache_.clear();
+    }
 
     const std::size_t columnCount = static_cast<std::size_t>(width_ * depth_);
     if (solidSurfaceHeightMap_.size() != columnCount)
@@ -3313,7 +3690,7 @@ void DemoWorld::RebuildMeshCache()
         }
     }
 
-    if (dirtyChunks.empty())
+    if (dirtyChunks.empty() && (!rebuildGlobalVertexCache || !globalMeshCacheDirty_))
     {
         PruneRetiredChunkStates();
         terrainDirty_ = false;
@@ -4033,48 +4410,56 @@ void DemoWorld::RebuildMeshCache()
 
     PruneRetiredChunkStates();
 
-    std::vector<ChunkCoord> orderedChunkCoords;
-    orderedChunkCoords.reserve(chunkRuntimeStates_.size());
-    for (const auto& [chunk, state] : chunkRuntimeStates_)
+    if (rebuildGlobalVertexCache)
     {
-        static_cast<void>(state);
-        orderedChunkCoords.push_back(chunk);
-    }
-    std::sort(orderedChunkCoords.begin(), orderedChunkCoords.end(), [](const ChunkCoord& lhs, const ChunkCoord& rhs)
-    {
-        if (lhs.z != rhs.z)
+        std::vector<ChunkCoord> orderedChunkCoords;
+        orderedChunkCoords.reserve(chunkRuntimeStates_.size());
+        for (const auto& [chunk, state] : chunkRuntimeStates_)
         {
-            return lhs.z < rhs.z;
+            static_cast<void>(state);
+            orderedChunkCoords.push_back(chunk);
         }
-        if (lhs.y != rhs.y)
+        std::sort(orderedChunkCoords.begin(), orderedChunkCoords.end(), [](const ChunkCoord& lhs, const ChunkCoord& rhs)
         {
-            return lhs.y < rhs.y;
+            if (lhs.z != rhs.z)
+            {
+                return lhs.z < rhs.z;
+            }
+            if (lhs.y != rhs.y)
+            {
+                return lhs.y < rhs.y;
+            }
+            return lhs.x < rhs.x;
+        });
+
+        std::size_t totalOpaqueVertices = 0;
+        std::size_t totalTranslucentVertices = 0;
+        for (const ChunkCoord& chunk : orderedChunkCoords)
+        {
+            const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
+            totalOpaqueVertices += state.opaqueTriangles.size();
+            totalTranslucentVertices += state.translucentTriangles.size();
         }
-        return lhs.x < rhs.x;
-    });
 
-    std::size_t totalOpaqueVertices = 0;
-    std::size_t totalTranslucentVertices = 0;
-    for (const ChunkCoord& chunk : orderedChunkCoords)
-    {
-        const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
-        totalOpaqueVertices += state.opaqueTriangles.size();
-        totalTranslucentVertices += state.translucentTriangles.size();
+        terrainTriangleCache_.reserve(totalOpaqueVertices);
+        translucentTerrainTriangleCache_.reserve(totalTranslucentVertices);
+        for (const ChunkCoord& chunk : orderedChunkCoords)
+        {
+            ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
+            terrainTriangleCache_.insert(
+                terrainTriangleCache_.end(),
+                state.opaqueTriangles.begin(),
+                state.opaqueTriangles.end());
+            translucentTerrainTriangleCache_.insert(
+                translucentTerrainTriangleCache_.end(),
+                state.translucentTriangles.begin(),
+                state.translucentTriangles.end());
+        }
+        globalMeshCacheDirty_ = false;
     }
-
-    terrainTriangleCache_.reserve(totalOpaqueVertices);
-    translucentTerrainTriangleCache_.reserve(totalTranslucentVertices);
-    for (const ChunkCoord& chunk : orderedChunkCoords)
+    else if (!dirtyChunks.empty())
     {
-        ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
-        terrainTriangleCache_.insert(
-            terrainTriangleCache_.end(),
-            state.opaqueTriangles.begin(),
-            state.opaqueTriangles.end());
-        translucentTerrainTriangleCache_.insert(
-            translucentTerrainTriangleCache_.end(),
-            state.translucentTriangles.begin(),
-            state.translucentTriangles.end());
+        globalMeshCacheDirty_ = true;
     }
 
     bool hasDirtyBacklog = dirtyChunkTotal > dirtyChunks.size();

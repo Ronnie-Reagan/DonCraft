@@ -13,8 +13,10 @@ That means the same authoritative world simulation can run inside the graphical 
 
 - Steam client startup MUST happens before SDL startup.
 - A graphical client executable now has a real session front end:
-  - `Continue Offline`
-  - `Host Self-Hosted World`
+  - selectable world slots with saved/empty status
+  - `Continue Offline Slot N`
+  - `New Offline World`
+  - `Host Self-Hosted World` with load-saved/create-new setup
   - `Join World`
   - `Quit`
 - Offline, listen-host, client, and dedicated server all run through a shared authoritative `SessionRuntime`.

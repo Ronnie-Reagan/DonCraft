@@ -3,6 +3,7 @@
 #include "core/math.hpp"
 #include "game/session_types.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -88,59 +89,46 @@ struct WeaponViewTuning
     WeaponScopeTuning scope{};
 };
 
-inline constexpr std::size_t kToolTypeCount = 4u;
+inline constexpr std::size_t kToolTypeCount = 5u;
+inline constexpr std::size_t kCartridgeTypeCount = 3u;
 
 [[nodiscard]] inline auto ToToolIndex(const ToolType tool) -> std::size_t
 {
-    switch (tool)
-    {
-    case ToolType::Rifle:
-        return 0u;
-    case ToolType::Grenade:
-        return 1u;
-    case ToolType::Dig:
-        return 2u;
-    case ToolType::Smg:
-        return 3u;
-    default:
-        return 0u;
-    }
+    const std::size_t index = static_cast<std::size_t>(tool);
+    return index < kToolTypeCount ? index : 0u;
 }
 
-[[nodiscard]] inline auto GetCartridgeDefinition(const CartridgeType type) -> CartridgeDefinition
-{
-    switch (type)
+inline constexpr std::array<CartridgeDefinition, kCartridgeTypeCount> kCartridgeDefinitions{{
     {
-    case CartridgeType::Rifle762:
-        return {
-            .type = CartridgeType::Rifle762,
-            .name = "7.62 NATO",
-            .muzzleVelocity = 128.0f,
-            .recoilPitchDegrees = 0.50f,
-            .recoilYawDegrees = 0.70f,
-            .tracerColor = Vec4{1.0f, 0.84f, 0.44f, 1.0f},
-        };
-    case CartridgeType::Pistol9mm:
-        return {
-            .type = CartridgeType::Pistol9mm,
-            .name = "9x19mm",
-            .muzzleVelocity = 96.0f,
-            .recoilPitchDegrees = 0.22f,
-            .recoilYawDegrees = 0.45f,
-            .tracerColor = Vec4{0.82f, 0.96f, 0.48f, 1.0f},
-        };
-    case CartridgeType::None:
-    default:
-        return {};
-    }
+        .type = CartridgeType::None,
+        .name = "N/A",
+    },
+    {
+        .type = CartridgeType::Rifle762,
+        .name = "7.62 NATO",
+        .muzzleVelocity = 128.0f,
+        .recoilPitchDegrees = 0.50f,
+        .recoilYawDegrees = 0.70f,
+        .tracerColor = Vec4{1.0f, 0.84f, 0.44f, 1.0f},
+    },
+    {
+        .type = CartridgeType::Pistol9mm,
+        .name = "9x19mm",
+        .muzzleVelocity = 96.0f,
+        .recoilPitchDegrees = 0.22f,
+        .recoilYawDegrees = 0.45f,
+        .tracerColor = Vec4{0.82f, 0.96f, 0.48f, 1.0f},
+    },
+}};
+
+[[nodiscard]] inline auto ToCartridgeIndex(const CartridgeType type) -> std::size_t
+{
+    const std::size_t index = static_cast<std::size_t>(type);
+    return index < kCartridgeTypeCount ? index : 0u;
 }
 
-[[nodiscard]] inline auto GetWeaponDefinition(const ToolType tool) -> WeaponDefinition
-{
-    switch (tool)
+inline constexpr std::array<WeaponDefinition, kToolTypeCount> kWeaponDefinitions{{
     {
-    case ToolType::Rifle:
-        return {
             .tool = ToolType::Rifle,
             .name = "RIFLE",
             .cartridge = CartridgeType::Rifle762,
@@ -160,9 +148,28 @@ inline constexpr std::size_t kToolTypeCount = 4u;
             .defaultZoomMagnification = 1.0f,
             .minimumZoomMagnification = 1.0f,
             .maximumZoomMagnification = 6.0f,
-        };
-    case ToolType::Smg:
-        return {
+    },
+    {
+            .tool = ToolType::Grenade,
+            .name = "GRENADE",
+            .cartridge = CartridgeType::None,
+            .automatic = false,
+            .supportsAds = false,
+            .usesScope = false,
+            .usesMagazine = false,
+            .weaponCycleDecayRate = 6.5f,
+    },
+    {
+            .tool = ToolType::Dig,
+            .name = "DIG TOOL",
+            .cartridge = CartridgeType::None,
+            .automatic = false,
+            .supportsAds = false,
+            .usesScope = false,
+            .usesMagazine = false,
+            .weaponCycleDecayRate = 2.1f,
+    },
+    {
             .tool = ToolType::Smg,
             .name = "SMG",
             .cartridge = CartridgeType::Pistol9mm,
@@ -182,39 +189,23 @@ inline constexpr std::size_t kToolTypeCount = 4u;
             .defaultZoomMagnification = 1.0f,
             .minimumZoomMagnification = 1.0f,
             .maximumZoomMagnification = 1.0f,
-        };
-    case ToolType::Grenade:
-        return {
-            .tool = ToolType::Grenade,
-            .name = "GRENADE",
-            .cartridge = CartridgeType::None,
-            .automatic = false,
-            .supportsAds = false,
-            .usesScope = false,
-            .usesMagazine = false,
-            .weaponCycleDecayRate = 6.5f,
-        };
-    case ToolType::Dig:
-    default:
-        return {
-            .tool = ToolType::Dig,
-            .name = "DIG TOOL",
-            .cartridge = CartridgeType::None,
-            .automatic = false,
-            .supportsAds = false,
-            .usesScope = false,
-            .usesMagazine = false,
-            .weaponCycleDecayRate = 2.1f,
-        };
-    }
-}
-
-[[nodiscard]] inline auto GetWeaponViewTuning(const ToolType tool) -> WeaponViewTuning
-{
-    switch (tool)
+    },
     {
-    case ToolType::Rifle:
-        return {
+            .tool = ToolType::Build,
+            .name = "BUILD",
+            .cartridge = CartridgeType::None,
+            .automatic = false,
+            .supportsAds = false,
+            .usesScope = false,
+            .usesMagazine = false,
+            .weaponCycleDecayRate = 5.5f,
+            .viewModelKickDistance = 0.05f,
+            .viewModelKickRise = 0.010f,
+    },
+}};
+
+inline constexpr std::array<WeaponViewTuning, kToolTypeCount> kWeaponViewTunings{{
+    {
             .ads =
                 {
                     .sightLocalPoint = Vec3{0.0f, 0.064f, 0.150f},
@@ -242,26 +233,39 @@ inline constexpr std::size_t kToolTypeCount = 4u;
                             .farPlanePaddingMeters = 64.0f,
                         },
                 },
-        };
-    case ToolType::Smg:
-        return {
+    },
+    {
+            .muzzleLocalPoint = Vec3{0.0f, 0.0f, 0.0f},
+    },
+    {
+            .muzzleLocalPoint = Vec3{0.0f, 0.0f, 0.0f},
+    },
+    {
             .ads =
                 {
                     .sightLocalPoint = Vec3{0.0f, 0.095f, 0.150f},
                     .eyeReliefMeters = 0.18f,
                 },
             .muzzleLocalPoint = Vec3{0.0f, -0.012f, 0.78f},
-        };
-    case ToolType::Grenade:
-        return {
-            .muzzleLocalPoint = Vec3{0.0f, 0.0f, 0.0f},
-        };
-    case ToolType::Dig:
-    default:
-        return {
-            .muzzleLocalPoint = Vec3{0.0f, 0.0f, 0.0f},
-        };
-    }
+    },
+    {
+            .muzzleLocalPoint = Vec3{0.0f, -0.02f, 0.56f},
+    },
+}};
+
+[[nodiscard]] inline auto GetCartridgeDefinition(const CartridgeType type) -> const CartridgeDefinition&
+{
+    return kCartridgeDefinitions[ToCartridgeIndex(type)];
+}
+
+[[nodiscard]] inline auto GetWeaponDefinition(const ToolType tool) -> const WeaponDefinition&
+{
+    return kWeaponDefinitions[ToToolIndex(tool)];
+}
+
+[[nodiscard]] inline auto GetWeaponViewTuning(const ToolType tool) -> const WeaponViewTuning&
+{
+    return kWeaponViewTunings[ToToolIndex(tool)];
 }
 
 [[nodiscard]] inline bool IsFirearmTool(const ToolType tool)

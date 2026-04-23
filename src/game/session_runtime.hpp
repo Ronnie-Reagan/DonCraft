@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/math.hpp"
+#include "game/construction.hpp"
 #include "game/player_controller.hpp"
 #include "game/session_types.hpp"
 #include "game/truck_controller.hpp"
@@ -22,6 +23,7 @@ class SessionRuntime
 public:
     struct AudioCue
     {
+        Vec3 position{};
         float baseFrequency = 220.0f;
         float durationSeconds = 0.1f;
         float amplitude = 0.18f;
@@ -54,6 +56,7 @@ public:
         Vec3 position{};
         Vec3 previousPosition{};
         Vec3 velocity{};
+        int damage = 0;
         float ttl = 8.0f;
     };
 
@@ -75,13 +78,23 @@ public:
         std::array<WeaponInventory, kToolTypeCount> weaponInventories{};
         float fireCooldown = 0.0f;
         float digCooldown = 0.0f;
+        float buildCooldown = 0.0f;
         float reloadTimer = 0.0f;
         float reloadDuration = 0.0f;
         float weaponCycle = 0.0f;
         float footstepCooldown = 0.0f;
         bool reloading = false;
+        std::uint8_t buildRotationQuarterTurns = 0u;
         world::MaterialId crosshairMaterial = world::MaterialId::Air;
         std::uint32_t lastAppliedCommandSequence = 0;
+        std::uint32_t lastJumpPressCount = 0;
+        std::uint32_t lastPrimaryPressCount = 0;
+        std::uint32_t lastQuickGrenadePressCount = 0;
+        std::uint32_t lastInteractPressCount = 0;
+        std::uint32_t lastReloadPressCount = 0;
+        float lastCumulativeLookYawDelta = 0.0f;
+        float lastCumulativeLookPitchDelta = 0.0f;
+        int health = 100;
     };
 
     struct Config
@@ -172,13 +185,16 @@ private:
     void UpdatePlayerCrosshair(PlayerState& player);
     void FireWeapon(PlayerState& player);
     void UseDigTool(PlayerState& player);
+    void PlaceConstruction(PlayerState& player);
     void SpawnGrenade(const PlayerState& player);
     void UpdateGrenades(float dt);
     void UpdateBeams(float dt);
     void UpdateBullets(float dt);
-    void QueueBulletImpactAudio(world::MaterialId material, float impactSpeed);
+    void QueueBulletImpactAudio(const Vec3& position, world::MaterialId material, float impactSpeed);
     void StartReload(PlayerState& player);
     void CompleteReload(PlayerState& player);
+    void ApplyDamage(PlayerState& target, int damage, PlayerId instigator, const Vec3& impactPosition);
+    void RespawnPlayer(PlayerState& player);
 
     [[nodiscard]] auto CurrentAimPosition(const PlayerState& player) const -> Vec3;
     [[nodiscard]] auto CurrentForwardVector(const PlayerState& player) const -> Vec3;

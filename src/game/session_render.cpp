@@ -1,5 +1,6 @@
 #include "game/session_render.hpp"
 
+#include "game/construction.hpp"
 #include "game/model_primitives.hpp"
 #include "game/weapon_definitions.hpp"
 
@@ -397,6 +398,31 @@ void AppendShovelMesh(
     model::AppendBox(triangles, bladeBasis, Vec3{0.11f, 0.020f, 0.12f}, steelColor);
 }
 
+void AppendBuildToolMesh(
+    std::vector<render::ColorVertex3D>& triangles,
+    const model::Basis3& basis,
+    const float cycle)
+{
+    const Vec4 woodColor = MakeColor(0.60f, 0.42f, 0.22f, 1.0f);
+    const Vec4 steelColor = MakeColor(0.58f, 0.60f, 0.64f, 1.0f);
+    const Vec4 accentColor = MakeColor(0.18f, 0.80f, 0.86f, 0.86f);
+
+    model::Basis3 handleBasis = MakeAxisBasis(model::TransformPoint(basis, Vec3{0.0f, -0.03f, 0.18f}), basis.forward, basis.up);
+    model::AppendCylinder(triangles, handleBasis, 0.26f, 0.020f, 8, woodColor, true, true);
+
+    model::Basis3 headBasis = basis;
+    headBasis.origin = model::TransformPoint(basis, Vec3{0.0f, 0.05f - cycle * 0.01f, 0.50f});
+    model::AppendBox(triangles, headBasis, Vec3{0.090f, 0.040f, 0.045f}, steelColor);
+
+    model::Basis3 clawBasis = basis;
+    clawBasis.origin = model::TransformPoint(basis, Vec3{0.0f, 0.09f - cycle * 0.01f, 0.58f});
+    model::AppendBox(triangles, clawBasis, Vec3{0.050f, 0.030f, 0.055f}, steelColor);
+
+    model::Basis3 gaugeBasis = basis;
+    gaugeBasis.origin = model::TransformPoint(basis, Vec3{0.0f, 0.11f, 0.22f});
+    model::AppendBox(triangles, gaugeBasis, Vec3{0.050f, 0.028f, 0.070f}, accentColor);
+}
+
 auto BuildHeldItemBasis(
     const ToolType tool,
     const Vec3& aimPosition,
@@ -501,6 +527,9 @@ void AppendCharacterHeldToolMesh(
         break;
     case ToolType::Dig:
         AppendShovelMesh(triangles, basis);
+        break;
+    case ToolType::Build:
+        AppendBuildToolMesh(triangles, basis, clampedWeaponCycle);
         break;
     default:
         break;
@@ -933,8 +962,196 @@ void AppendHeldToolMesh(
         return;
     }
 
+    if (tool == ToolType::Build)
+    {
+        const model::Basis3 weaponBasis = BuildHeldItemBasis(tool, aimPosition, forward, walkCycle, moveSpeed, weaponCycle);
+        AppendBuildToolMesh(triangles, weaponBasis, weaponCycle);
+        return;
+    }
+
     const model::Basis3 shovelBasis = BuildShovelBasis(aimPosition, forward, walkCycle, moveSpeed, weaponCycle);
     AppendShovelMesh(triangles, shovelBasis);
+}
+
+auto BuildSessionWorldToClip(
+    const Vec3& cameraPosition,
+    const Vec3& aimPosition,
+    const Vec3& forward,
+    const SessionRenderOptions& options,
+    const int viewportWidth,
+    const int viewportHeight) -> Mat4
+{
+    return BuildPerspective(
+        cameraPosition,
+        aimPosition + forward * std::max(options.terrainDrawDistanceMeters * 1.15f, 32.0f),
+        BuildMainSessionFovDegrees(),
+        options.terrainDrawDistanceMeters + 160.0f,
+        viewportWidth,
+        viewportHeight);
+}
+
+void GatherTerrainRenderData(
+    render::FrameRenderData& data,
+    world::DemoWorld& world,
+    const Vec3& cameraPosition,
+    const Vec3& aimPosition,
+    const Vec3& forward,
+    const SessionRenderOptions& options,
+    const int viewportWidth,
+    const int viewportHeight)
+{
+    data.clearColor = MakeColor(0.53f, 0.73f, 0.92f, 1.0f);
+    data.worldToClip = BuildSessionWorldToClip(cameraPosition, aimPosition, forward, options, viewportWidth, viewportHeight);
+
+    world.GatherRenderGeometrySmoothedCulled(
+        data.terrainTriangleStorage,
+        data.translucentTerrainTriangleStorage,
+        data.debugLines,
+        data.worldToClip,
+        cameraPosition,
+        options.terrainDrawDistanceMeters + 160.0f,
+        options.showWireframe,
+        options.showActiveChunks);
+
+    data.terrainTriangles = data.terrainTriangleStorage;
+    data.translucentTerrainTriangles = data.translucentTerrainTriangleStorage;
+    data.terrainMeshVersion = world.TerrainMeshVersion();
+
+    if (!data.translucentTerrainTriangles.empty() &&
+        data.translucentTerrainTriangles.size() <= kMaxSortedTranslucentVertices)
+    {
+        SortTrianglesBackToFront(data.translucentTerrainTriangleStorage, cameraPosition);
+        data.translucentTerrainTriangles = data.translucentTerrainTriangleStorage;
+    }
+}
+
+void AppendConstructionPreviewMesh(
+    std::vector<render::ColorVertex3D>& triangles,
+    const world::DemoWorld& world,
+    const ConstructionPlacement& placement)
+{
+    const float inset = world.CellSize() * 0.03f;
+    const Vec3 halfExtents{
+        std::max(world.CellSize() * 0.5f - inset, 0.01f),
+        std::max(world.CellSize() * 0.5f - inset, 0.01f),
+        std::max(world.CellSize() * 0.5f - inset, 0.01f),
+    };
+
+    const bool woodPlacement = placement.material == world::MaterialId::WoodPlanks;
+    const Vec4 buildableColor = woodPlacement
+        ? (placement.shape == ConstructionShape::Wall
+            ? MakeColor(0.66f, 0.48f, 0.28f, 0.44f)
+            : MakeColor(0.76f, 0.58f, 0.34f, 0.40f))
+        : (placement.shape == ConstructionShape::Wall
+            ? MakeColor(0.26f, 0.82f, 0.48f, 0.24f)
+            : MakeColor(0.18f, 0.78f, 0.92f, 0.24f));
+    const Vec4 blockedColor = MakeColor(0.92f, 0.28f, 0.20f, 0.32f);
+    const Vec3 worldMin = world.WorldMin();
+
+    triangles.reserve(triangles.size() + placement.previewCells.size() * 36u);
+    for (const ConstructionPreviewCell& previewCell : placement.previewCells)
+    {
+        model::Basis3 basis{};
+        basis.origin = worldMin + Vec3{
+            (static_cast<float>(previewCell.cell.x) + 0.5f) * world.CellSize(),
+            (static_cast<float>(previewCell.cell.y) + 0.5f) * world.CellSize(),
+            (static_cast<float>(previewCell.cell.z) + 0.5f) * world.CellSize(),
+        };
+        model::AppendBox(triangles, basis, halfExtents, previewCell.blocked ? blockedColor : buildableColor);
+    }
+}
+
+void AppendConstructionPreview(
+    render::FrameRenderData& data,
+    const world::DemoWorld& world,
+    const Vec3& aimPosition,
+    const Vec3& forward,
+    const SessionRenderOptions& options,
+    const bool allowPreview)
+{
+    if (!allowPreview || options.localTool != ToolType::Build)
+    {
+        return;
+    }
+
+    const ConstructionPlacement placement = ComputeConstructionPlacement(
+        world,
+        aimPosition,
+        forward,
+        options.buildMaterial,
+        options.buildWallMode ? ConstructionShape::Wall : ConstructionShape::Floor,
+        options.buildRotationQuarterTurns);
+    if (!placement.valid)
+    {
+        return;
+    }
+
+    AppendConstructionPreviewMesh(data.dynamicTranslucentTriangles, world, placement);
+}
+
+struct LocalViewModelState
+{
+    bool enabled = false;
+    bool drivingTruck = false;
+    Vec3 aimPosition{};
+    Vec3 forward{0.0f, 0.0f, 1.0f};
+    float walkCycle = 0.0f;
+    float moveSpeed = 0.0f;
+    float weaponCycle = 0.0f;
+};
+
+void PopulateLocalViewModel(
+    render::FrameRenderData& data,
+    const SessionRenderOptions& options,
+    const LocalViewModelState& state,
+    const int viewportWidth,
+    const int viewportHeight)
+{
+    if (!state.enabled || state.drivingTruck)
+    {
+        ConfigureScopedView(data, options, nullptr, viewportWidth, viewportHeight);
+        return;
+    }
+
+    const WeaponDefinition localWeapon = GetWeaponDefinition(options.localTool);
+    const bool localAds = options.aimDownSights && localWeapon.supportsAds;
+    const bool rifleAds = localAds && localWeapon.usesScope;
+    model::Basis3 rifleBasis{};
+    const model::Basis3* rifleBasisOverride = nullptr;
+    if (options.localTool == ToolType::Rifle)
+    {
+        rifleBasis = BuildHeldItemBasis(
+            options.localTool,
+            state.aimPosition,
+            state.forward,
+            state.walkCycle,
+            state.moveSpeed,
+            state.weaponCycle,
+            localAds ? 1.0f : 0.0f);
+        rifleBasisOverride = &rifleBasis;
+    }
+
+    AppendHeldToolMesh(
+        data.viewModelTriangles,
+        state.aimPosition,
+        state.forward,
+        state.walkCycle,
+        state.moveSpeed,
+        options.localTool,
+        state.weaponCycle,
+        localAds,
+        rifleBasisOverride);
+    if (rifleAds && rifleBasisOverride != nullptr)
+    {
+        AppendRifleScopeOccluderMesh(data.viewModelPostScopeTriangles, *rifleBasisOverride);
+    }
+    ConfigureScopedView(data, options, rifleAds ? rifleBasisOverride : nullptr, viewportWidth, viewportHeight);
+}
+
+void SortDynamicTranslucency(render::FrameRenderData& data, const Vec3& cameraPosition)
+{
+    static_cast<void>(data);
+    static_cast<void>(cameraPosition);
 }
 }
 
@@ -947,7 +1164,6 @@ auto BuildRuntimeRenderData(
     const int viewportHeight) -> render::FrameRenderData
 {
     render::FrameRenderData data{};
-    data.clearColor = MakeColor(0.53f, 0.73f, 0.92f, 1.0f);
 
     const SessionRuntime::PlayerState* const localPlayer = runtime.FindPlayer(localPlayerId);
     const PlayerController* const cameraPlayer = predictedLocalPlayer != nullptr ? predictedLocalPlayer : (localPlayer != nullptr ? &localPlayer->controller : nullptr);
@@ -955,31 +1171,15 @@ auto BuildRuntimeRenderData(
     const Vec3 cameraPosition = BuildViewCameraPosition(runtime.World(), cameraPlayer, drivingTruck, runtime.Truck().CameraPosition(), options);
     const Vec3 forward = drivingTruck ? runtime.Truck().ForwardVector() : (cameraPlayer != nullptr ? cameraPlayer->ForwardVector() : Vec3{0.0f, 0.0f, 1.0f});
     const Vec3 aimPosition = drivingTruck ? runtime.Truck().CameraPosition() : (cameraPlayer != nullptr ? cameraPlayer->CameraPosition() : cameraPosition);
-    data.worldToClip = BuildPerspective(
+    GatherTerrainRenderData(
+        data,
+        runtime.MutableWorld(),
         cameraPosition,
-        aimPosition + forward * std::max(options.terrainDrawDistanceMeters, 24.0f),
-        BuildMainSessionFovDegrees(),
-        options.terrainDrawDistanceMeters + 64.0f,
+        aimPosition,
+        forward,
+        options,
         viewportWidth,
         viewportHeight);
-
-    runtime.MutableWorld().GatherRenderGeometrySmoothedCulled(
-        data.terrainTriangleStorage,
-        data.translucentTerrainTriangleStorage,
-        data.debugLines,
-        data.worldToClip,
-        cameraPosition,
-        options.terrainDrawDistanceMeters,
-        options.showWireframe,
-        options.showActiveChunks);
-    data.terrainTriangles = data.terrainTriangleStorage;
-    data.translucentTerrainTriangles = data.translucentTerrainTriangleStorage;
-    data.terrainMeshVersion = runtime.World().TerrainMeshVersion();
-    if (!data.translucentTerrainTriangles.empty() && data.translucentTerrainTriangles.size() <= kMaxSortedTranslucentVertices)
-    {
-        SortTrianglesBackToFront(data.translucentTerrainTriangleStorage, cameraPosition);
-        data.translucentTerrainTriangles = data.translucentTerrainTriangleStorage;
-    }
 
     runtime.Truck().AppendModelTriangles(data.dynamicTriangles, data.dynamicTranslucentTriangles);
     if (options.showWireframe)
@@ -1004,6 +1204,7 @@ auto BuildRuntimeRenderData(
 
     for (const auto& [id, player] : runtime.Players())
     {
+        // TODO: update the player pos to be inside the truck when entering it as this currently draws the player at point of entry on the ground
         if (!options.thirdPerson && id == localPlayerId && !player.drivingTruck)
         {
             continue;
@@ -1025,52 +1226,33 @@ auto BuildRuntimeRenderData(
             player.drivingTruck);
     }
 
-    if (!options.thirdPerson && localPlayer != nullptr && !localPlayer->drivingTruck)
-    {
-        const PlayerController* const viewPlayer = predictedLocalPlayer != nullptr ? predictedLocalPlayer : &localPlayer->controller;
-        const WeaponDefinition localWeapon = GetWeaponDefinition(options.localTool);
-        const bool localAds = options.aimDownSights && localWeapon.supportsAds;
-        const bool rifleAds = localAds && localWeapon.usesScope;
-        model::Basis3 rifleBasis{};
-        const model::Basis3* rifleBasisOverride = nullptr;
-        if (options.localTool == ToolType::Rifle)
+    const PlayerController* const viewPlayer =
+        localPlayer != nullptr
+            ? (predictedLocalPlayer != nullptr ? predictedLocalPlayer : &localPlayer->controller)
+            : nullptr;
+    AppendConstructionPreview(
+        data,
+        runtime.World(),
+        viewPlayer != nullptr ? viewPlayer->CameraPosition() : aimPosition,
+        viewPlayer != nullptr ? viewPlayer->ForwardVector() : forward,
+        options,
+        localPlayer != nullptr && !drivingTruck);
+    PopulateLocalViewModel(
+        data,
+        options,
         {
-            rifleBasis = BuildHeldItemBasis(
-                options.localTool,
-                viewPlayer->CameraPosition(),
-                viewPlayer->ForwardVector(),
-                viewPlayer->WalkCycleRadians(),
-                viewPlayer->HorizontalSpeedMetersPerSecond(),
-                std::max(localPlayer->weaponCycle, options.localWeaponCycle),
-                localAds ? 1.0f : 0.0f);
-            rifleBasisOverride = &rifleBasis;
-        }
+            .enabled = !options.thirdPerson && localPlayer != nullptr,
+            .drivingTruck = localPlayer != nullptr && localPlayer->drivingTruck,
+            .aimPosition = viewPlayer != nullptr ? viewPlayer->CameraPosition() : aimPosition,
+            .forward = viewPlayer != nullptr ? viewPlayer->ForwardVector() : forward,
+            .walkCycle = viewPlayer != nullptr ? viewPlayer->WalkCycleRadians() : 0.0f,
+            .moveSpeed = viewPlayer != nullptr ? viewPlayer->HorizontalSpeedMetersPerSecond() : 0.0f,
+            .weaponCycle = localPlayer != nullptr ? std::max(localPlayer->weaponCycle, options.localWeaponCycle) : options.localWeaponCycle,
+        },
+        viewportWidth,
+        viewportHeight);
 
-        AppendHeldToolMesh(
-            data.viewModelTriangles,
-            viewPlayer->CameraPosition(),
-            viewPlayer->ForwardVector(),
-            viewPlayer->WalkCycleRadians(),
-            viewPlayer->HorizontalSpeedMetersPerSecond(),
-            options.localTool,
-            std::max(localPlayer->weaponCycle, options.localWeaponCycle),
-            localAds,
-            rifleBasisOverride);
-        if (rifleAds && rifleBasisOverride != nullptr)
-        {
-            AppendRifleScopeOccluderMesh(data.viewModelPostScopeTriangles, *rifleBasisOverride);
-        }
-        ConfigureScopedView(data, options, rifleAds ? rifleBasisOverride : nullptr, viewportWidth, viewportHeight);
-    }
-    else
-    {
-        ConfigureScopedView(data, options, nullptr, viewportWidth, viewportHeight);
-    }
-
-    if (!data.dynamicTranslucentTriangles.empty() && data.dynamicTranslucentTriangles.size() <= kMaxSortedTranslucentVertices)
-    {
-        SortTrianglesBackToFront(data.dynamicTranslucentTriangles, cameraPosition);
-    }
+    SortDynamicTranslucency(data, cameraPosition);
 
     return data;
 }
@@ -1083,7 +1265,6 @@ auto BuildClientRenderData(
     const float interpolationAlpha) -> render::FrameRenderData
 {
     render::FrameRenderData data{};
-    data.clearColor = MakeColor(0.53f, 0.73f, 0.92f, 1.0f);
 
     const net::ActorSnapshotFrame& authoritativeFrame = client.ActorFrame();
     const net::ActorSnapshotFrame frame = client.BuildRenderActorFrame(interpolationAlpha);
@@ -1097,7 +1278,7 @@ auto BuildClientRenderData(
         }
     }
 
-    const PlayerController* const predictedLocalPlayer = client.PredictedLocalPlayer();
+    const PlayerController* const predictedLocalPlayer = client.RenderedLocalPlayer();
     const bool drivingTruck = localActor != nullptr && localActor->drivingTruck;
     const Vec3 truckCameraPosition = frame.truck.position + Vec3{0.0f, 1.1f, 0.0f};
     const Vec3 cameraPosition = BuildViewCameraPosition(
@@ -1115,31 +1296,15 @@ auto BuildClientRenderData(
     const Vec3 aimPosition = drivingTruck
         ? truckCameraPosition
         : (predictedLocalPlayer != nullptr ? predictedLocalPlayer->CameraPosition() : (localActor != nullptr ? localActor->cameraPosition : cameraPosition));
-    data.worldToClip = BuildPerspective(
+    GatherTerrainRenderData(
+        data,
+        client.MutableWorld(),
         cameraPosition,
-        aimPosition + forward * std::max(options.terrainDrawDistanceMeters, 24.0f),
-        BuildMainSessionFovDegrees(),
-        options.terrainDrawDistanceMeters + 64.0f,
+        aimPosition,
+        forward,
+        options,
         viewportWidth,
         viewportHeight);
-
-    client.MutableWorld().GatherRenderGeometrySmoothedCulled(
-        data.terrainTriangleStorage,
-        data.translucentTerrainTriangleStorage,
-        data.debugLines,
-        data.worldToClip,
-        cameraPosition,
-        options.terrainDrawDistanceMeters,
-        options.showWireframe,
-        options.showActiveChunks);
-    data.terrainTriangles = data.terrainTriangleStorage;
-    data.translucentTerrainTriangles = data.translucentTerrainTriangleStorage;
-    data.terrainMeshVersion = client.World().TerrainMeshVersion();
-    if (!data.translucentTerrainTriangles.empty() && data.translucentTerrainTriangles.size() <= kMaxSortedTranslucentVertices)
-    {
-        SortTrianglesBackToFront(data.translucentTerrainTriangleStorage, cameraPosition);
-        data.translucentTerrainTriangles = data.translucentTerrainTriangleStorage;
-    }
 
     AppendTruckApproxMesh(data.dynamicTriangles, frame.truck.position, frame.truck.forward, frame.truck.averageSink);
 
@@ -1200,55 +1365,29 @@ auto BuildClientRenderData(
             actor.drivingTruck);
     }
 
-    if (!options.thirdPerson && !drivingTruck)
-    {
-        const Vec3 localAimPosition = predictedLocalPlayer != nullptr ? predictedLocalPlayer->CameraPosition() : aimPosition;
-        const Vec3 localForward = predictedLocalPlayer != nullptr ? predictedLocalPlayer->ForwardVector() : forward;
-        const float localWalkCycle = predictedLocalPlayer != nullptr ? predictedLocalPlayer->WalkCycleRadians() : (localActor != nullptr ? localActor->walkCycleRadians : 0.0f);
-        const float localMoveSpeed = predictedLocalPlayer != nullptr ? predictedLocalPlayer->HorizontalSpeedMetersPerSecond() : (localActor != nullptr ? localActor->horizontalSpeed : 0.0f);
-        const WeaponDefinition localWeapon = GetWeaponDefinition(options.localTool);
-        const bool localAds = options.aimDownSights && localWeapon.supportsAds;
-        const bool rifleAds = localAds && localWeapon.usesScope;
-        model::Basis3 rifleBasis{};
-        const model::Basis3* rifleBasisOverride = nullptr;
-        if (options.localTool == ToolType::Rifle)
+    AppendConstructionPreview(
+        data,
+        client.World(),
+        predictedLocalPlayer != nullptr ? predictedLocalPlayer->CameraPosition() : aimPosition,
+        predictedLocalPlayer != nullptr ? predictedLocalPlayer->ForwardVector() : forward,
+        options,
+        !drivingTruck);
+    PopulateLocalViewModel(
+        data,
+        options,
         {
-            rifleBasis = BuildHeldItemBasis(
-                options.localTool,
-                localAimPosition,
-                localForward,
-                localWalkCycle,
-                localMoveSpeed,
-                options.localWeaponCycle,
-                localAds ? 1.0f : 0.0f);
-            rifleBasisOverride = &rifleBasis;
-        }
+            .enabled = !options.thirdPerson,
+            .drivingTruck = drivingTruck,
+            .aimPosition = predictedLocalPlayer != nullptr ? predictedLocalPlayer->CameraPosition() : aimPosition,
+            .forward = predictedLocalPlayer != nullptr ? predictedLocalPlayer->ForwardVector() : forward,
+            .walkCycle = predictedLocalPlayer != nullptr ? predictedLocalPlayer->WalkCycleRadians() : (localActor != nullptr ? localActor->walkCycleRadians : 0.0f),
+            .moveSpeed = predictedLocalPlayer != nullptr ? predictedLocalPlayer->HorizontalSpeedMetersPerSecond() : (localActor != nullptr ? localActor->horizontalSpeed : 0.0f),
+            .weaponCycle = options.localWeaponCycle,
+        },
+        viewportWidth,
+        viewportHeight);
 
-        AppendHeldToolMesh(
-            data.viewModelTriangles,
-            localAimPosition,
-            localForward,
-            localWalkCycle,
-            localMoveSpeed,
-            options.localTool,
-            options.localWeaponCycle,
-            localAds,
-            rifleBasisOverride);
-        if (rifleAds && rifleBasisOverride != nullptr)
-        {
-            AppendRifleScopeOccluderMesh(data.viewModelPostScopeTriangles, *rifleBasisOverride);
-        }
-        ConfigureScopedView(data, options, rifleAds ? rifleBasisOverride : nullptr, viewportWidth, viewportHeight);
-    }
-    else
-    {
-        ConfigureScopedView(data, options, nullptr, viewportWidth, viewportHeight);
-    }
-
-    if (!data.dynamicTranslucentTriangles.empty() && data.dynamicTranslucentTriangles.size() <= kMaxSortedTranslucentVertices)
-    {
-        SortTrianglesBackToFront(data.dynamicTranslucentTriangles, cameraPosition);
-    }
+    SortDynamicTranslucency(data, cameraPosition);
 
     return data;
 }

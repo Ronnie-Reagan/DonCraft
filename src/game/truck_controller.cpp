@@ -1,81 +1,14 @@
 #include "game/truck_controller.hpp"
 
+#include "game/movement_utils.hpp"
 #include "game/model_primitives.hpp"
 #include "world/material_properties.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cmath>
 
 namespace df::game
 {
-namespace
-{
-auto MoveToward(const float current, const float target, const float maxDelta) -> float
-{
-    if (current < target)
-    {
-        return std::min(current + maxDelta, target);
-    }
-
-    return std::max(current - maxDelta, target);
-}
-
-auto WrapAngle(const float radians) -> float
-{
-    return std::remainder(radians, kPi * 2.0f);
-}
-
-auto TryStepMove(
-    const world::DemoWorld& world,
-    Vec3& position,
-    const Vec3& moveDelta,
-    const Vec3& halfExtents,
-    const float stepHeight) -> bool
-{
-    if (LengthSquared(moveDelta) <= 1.0e-8f)
-    {
-        return true;
-    }
-
-    const auto tryMove = [&](const Vec3& delta, const float lift) -> bool
-    {
-        const Vec3 raised = position + Vec3{0.0f, lift, 0.0f};
-        if (lift > 0.0f && world.OverlapsBlocking(raised, halfExtents))
-        {
-            return false;
-        }
-
-        const Vec3 candidate = raised + delta;
-        if (world.OverlapsBlocking(candidate, halfExtents))
-        {
-            return false;
-        }
-
-        position = candidate;
-        return true;
-    };
-
-    if (tryMove(moveDelta, 0.0f))
-    {
-        return true;
-    }
-
-    if (stepHeight > 0.0f)
-    {
-        for (const float fraction : {1.0f, 0.75f, 0.5f})
-        {
-            if (tryMove(moveDelta, stepHeight * fraction))
-            {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-}
-
 void TruckController::Reset(const world::DemoWorld& world)
 {
     const Vec3 minimum = world.WorldMin();
@@ -116,7 +49,7 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
     const float steeringTarget = occupied
         ? (input.moveRight ? 1.0f : 0.0f) - (input.moveLeft ? 1.0f : 0.0f)
         : 0.0f;
-    steering_ = MoveToward(steering_, steeringTarget, dt * 4.0f);
+    steering_ = movement::MoveToward(steering_, steeringTarget, dt * 4.0f);
 
     SampleGroundContacts(world);
 
@@ -172,14 +105,14 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
     if (std::abs(throttle) > 0.001f)
     {
         const float accel = ((forwardSpeed * throttle) >= 0.0f) ? engineAcceleration : brakeAcceleration;
-        nextForwardSpeed = MoveToward(forwardSpeed, targetForwardSpeed, accel * dt);
+        nextForwardSpeed = movement::MoveToward(forwardSpeed, targetForwardSpeed, accel * dt);
     }
     else
     {
-        nextForwardSpeed = MoveToward(forwardSpeed, 0.0f, (grounded_ ? 7.0f : 1.5f) * dt);
+        nextForwardSpeed = movement::MoveToward(forwardSpeed, 0.0f, (grounded_ ? 7.0f : 1.5f) * dt);
     }
 
-    const float nextLateralSpeed = MoveToward(lateralSpeed, 0.0f, (grounded_ ? (15.0f * averageGrip + 2.0f) : 1.5f) * dt);
+    const float nextLateralSpeed = movement::MoveToward(lateralSpeed, 0.0f, (grounded_ ? (15.0f * averageGrip + 2.0f) : 1.5f) * dt);
     velocity_ = forward * nextForwardSpeed + right * nextLateralSpeed + Vec3{0.0f, velocity_.y, 0.0f};
 
     if (grounded_)
@@ -193,15 +126,15 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
     const Vec3 halfExtents = BodyHalfExtents();
     const Vec3 horizontalDelta{velocity_.x * dt, 0.0f, velocity_.z * dt};
     const float stepHeight = grounded_ ? 0.52f + averageSink_ * world.CellSize() * 0.45f : 0.0f;
-    if (!TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
+    if (!movement::TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
     {
         const float previousX = position_.x;
         const float previousZ = position_.z;
-        if (!TryStepMove(world, position_, Vec3{horizontalDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{horizontalDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
         {
             velocity_.x = 0.0f;
         }
-        if (!TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalDelta.z}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalDelta.z}, halfExtents, stepHeight))
         {
             velocity_.z = 0.0f;
         }
@@ -235,7 +168,7 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
     const float wheelAngularDelta = (wheelRadius > 0.001f ? nextForwardSpeed / wheelRadius : 0.0f) * dt;
     for (float& wheelSpinRadians : wheelSpinRadians_)
     {
-        wheelSpinRadians = WrapAngle(wheelSpinRadians + wheelAngularDelta);
+        wheelSpinRadians = movement::WrapAngleRadians(wheelSpinRadians + wheelAngularDelta);
     }
 
     SampleGroundContacts(world);

@@ -12,6 +12,57 @@ namespace df::platform
 namespace
 {
 constexpr int kSampleRate = 48000;
+constexpr Vec3 kWorldUp{0.0f, 1.0f, 0.0f};
+
+struct SpatialMix
+{
+    float leftGain = 0.0f;
+    float rightGain = 0.0f;
+};
+
+auto ResolveListenerForward(const Vec3& forward) -> Vec3
+{
+    const Vec3 normalized = Normalize(Vec3{forward.x, 0.0f, forward.z});
+    return LengthSquared(normalized) > 1.0e-6f ? normalized : Vec3{0.0f, 0.0f, 1.0f};
+}
+
+auto ResolveListenerRight(const Vec3& forward) -> Vec3
+{
+    const Vec3 right = Normalize(Cross(ResolveListenerForward(forward), kWorldUp));
+    return LengthSquared(right) > 1.0e-6f ? right : Vec3{1.0f, 0.0f, 0.0f};
+}
+
+auto ComputeSpatialMix(const Vec3& listenerPosition, const Vec3& listenerForward, const Vec3& sourcePosition) -> SpatialMix
+{
+    const Vec3 delta = sourcePosition - listenerPosition;
+    const float distance = Length(delta);
+    constexpr float kNearDistance = 1.25f;
+    constexpr float kFarDistance = 42.0f;
+    if (distance >= kFarDistance)
+    {
+        return {};
+    }
+
+    float attenuation = 1.0f;
+    if (distance > kNearDistance)
+    {
+        const float fade = Clamp((distance - kNearDistance) / (kFarDistance - kNearDistance), 0.0f, 1.0f);
+        attenuation = (1.0f - fade) * (1.0f - fade * 0.35f);
+    }
+
+    float pan = 0.0f;
+    const Vec3 flatDelta = Normalize(Vec3{delta.x, 0.0f, delta.z});
+    if (LengthSquared(flatDelta) > 1.0e-6f)
+    {
+        pan = Clamp(Dot(flatDelta, ResolveListenerRight(listenerForward)), -1.0f, 1.0f);
+    }
+
+    const float panAngle = (pan + 1.0f) * (kPi * 0.25f);
+    return {
+        .leftGain = attenuation * std::cos(panAngle),
+        .rightGain = attenuation * std::sin(panAngle),
+    };
+}
 }
 
 AudioDevice::~AudioDevice()
@@ -30,7 +81,7 @@ bool AudioDevice::Initialize()
 
     SDL_AudioSpec spec{};
     spec.format = SDL_AUDIO_F32;
-    spec.channels = 1;
+    spec.channels = 2;
     spec.freq = kSampleRate;
 
     stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &AudioDevice::StreamCallback, this);
@@ -53,14 +104,31 @@ void AudioDevice::Shutdown()
 
     std::scoped_lock lock(mutex_);
     voices_.clear();
+    listenerPosition_ = {};
+    listenerForward_ = Vec3{0.0f, 0.0f, 1.0f};
+    enginePosition_ = {};
     engineActive_ = false;
     engineLoad_ = 0.0f;
     engineRoughness_ = 0.0f;
 }
 
+void AudioDevice::SetListener(const Vec3& position, const Vec3& forward)
+{
+    std::scoped_lock lock(mutex_);
+    listenerPosition_ = position;
+    listenerForward_ = ResolveListenerForward(forward);
+}
+
 void AudioDevice::QueueCue(const SynthCue& cue)
 {
     std::scoped_lock lock(mutex_);
+    const SpatialMix spatialMix = cue.positional
+        ? ComputeSpatialMix(listenerPosition_, listenerForward_, cue.position)
+        : SpatialMix{0.70710678f, 0.70710678f};
+    if (cue.positional && spatialMix.leftGain <= 1.0e-4f && spatialMix.rightGain <= 1.0e-4f)
+    {
+        return;
+    }
     voices_.push_back({
         .phase = 0.0f,
         .frequency = cue.baseFrequency,
@@ -69,15 +137,18 @@ void AudioDevice::QueueCue(const SynthCue& cue)
         .sweep = cue.sweep,
         .remainingSeconds = cue.durationSeconds,
         .totalSeconds = cue.durationSeconds,
+        .leftGain = spatialMix.leftGain,
+        .rightGain = spatialMix.rightGain,
     });
 }
 
-void AudioDevice::SetEngineState(const float load, const float roughness, const bool active)
+void AudioDevice::SetEngineState(const float load, const float roughness, const bool active, const Vec3& position)
 {
     std::scoped_lock lock(mutex_);
     engineLoad_ = Clamp(load, 0.0f, 1.0f);
     engineRoughness_ = Clamp(roughness, 0.0f, 1.0f);
     engineActive_ = active;
+    enginePosition_ = position;
 }
 
 void SDLCALL AudioDevice::StreamCallback(void* userdata, SDL_AudioStream* stream, const int additionalAmount, int)
@@ -88,18 +159,18 @@ void SDLCALL AudioDevice::StreamCallback(void* userdata, SDL_AudioStream* stream
         return;
     }
 
-    const int sampleCount = additionalAmount / static_cast<int>(sizeof(float));
-    if (sampleCount <= 0)
+    const int frameCount = additionalAmount / static_cast<int>(sizeof(float) * 2);
+    if (frameCount <= 0)
     {
         return;
     }
 
-    std::vector<float> samples(static_cast<std::size_t>(sampleCount), 0.0f);
-    device->Mix(samples.data(), sampleCount);
-    SDL_PutAudioStreamData(stream, samples.data(), sampleCount * static_cast<int>(sizeof(float)));
+    std::vector<float> samples(static_cast<std::size_t>(frameCount) * 2u, 0.0f);
+    device->Mix(samples.data(), frameCount);
+    SDL_PutAudioStreamData(stream, samples.data(), static_cast<int>(samples.size() * sizeof(float)));
 }
 
-void AudioDevice::Mix(float* samples, const int sampleCount)
+void AudioDevice::Mix(float* samples, const int frameCount)
 {
     if (shuttingDown_.load(std::memory_order_acquire))
     {
@@ -107,10 +178,12 @@ void AudioDevice::Mix(float* samples, const int sampleCount)
     }
 
     std::scoped_lock lock(mutex_);
+    const SpatialMix engineSpatialMix = ComputeSpatialMix(listenerPosition_, listenerForward_, enginePosition_);
 
-    for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
+    for (int frameIndex = 0; frameIndex < frameCount; ++frameIndex)
     {
-        float mixed = 0.0f;
+        float mixedLeft = 0.0f;
+        float mixedRight = 0.0f;
 
         if (engineActive_)
         {
@@ -123,7 +196,9 @@ void AudioDevice::Mix(float* samples, const int sampleCount)
 
             const float harmonic = std::sin(enginePhase_ * 2.0f + 0.35f) * 0.32f;
             const float roughNoise = NextNoise() * engineRoughness_ * 0.12f;
-            mixed += (std::sin(enginePhase_) * 0.18f + harmonic * 0.10f + roughNoise) * (0.18f + engineLoad_ * 0.26f);
+            const float engineSample = (std::sin(enginePhase_) * 0.18f + harmonic * 0.10f + roughNoise) * (0.18f + engineLoad_ * 0.26f);
+            mixedLeft += engineSample * engineSpatialMix.leftGain;
+            mixedRight += engineSample * engineSpatialMix.rightGain;
         }
 
         for (auto voiceIter = voices_.begin(); voiceIter != voices_.end();)
@@ -140,7 +215,9 @@ void AudioDevice::Mix(float* samples, const int sampleCount)
 
             const float tone = std::sin(voiceIter->phase) * (1.0f - voiceIter->noise);
             const float noise = NextNoise() * voiceIter->noise;
-            mixed += (tone + noise) * voiceIter->amplitude * envelope;
+            const float voiceSample = (tone + noise) * voiceIter->amplitude * envelope;
+            mixedLeft += voiceSample * voiceIter->leftGain;
+            mixedRight += voiceSample * voiceIter->rightGain;
 
             voiceIter->remainingSeconds -= 1.0f / static_cast<float>(kSampleRate);
             if (voiceIter->remainingSeconds <= 0.0f)
@@ -153,7 +230,8 @@ void AudioDevice::Mix(float* samples, const int sampleCount)
             }
         }
 
-        samples[sampleIndex] = Clamp(mixed, -0.95f, 0.95f);
+        samples[frameIndex * 2 + 0] = Clamp(mixedLeft, -0.95f, 0.95f);
+        samples[frameIndex * 2 + 1] = Clamp(mixedRight, -0.95f, 0.95f);
     }
 }
 

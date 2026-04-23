@@ -1,130 +1,12 @@
 #include "game/player_controller.hpp"
 
+#include "game/movement_utils.hpp"
 #include "world/material_properties.hpp"
 
-#include <algorithm>
 #include <cmath>
 
 namespace df::game
 {
-namespace
-{
-auto MoveToward(const float current, const float target, const float maxDelta) -> float
-{
-    if (current < target)
-    {
-        return std::min(current + maxDelta, target);
-    }
-
-    return std::max(current - maxDelta, target);
-}
-
-auto WrapAngle(const float radians) -> float
-{
-    return std::remainder(radians, kPi * 2.0f);
-}
-
-auto TryStepMove(
-    const world::DemoWorld& world,
-    Vec3& position,
-    const Vec3& moveDelta,
-    const Vec3& halfExtents,
-    const float stepHeight) -> bool
-{
-    if (LengthSquared(moveDelta) <= 1.0e-8f)
-    {
-        return true;
-    }
-
-    const auto tryMove = [&](const Vec3& delta, const float lift) -> bool
-    {
-        const Vec3 raised = position + Vec3{0.0f, lift, 0.0f};
-        if (lift > 0.0f && world.OverlapsBlocking(raised, halfExtents))
-        {
-            return false;
-        }
-
-        const Vec3 candidate = raised + delta;
-        if (world.OverlapsBlocking(candidate, halfExtents))
-        {
-            return false;
-        }
-
-        position = candidate;
-        return true;
-    };
-
-    if (tryMove(moveDelta, 0.0f))
-    {
-        return true;
-    }
-
-    if (stepHeight > 0.0f)
-    {
-        for (const float fraction : {1.0f, 0.75f, 0.5f})
-        {
-            if (tryMove(moveDelta, stepHeight * fraction))
-            {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-auto SnapDownToGround(
-    const world::DemoWorld& world,
-    Vec3& position,
-    const Vec3& halfExtents,
-    const float maxDrop) -> bool
-{
-    if (maxDrop <= 1.0e-4f)
-    {
-        return false;
-    }
-
-    const auto isClearAtDrop = [&](const float drop) -> bool
-    {
-        return !world.OverlapsBlocking(position - Vec3{0.0f, drop, 0.0f}, halfExtents);
-    };
-
-    if (!isClearAtDrop(0.0f))
-    {
-        return false;
-    }
-
-    float low = 0.0f;
-    float high = maxDrop;
-    if (isClearAtDrop(high))
-    {
-        position.y -= high;
-        return true;
-    }
-
-    for (int iteration = 0; iteration < 8; ++iteration)
-    {
-        const float mid = (low + high) * 0.5f;
-        if (isClearAtDrop(mid))
-        {
-            low = mid;
-        }
-        else
-        {
-            high = mid;
-        }
-    }
-
-    if (low <= 1.0e-4f)
-    {
-        return false;
-    }
-
-    position.y -= low;
-    return true;
-}
-}
-
 void PlayerController::Spawn(const world::DemoWorld& world)
 {
     const Vec3 minimum = world.WorldMin();
@@ -158,16 +40,30 @@ void PlayerController::PlaceAt(const Vec3& position, const float yawRadians, con
     onGround_ = false;
 }
 
+void PlayerController::Translate(const Vec3& delta)
+{
+    position_ += delta;
+    for (FootState& foot : feet_)
+    {
+        foot.position += delta;
+    }
+}
+
 void PlayerController::AddViewKick(const float yawRadiansDelta, const float pitchRadiansDelta)
 {
-    yawRadians_ = WrapAngle(yawRadians_ + yawRadiansDelta);
+    yawRadians_ = movement::WrapAngleRadians(yawRadians_ + yawRadiansDelta);
     pitchRadians_ = Clamp(pitchRadians_ + pitchRadiansDelta, DegreesToRadians(-89.0f), DegreesToRadians(89.0f));
+}
+
+void PlayerController::ApplyViewDelta(const float yawRadiansDelta, const float pitchRadiansDelta)
+{
+    yawRadians_ = movement::WrapAngleRadians(yawRadians_ + yawRadiansDelta);
+    pitchRadians_ = Clamp(pitchRadians_ - pitchRadiansDelta, DegreesToRadians(-89.0f), DegreesToRadians(89.0f));
 }
 
 void PlayerController::Tick(const ControlState& input, const world::DemoWorld& world, const float dt)
 {
-    yawRadians_ += input.lookYawDelta * 0.0026f;
-    pitchRadians_ = Clamp(pitchRadians_ - input.lookPitchDelta * 0.0022f, DegreesToRadians(-89.0f), DegreesToRadians(89.0f));
+    ApplyViewDelta(input.lookYawDelta * 0.0026f, input.lookPitchDelta * 0.0022f);
     const bool wasGrounded = onGround_;
 
     const Vec3 flatForward = FlatForwardVector();
@@ -198,8 +94,8 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     const float targetSpeed = (input.sprint ? 8.5f : 6.0f) * moveScale;
     const float acceleration = onGround_ ? 38.0f : 18.0f;
 
-    velocity_.x = MoveToward(velocity_.x, moveInput.x * targetSpeed, acceleration * dt);
-    velocity_.z = MoveToward(velocity_.z, moveInput.z * targetSpeed, acceleration * dt);
+    velocity_.x = movement::MoveToward(velocity_.x, moveInput.x * targetSpeed, acceleration * dt);
+    velocity_.z = movement::MoveToward(velocity_.z, moveInput.z * targetSpeed, acceleration * dt);
 
     if (onGround_ && input.jumpPressed)
     {
@@ -215,15 +111,15 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     constexpr Vec3 kFootHalfExtents{0.12f, 0.08f, 0.19f};
     const float stepHeight = wasGrounded ? std::max(0.32f, world.CellSize() * 1.35f) : 0.0f;
     const Vec3 horizontalDelta{velocity_.x * dt, 0.0f, velocity_.z * dt};
-    if (!TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
+    if (!movement::TryStepMove(world, position_, horizontalDelta, halfExtents, stepHeight))
     {
         const float previousX = position_.x;
         const float previousZ = position_.z;
-        if (!TryStepMove(world, position_, Vec3{horizontalDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{horizontalDelta.x, 0.0f, 0.0f}, halfExtents, stepHeight))
         {
             velocity_.x = 0.0f;
         }
-        if (!TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalDelta.z}, halfExtents, stepHeight))
+        if (!movement::TryStepMove(world, position_, Vec3{0.0f, 0.0f, horizontalDelta.z}, halfExtents, stepHeight))
         {
             velocity_.z = 0.0f;
         }
@@ -240,7 +136,7 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     if (wasGrounded && velocity_.y <= 0.0f)
     {
         Vec3 snappedPosition = position_;
-        if (SnapDownToGround(world, snappedPosition, halfExtents, stepHeight + world.CellSize() * 0.55f))
+        if (movement::SnapDownToGround(world, snappedPosition, halfExtents, stepHeight + world.CellSize() * 0.55f))
         {
             position_.y = snappedPosition.y;
         }
@@ -380,7 +276,7 @@ void PlayerController::Tick(const ControlState& input, const world::DemoWorld& w
     footSamples = sampleFeet(position_.y);
     applyFootSamples(footSamples, position_.y);
 
-    walkCycleRadians_ = WrapAngle(walkCycleRadians_ + HorizontalSpeedMetersPerSecond() * dt * (onGround_ ? 3.2f : 1.4f));
+    walkCycleRadians_ = movement::WrapAngleRadians(walkCycleRadians_ + HorizontalSpeedMetersPerSecond() * dt * (onGround_ ? 3.2f : 1.4f));
 }
 
 auto PlayerController::ForwardVector() const -> Vec3

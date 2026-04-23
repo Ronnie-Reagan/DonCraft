@@ -13,9 +13,12 @@ struct SessionRenderOptions
     bool thirdPerson = false;
     bool aimDownSights = false;
     float zoomMagnification = 3.5f;
-    float terrainDrawDistanceMeters = 500.0f;
+    float terrainDrawDistanceMeters = 800.0f;
     ToolType localTool = ToolType::Rifle;
     float localWeaponCycle = 0.0f;
+    bool buildWallMode = false;
+    std::uint8_t buildRotationQuarterTurns = 0u;
+    world::MaterialId buildMaterial = world::MaterialId::WoodPlanks;
 };
 
 [[nodiscard]] auto BuildRuntimeRenderData(

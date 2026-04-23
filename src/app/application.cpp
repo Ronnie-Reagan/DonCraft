@@ -16,7 +16,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
+#include <system_error>
 #include <thread>
 
 namespace df
@@ -25,6 +27,25 @@ namespace
 {
 constexpr float kMinimumRenderDistanceMeters = 100.0f;
 constexpr float kMaximumRenderDistanceMeters = 5000.0f;
+constexpr int kMainMenuWorldSlotRow = 0;
+constexpr int kMainMenuContinueOfflineRow = 1;
+constexpr int kMainMenuNewOfflineRow = 2;
+constexpr int kMainMenuHostSetupRow = 3;
+constexpr int kMainMenuJoinWorldRow = 4;
+constexpr int kMainMenuQuitRow = 5;
+constexpr int kMainMenuRowCount = 6;
+constexpr int kHostSetupWorldSlotRow = 0;
+constexpr int kHostSetupStartModeRow = 1;
+constexpr int kHostSetupWorldWidthRow = 2;
+constexpr int kHostSetupWorldHeightRow = 3;
+constexpr int kHostSetupWorldDepthRow = 4;
+constexpr int kHostSetupActiveChunkRow = 5;
+constexpr int kHostSetupCellScaleRow = 6;
+constexpr int kHostSetupSeedRow = 7;
+constexpr int kHostSetupReliefRow = 8;
+constexpr int kHostSetupWaterLevelRow = 9;
+constexpr int kHostSetupStartHostingRow = 10;
+constexpr int kHostSetupRowCount = 11;
 
 auto FormatFloat(const float value, const int decimals = 1) -> std::string
 {
@@ -49,6 +70,16 @@ auto LocalWeaponCycleDecayRate(const game::ToolType tool) -> float
     return game::GetWeaponDefinition(tool).weaponCycleDecayRate;
 }
 
+auto ShouldRestartLocalWeaponCycle(const game::PlayerCommandFrame& command, const float localWeaponCycle) -> bool
+{
+    const game::WeaponDefinition selectedWeapon = game::GetWeaponDefinition(command.selectedTool);
+    const bool repeatingToolAction =
+        command.primaryDown &&
+        localWeaponCycle <= 0.02f &&
+        (command.selectedTool == game::ToolType::Dig || (game::IsFirearmTool(command.selectedTool) && selectedWeapon.automatic));
+    return command.primaryPressed || command.quickGrenadePressed || repeatingToolAction;
+}
+
 auto ClampRenderDistanceMeters(const float meters) -> float
 {
     return Clamp(meters, kMinimumRenderDistanceMeters, kMaximumRenderDistanceMeters);
@@ -65,6 +96,63 @@ auto FindActorSnapshot(const net::ActorSnapshotFrame& frame, const game::PlayerI
     }
 
     return nullptr;
+}
+
+struct AudioListenerState
+{
+    Vec3 position{};
+    Vec3 forward{0.0f, 0.0f, 1.0f};
+};
+
+auto BuildHostAudioListener(const net::SessionHost& hostSession, const game::PlayerId localPlayerId) -> AudioListenerState
+{
+    const game::SessionRuntime& runtime = hostSession.Runtime();
+    if (const game::SessionRuntime::PlayerState* const localPlayer = runtime.FindPlayer(localPlayerId))
+    {
+        if (localPlayer->drivingTruck)
+        {
+            return {
+                .position = runtime.Truck().CameraPosition(),
+                .forward = runtime.Truck().ForwardVector(),
+            };
+        }
+
+        return {
+            .position = localPlayer->controller.CameraPosition(),
+            .forward = localPlayer->controller.ForwardVector(),
+        };
+    }
+
+    return {};
+}
+
+auto BuildClientAudioListener(const net::SessionClient& client) -> AudioListenerState
+{
+    if (const game::PlayerController* const predictedPlayer = client.RenderedLocalPlayer())
+    {
+        return {
+            .position = predictedPlayer->CameraPosition(),
+            .forward = predictedPlayer->ForwardVector(),
+        };
+    }
+
+    if (const net::ActorSnapshot* const localActor = FindActorSnapshot(client.ActorFrame(), client.LocalPlayerId()))
+    {
+        if (localActor->drivingTruck)
+        {
+            return {
+                .position = client.ActorFrame().truck.position + Vec3{0.0f, 1.1f, 0.0f},
+                .forward = client.ActorFrame().truck.forward,
+            };
+        }
+
+        return {
+            .position = localActor->cameraPosition,
+            .forward = localActor->forward,
+        };
+    }
+
+    return {};
 }
 
 void AppendHolosightReticle(
@@ -113,6 +201,12 @@ auto HoveredMenuRow(
 
     const int rowIndex = static_cast<int>((input.mouseY - (rowStartY - 4.0f)) / rowHeight);
     return rowIndex >= 0 && rowIndex < rowCount ? rowIndex : -1;
+}
+
+bool PathExistsNoThrow(const std::filesystem::path& path)
+{
+    std::error_code existsError;
+    return std::filesystem::exists(path, existsError) && !existsError;
 }
 
 void AppendScopeOverlay(
@@ -224,27 +318,59 @@ int Application::Run()
             const ScopedProfileSection scope(&frameProfiler_, "Audio Update");
             if (hostSessionActive_)
             {
+                const AudioListenerState listener = BuildHostAudioListener(hostSession_, localPlayerId_);
+                audio_.SetListener(listener.position, listener.forward);
                 for (const game::SessionRuntime::AudioCue& cue : hostSession_.ConsumeAudioCues())
                 {
                     audio_.QueueCue({
+                        .position = cue.position,
                         .baseFrequency = cue.baseFrequency,
                         .durationSeconds = cue.durationSeconds,
                         .amplitude = cue.amplitude,
                         .noise = cue.noise,
                         .sweep = cue.sweep,
+                        .positional = true,
                     });
                 }
 
-                const bool engineActive = hostSession_.MutableRuntime().TruckDriverId() != game::kInvalidPlayerId ||
-                    hostSession_.MutableRuntime().Truck().SpeedMetersPerSecond() > 0.6f;
+                const game::SessionRuntime& runtime = hostSession_.Runtime();
+                const bool engineActive = runtime.TruckDriverId() != game::kInvalidPlayerId ||
+                    runtime.Truck().SpeedMetersPerSecond() > 0.6f;
                 audio_.SetEngineState(
-                    hostSession_.MutableRuntime().Truck().EngineLoad(),
-                    world::GetMaterialProperties(hostSession_.MutableRuntime().Truck().ContactMaterial()).wheelSink,
-                    engineActive);
+                    runtime.Truck().EngineLoad(),
+                    world::GetMaterialProperties(runtime.Truck().ContactMaterial()).wheelSink,
+                    engineActive,
+                    runtime.Truck().Position());
+            }
+            else if (clientSessionActive_)
+            {
+                const AudioListenerState listener = BuildClientAudioListener(clientSession_);
+                audio_.SetListener(listener.position, listener.forward);
+                for (const net::AudioCueSnapshot& cue : clientSession_.ConsumeAudioCues())
+                {
+                    audio_.QueueCue({
+                        .position = cue.position,
+                        .baseFrequency = cue.baseFrequency,
+                        .durationSeconds = cue.durationSeconds,
+                        .amplitude = cue.amplitude,
+                        .noise = cue.noise,
+                        .sweep = cue.sweep,
+                        .positional = true,
+                    });
+                }
+
+                const net::ActorSnapshotFrame& actorFrame = clientSession_.ActorFrame();
+                const bool engineActive = actorFrame.truck.occupied || actorFrame.truck.speedMetersPerSecond > 0.6f;
+                audio_.SetEngineState(
+                    actorFrame.truck.engineLoad,
+                    world::GetMaterialProperties(actorFrame.truck.contactMaterial).wheelSink,
+                    engineActive,
+                    actorFrame.truck.position);
             }
             else
             {
-                audio_.SetEngineState(0.0f, 0.0f, false);
+                audio_.SetListener({}, Vec3{0.0f, 0.0f, 1.0f});
+                audio_.SetEngineState(0.0f, 0.0f, false, {});
             }
         }
 
@@ -278,7 +404,7 @@ int Application::Run()
                 drawableWidth,
                 drawableHeight);
         }
-        else if (clientSessionActive_ && renderSessionState == ScreenState::ClientSession)
+        else if (clientSessionActive_ && renderSessionState == ScreenState::ClientSession && clientSession_.IsReady())
         {
             renderData = game::BuildClientRenderData(
                 clientSession_,
@@ -362,7 +488,7 @@ void Application::HandleFrameInput(const platform::InputState& input, bool& runn
 
     if (sessionMenuOpen_)
     {
-        HandleSessionOverlayInput(input);
+        HandleSessionOverlayInput(input, running);
     }
 
     const bool gameplayInputEnabled =
@@ -385,7 +511,7 @@ void Application::TickSimulation(const double dt)
 
     if (hostSessionActive_ && (activeSessionState == ScreenState::OfflineSession || activeSessionState == ScreenState::ListenSession))
     {
-        static_cast<void>(hostSession_.MutableRuntime().SubmitCommand(localPlayerId_, ConsumeLocalCommandForTick()));
+        static_cast<void>(hostSession_.MutableRuntime().SubmitCommand(localPlayerId_, ConsumeLocalCommandForTick(static_cast<float>(dt))));
         if (!(activeSessionState == ScreenState::OfflineSession && sessionMenuOpen_))
         {
             hostSession_.Tick(static_cast<float>(dt));
@@ -395,7 +521,7 @@ void Application::TickSimulation(const double dt)
 
     if (clientSessionActive_ && activeSessionState == ScreenState::ClientSession)
     {
-        clientSession_.Tick(static_cast<float>(dt), ConsumeLocalCommandForTick());
+        clientSession_.Tick(static_cast<float>(dt), ConsumeLocalCommandForTick(static_cast<float>(dt)));
         if (clientSession_.Disconnected())
         {
             const std::string disconnectText = clientSession_.LastDisconnectText();
@@ -495,6 +621,10 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
     {
         selectedTool_ = game::ToolType::Smg;
     }
+    if (input.KeyPressed(SDL_SCANCODE_5))
+    {
+        selectedTool_ = game::ToolType::Build;
+    }
     if (input.KeyPressed(SDL_SCANCODE_F2))
     {
         renderOptions_.showActiveChunks = !renderOptions_.showActiveChunks;
@@ -508,6 +638,10 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
         renderOptions_.thirdPerson = !renderOptions_.thirdPerson;
     }
     const game::WeaponDefinition selectedWeapon = game::GetWeaponDefinition(selectedTool_);
+    if (selectedTool_ == game::ToolType::Build && input.KeyPressed(SDL_SCANCODE_R))
+    {
+        buildRotationQuarterTurns_ = static_cast<std::uint8_t>((buildRotationQuarterTurns_ + 1u) & 3u);
+    }
     if (selectedWeapon.usesScope &&
         (input.KeyDown(SDL_SCANCODE_LCTRL) || input.KeyDown(SDL_SCANCODE_RCTRL)) &&
         std::abs(input.mouseWheelY) > 0.0f)
@@ -525,40 +659,64 @@ void Application::BuildLocalCommand(const platform::InputState& input, const boo
     localCommand_.control.moveRight = input.KeyDown(SDL_SCANCODE_D);
     localCommand_.control.sprint = input.KeyDown(SDL_SCANCODE_LSHIFT) || input.KeyDown(SDL_SCANCODE_RSHIFT);
     localCommand_.primaryDown = input.MouseDown(SDL_BUTTON_LEFT);
-    localCommand_.secondaryDown = input.MouseDown(SDL_BUTTON_RIGHT) && selectedWeapon.supportsAds;
-    renderOptions_.aimDownSights = localCommand_.secondaryDown;
+    localCommand_.secondaryDown = input.MouseDown(SDL_BUTTON_RIGHT) && (selectedWeapon.supportsAds || selectedTool_ == game::ToolType::Build);
+    renderOptions_.aimDownSights = selectedWeapon.supportsAds && localCommand_.secondaryDown;
     renderOptions_.localTool = selectedTool_;
+    renderOptions_.buildWallMode = selectedTool_ == game::ToolType::Build && localCommand_.secondaryDown;
+    renderOptions_.buildRotationQuarterTurns = buildRotationQuarterTurns_;
+    renderOptions_.buildMaterial = world::MaterialId::WoodPlanks;
 
     pendingLookYawDelta_ += input.mouseDeltaX;
     pendingLookPitchDelta_ += input.mouseDeltaY;
-    pendingJumpPressed_ = pendingJumpPressed_ || input.KeyPressed(SDL_SCANCODE_SPACE);
-    pendingPrimaryPressed_ = pendingPrimaryPressed_ || input.MousePressed(SDL_BUTTON_LEFT);
-    pendingQuickGrenadePressed_ = pendingQuickGrenadePressed_ || input.KeyPressed(SDL_SCANCODE_G);
-    pendingInteractPressed_ = pendingInteractPressed_ || input.KeyPressed(SDL_SCANCODE_E);
-    pendingReloadPressed_ = pendingReloadPressed_ || input.KeyPressed(SDL_SCANCODE_R);
-    localWeaponCycle_ = std::max(0.0f, localWeaponCycle_ - frameDeltaSeconds_ * LocalWeaponCycleDecayRate(selectedTool_));
-    const bool repeatingToolAction =
-        localCommand_.primaryDown &&
-        localWeaponCycle_ <= 0.02f &&
-        (selectedTool_ == game::ToolType::Dig || (game::IsFirearmTool(selectedTool_) && selectedWeapon.automatic));
-    if (pendingPrimaryPressed_ || pendingQuickGrenadePressed_ || repeatingToolAction)
+    cumulativeLookYawDelta_ += input.mouseDeltaX;
+    cumulativeLookPitchDelta_ += input.mouseDeltaY;
+    if (input.KeyPressed(SDL_SCANCODE_SPACE))
     {
-        localWeaponCycle_ = 1.0f;
+        pendingJumpPressed_ = true;
+        ++jumpPressCount_;
+    }
+    if (input.MousePressed(SDL_BUTTON_LEFT))
+    {
+        pendingPrimaryPressed_ = true;
+        ++primaryPressCount_;
+    }
+    if (input.KeyPressed(SDL_SCANCODE_G))
+    {
+        pendingQuickGrenadePressed_ = true;
+        ++quickGrenadePressCount_;
+    }
+    if (input.KeyPressed(SDL_SCANCODE_E))
+    {
+        pendingInteractPressed_ = true;
+        ++interactPressCount_;
+    }
+    if (input.KeyPressed(SDL_SCANCODE_R))
+    {
+        pendingReloadPressed_ = true;
+        ++reloadPressCount_;
     }
     renderOptions_.localWeaponCycle = localWeaponCycle_;
 }
 
-auto Application::ConsumeLocalCommandForTick() -> game::PlayerCommandFrame
+auto Application::ConsumeLocalCommandForTick(const float dt) -> game::PlayerCommandFrame
 {
     game::PlayerCommandFrame command = localCommand_;
     command.sequence = ++localCommandSequence_;
     command.control.lookYawDelta = pendingLookYawDelta_;
     command.control.lookPitchDelta = pendingLookPitchDelta_;
+    command.cumulativeLookYawDelta = cumulativeLookYawDelta_;
+    command.cumulativeLookPitchDelta = cumulativeLookPitchDelta_;
+    command.hasCumulativeLook = true;
     command.control.jumpPressed = pendingJumpPressed_;
     command.primaryPressed = pendingPrimaryPressed_;
     command.quickGrenadePressed = pendingQuickGrenadePressed_;
     command.interactPressed = pendingInteractPressed_;
     command.reloadPressed = pendingReloadPressed_;
+    command.jumpPressCount = jumpPressCount_;
+    command.primaryPressCount = primaryPressCount_;
+    command.quickGrenadePressCount = quickGrenadePressCount_;
+    command.interactPressCount = interactPressCount_;
+    command.reloadPressCount = reloadPressCount_;
 
     pendingLookYawDelta_ = 0.0f;
     pendingLookPitchDelta_ = 0.0f;
@@ -567,6 +725,12 @@ auto Application::ConsumeLocalCommandForTick() -> game::PlayerCommandFrame
     pendingQuickGrenadePressed_ = false;
     pendingInteractPressed_ = false;
     pendingReloadPressed_ = false;
+    localWeaponCycle_ = std::max(0.0f, localWeaponCycle_ - dt * LocalWeaponCycleDecayRate(command.selectedTool));
+    if (ShouldRestartLocalWeaponCycle(command, localWeaponCycle_))
+    {
+        localWeaponCycle_ = 1.0f;
+    }
+    renderOptions_.localWeaponCycle = localWeaponCycle_;
     return command;
 }
 
@@ -582,8 +746,22 @@ void Application::ClearLocalCommandState()
     pendingReloadPressed_ = false;
     renderOptions_.aimDownSights = false;
     renderOptions_.localTool = selectedTool_;
-    localWeaponCycle_ = std::max(0.0f, localWeaponCycle_ - frameDeltaSeconds_ * LocalWeaponCycleDecayRate(selectedTool_));
     renderOptions_.localWeaponCycle = localWeaponCycle_;
+    renderOptions_.buildWallMode = selectedTool_ == game::ToolType::Build;
+    renderOptions_.buildRotationQuarterTurns = buildRotationQuarterTurns_;
+    renderOptions_.buildMaterial = world::MaterialId::WoodPlanks;
+}
+
+void Application::ResetLocalInputEdgeCounters()
+{
+    jumpPressCount_ = 0;
+    primaryPressCount_ = 0;
+    quickGrenadePressCount_ = 0;
+    interactPressCount_ = 0;
+    reloadPressCount_ = 0;
+    cumulativeLookYawDelta_ = 0.0f;
+    cumulativeLookPitchDelta_ = 0.0f;
+    localCommandSequence_ = 0;
 }
 
 void Application::ResetActiveSessions()
@@ -599,6 +777,9 @@ void Application::ResetActiveSessions()
         hostSessionActive_ = false;
     }
     pendingListenJoin_.reset();
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
+    sessionMenuDragItem_ = -1;
 }
 
 void Application::QueueListenJoin(
@@ -624,6 +805,8 @@ void Application::QueueListenJoin(
     browserReturnState_.reset();
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
     sessionMenuDragItem_ = -1;
     LogInfo(
         "Application queued listen join lobby_id=", lobbyId,
@@ -645,11 +828,15 @@ bool Application::StartClientSessionWithTransport(std::unique_ptr<steam::SteamSo
     hostSessionActive_ = false;
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
     sessionMenuDragItem_ = -1;
     screenState_ = ScreenState::ClientSession;
     browserReturnState_.reset();
     renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
+    buildRotationQuarterTurns_ = 0u;
+    ResetLocalInputEdgeCounters();
     ClearLocalCommandState();
     statusText_ = std::string(statusText);
     return true;
@@ -699,16 +886,109 @@ void Application::CompletePendingListenJoin()
     (void)StartClientSessionWithTransport(std::move(transport), "CONNECTING TO LISTEN HOST");
 }
 
-void Application::StartOfflineSession()
+auto Application::WorldSavePath(const int slot) const -> std::filesystem::path
 {
+    return userDataPath_ / "worlds" / (std::string("world_") + std::to_string(std::max(1, slot)) + ".bin");
+}
+
+bool Application::WorldSaveExists(const int slot) const
+{
+    std::error_code existsError;
+    const int clampedSlot = std::max(1, slot);
+    const bool saveExists = std::filesystem::exists(WorldSavePath(clampedSlot), existsError);
+    if (existsError)
+    {
+        LogWarning(
+            "Could not inspect world slot ", clampedSlot,
+            " path='", WorldSavePath(clampedSlot).string(),
+            "' error='", existsError.message(), "'");
+        return false;
+    }
+    if (saveExists || clampedSlot != 1)
+    {
+        return saveExists;
+    }
+
+    return PathExistsNoThrow(userDataPath_ / "offline_world.bin") || PathExistsNoThrow(userDataPath_ / "listen_world.bin");
+}
+
+auto Application::ResolveWorldSavePathForStart(const int slot, const bool createNewWorld, const bool listenSession) const -> std::filesystem::path
+{
+    const std::filesystem::path savePath = WorldSavePath(slot);
+    if (createNewWorld || std::max(1, slot) != 1 || PathExistsNoThrow(savePath))
+    {
+        return savePath;
+    }
+
+    const std::array<std::filesystem::path, 2> legacyPaths = listenSession
+        ? std::array<std::filesystem::path, 2>{userDataPath_ / "listen_world.bin", userDataPath_ / "offline_world.bin"}
+        : std::array<std::filesystem::path, 2>{userDataPath_ / "offline_world.bin", userDataPath_ / "listen_world.bin"};
+    for (const std::filesystem::path& legacyPath : legacyPaths)
+    {
+        if (!PathExistsNoThrow(legacyPath))
+        {
+            continue;
+        }
+
+        std::error_code createError;
+        std::filesystem::create_directories(savePath.parent_path(), createError);
+        if (createError)
+        {
+            LogWarning(
+                "Could not prepare world slot migration directory path='", savePath.parent_path().string(),
+                "' error='", createError.message(),
+                "'. Loading legacy save path='", legacyPath.string(), "'.");
+            return legacyPath;
+        }
+
+        std::error_code copyError;
+        std::filesystem::copy_file(legacyPath, savePath, std::filesystem::copy_options::none, copyError);
+        if (!copyError)
+        {
+            LogInfo("Migrated legacy world save path='", legacyPath.string(), "' to slot path='", savePath.string(), "'.");
+            return savePath;
+        }
+
+        LogWarning(
+            "Could not migrate legacy world save path='", legacyPath.string(),
+            "' to slot path='", savePath.string(),
+            "' error='", copyError.message(),
+            "'. Loading legacy save in place.");
+        return legacyPath;
+    }
+
+    return savePath;
+}
+
+auto Application::ResolveWorldSlotForStart(const bool createNewWorld) -> int
+{
+    selectedWorldSlot_ = std::max(1, selectedWorldSlot_);
+    if (!createNewWorld)
+    {
+        return selectedWorldSlot_;
+    }
+
+    int slot = selectedWorldSlot_;
+    while (slot < std::numeric_limits<int>::max() && WorldSaveExists(slot))
+    {
+        ++slot;
+    }
+    selectedWorldSlot_ = std::max(1, slot);
+    return selectedWorldSlot_;
+}
+
+void Application::StartOfflineSession(const bool createNewWorld)
+{
+    const int worldSlot = ResolveWorldSlotForStart(createNewWorld);
     ResetActiveSessions();
     steam_.LeaveLobby();
 
     net::SessionHost::Config config{};
     config.runtime.mode = game::SessionMode::Offline;
-    config.runtime.sessionName = "Offline Frontier";
-    config.runtime.savePath = userDataPath_ / "offline_world.bin";
+    config.runtime.sessionName = std::string("Offline World ") + std::to_string(worldSlot);
+    config.runtime.savePath = ResolveWorldSavePathForStart(worldSlot, createNewWorld, false);
     config.runtime.generationSettings = pendingWorldSettings_;
+    config.runtime.loadExistingWorld = !createNewWorld;
     config.localHostPlayerId = localPlayerId_;
     config.localHostPlayerName = playerName_;
     try
@@ -725,17 +1005,22 @@ void Application::StartOfflineSession()
     clientSessionActive_ = false;
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
     sessionMenuDragItem_ = -1;
     screenState_ = ScreenState::OfflineSession;
     pendingWorldSettings_ = hostSession_.MutableRuntime().World().GenerationSettings();
     renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
+    buildRotationQuarterTurns_ = 0u;
+    ResetLocalInputEdgeCounters();
     ClearLocalCommandState();
-    statusText_ = "OFFLINE SESSION";
+    statusText_ = std::string(createNewWorld ? "NEW OFFLINE WORLD " : "OFFLINE WORLD ") + std::to_string(worldSlot);
 }
 
-void Application::StartListenSession()
+void Application::StartListenSession(const bool createNewWorld)
 {
+    const int worldSlot = ResolveWorldSlotForStart(createNewWorld);
     ResetActiveSessions();
     steam_.LeaveLobby();
 
@@ -748,9 +1033,10 @@ void Application::StartListenSession()
 
     net::SessionHost::Config config{};
     config.runtime.mode = game::SessionMode::ListenHost;
-    config.runtime.sessionName = "Self Hosted Frontier";
-    config.runtime.savePath = userDataPath_ / "listen_world.bin";
+    config.runtime.sessionName = std::string("Self Hosted World ") + std::to_string(worldSlot);
+    config.runtime.savePath = ResolveWorldSavePathForStart(worldSlot, createNewWorld, true);
     config.runtime.generationSettings = pendingWorldSettings_;
+    config.runtime.loadExistingWorld = !createNewWorld;
     config.localHostPlayerId = localPlayerId_;
     config.localHostPlayerName = playerName_;
     try
@@ -767,11 +1053,15 @@ void Application::StartListenSession()
     clientSessionActive_ = false;
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
     sessionMenuDragItem_ = -1;
     screenState_ = ScreenState::ListenSession;
     pendingWorldSettings_ = hostSession_.MutableRuntime().World().GenerationSettings();
     renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
+    buildRotationQuarterTurns_ = 0u;
+    ResetLocalInputEdgeCounters();
     ClearLocalCommandState();
     steam_.CreateLobby(config.runtime.sessionName, "SELF HOSTED WORLD", config.runtime.maxPlayers);
     statusText_ = "CREATING LISTEN LOBBY";
@@ -815,12 +1105,16 @@ void Application::DisconnectToMenu(const std::string_view statusText)
     ResetActiveSessions();
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
     sessionMenuDragItem_ = -1;
     steam_.LeaveLobby();
     browserReturnState_.reset();
     platform_->SetRelativeMouseMode(false);
     renderOptions_.zoomMagnification = game::GetWeaponDefinition(game::ToolType::Rifle).defaultZoomMagnification;
     localWeaponCycle_ = 0.0f;
+    buildRotationQuarterTurns_ = 0u;
+    ResetLocalInputEdgeCounters();
     ClearLocalCommandState();
     screenState_ = ScreenState::MainMenu;
     statusText_ = std::string(statusText);
@@ -837,6 +1131,8 @@ void Application::ApplyPendingWorldSettings()
     pendingWorldSettings_ = hostSession_.MutableRuntime().World().GenerationSettings();
     sessionMenuOpen_ = false;
     sessionMenuSelection_ = 0;
+    mainMenuDragItem_ = -1;
+    hostSetupDragItem_ = -1;
     sessionMenuDragItem_ = -1;
     statusText_ = "WORLD REBUILT";
 }
@@ -909,7 +1205,10 @@ void Application::BuildOverlay(render::FrameRenderData& renderData, const platfo
         {
             const net::ActorSnapshotFrame hudFrame =
                 clientSession_.BuildRenderActorFrame(static_cast<float>(fixedStepClock_.InterpolationAlpha()));
-            if (const net::ActorSnapshot* const actor = FindActorSnapshot(hudFrame, localPlayerId_))
+            const game::PlayerId clientLocalPlayerId = clientSession_.LocalPlayerId();
+            if (const net::ActorSnapshot* const actor = FindActorSnapshot(
+                    hudFrame,
+                    clientLocalPlayerId != game::kInvalidPlayerId ? clientLocalPlayerId : localPlayerId_))
             {
                 hudTool = actor->tool;
                 ammoInMagazine = actor->ammoInMagazine;
@@ -930,6 +1229,30 @@ void Application::BuildOverlay(render::FrameRenderData& renderData, const platfo
             MakeColor(0.84f, 0.90f, 0.96f, 1.0f),
             screenWidth,
             screenHeight);
+
+        if (hudTool == game::ToolType::Build)
+        {
+            const std::string modeLabel = renderOptions_.buildWallMode ? "WALL" : "FLOOR";
+            const std::string rotationLabel = std::to_string(static_cast<int>(buildRotationQuarterTurns_) * 90);
+            game::AppendText(
+                renderData.overlayTriangles,
+                28.0f,
+                154.0f,
+                1.8f,
+                std::string("BUILD ") + std::string(world::ToString(renderOptions_.buildMaterial)) + "  MODE " + modeLabel + "  ROT " + rotationLabel,
+                MakeColor(0.74f, 0.95f, 0.82f, 1.0f),
+                screenWidth,
+                screenHeight);
+            game::AppendText(
+                renderData.overlayTriangles,
+                28.0f,
+                172.0f,
+                1.6f,
+                "LMB PLACE  RMB WALL  R ROTATE",
+                MakeColor(0.80f, 0.86f, 0.92f, 1.0f),
+                screenWidth,
+                screenHeight);
+        }
 
         if (hudWeapon.usesMagazine && ammoInMagazine >= 0)
         {
@@ -1012,15 +1335,18 @@ void Application::BuildMainMenu(std::vector<render::ColorVertex2D>& overlayTrian
     const auto [width, height] = platform_->DrawableSize();
     const float screenWidth = static_cast<float>(width);
     const float screenHeight = static_cast<float>(height);
-    const float panelX = screenWidth * 0.5f - 280.0f;
-    const float panelY = screenHeight * 0.5f - 120.0f;
+    const float panelX = screenWidth * 0.5f - 310.0f;
+    const float panelY = screenHeight * 0.5f - 160.0f;
+    const bool selectedSlotHasSave = WorldSaveExists(selectedWorldSlot_);
 
-    game::AppendRect(overlayTriangles, panelX, panelY, 560.0f, 260.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
+    game::AppendRect(overlayTriangles, panelX, panelY, 620.0f, 326.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
     game::AppendText(overlayTriangles, panelX + 24.0f, panelY + 24.0f, 2.4f, "DEFORM FRONTIER", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-    const std::array<std::string, 4> items = {
-        "CONTINUE OFFLINE",
-        "HOST SELF HOSTED WORLD",
+    const std::array<std::string, kMainMenuRowCount> items = {
+        std::string("WORLD SLOT ") + std::to_string(selectedWorldSlot_) + (selectedSlotHasSave ? "  SAVED" : "  EMPTY"),
+        std::string("CONTINUE OFFLINE SLOT ") + std::to_string(selectedWorldSlot_),
+        "NEW OFFLINE WORLD",
+        "HOST SELF-HOSTED WORLD",
         "JOIN WORLD",
         "QUIT",
     };
@@ -1029,7 +1355,7 @@ void Application::BuildMainMenu(std::vector<render::ColorVertex2D>& overlayTrian
     {
         if (index == mainMenuSelection_)
         {
-            game::AppendRect(overlayTriangles, panelX + 18.0f, rowY - 4.0f, 524.0f, 24.0f, MakeColor(0.20f, 0.28f, 0.36f, 0.90f), screenWidth, screenHeight);
+            game::AppendRect(overlayTriangles, panelX + 18.0f, rowY - 4.0f, 584.0f, 24.0f, MakeColor(0.20f, 0.28f, 0.36f, 0.90f), screenWidth, screenHeight);
         }
         game::AppendText(
             overlayTriangles,
@@ -1042,6 +1368,16 @@ void Application::BuildMainMenu(std::vector<render::ColorVertex2D>& overlayTrian
             screenHeight);
         rowY += 28.0f;
     }
+
+    game::AppendText(
+        overlayTriangles,
+        panelX + 24.0f,
+        panelY + 282.0f,
+        1.6f,
+        "LEFT RIGHT OR DRAG WORLD SLOT  NEW PICKS THE NEXT EMPTY SLOT",
+        MakeColor(0.82f, 0.87f, 0.93f, 1.0f),
+        screenWidth,
+        screenHeight);
 }
 
 void Application::BuildHostSetupMenu(std::vector<render::ColorVertex2D>& overlayTriangles) const
@@ -1049,18 +1385,21 @@ void Application::BuildHostSetupMenu(std::vector<render::ColorVertex2D>& overlay
     const auto [width, height] = platform_->DrawableSize();
     const float screenWidth = static_cast<float>(width);
     const float screenHeight = static_cast<float>(height);
-    const float panelX = screenWidth * 0.5f - 320.0f;
-    const float panelY = screenHeight * 0.5f - 170.0f;
+    const float panelX = screenWidth * 0.5f - 350.0f;
+    const float panelY = screenHeight * 0.5f - 210.0f;
+    const bool selectedSlotHasSave = WorldSaveExists(selectedWorldSlot_);
 
-    game::AppendRect(overlayTriangles, panelX, panelY, 640.0f, 340.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
+    game::AppendRect(overlayTriangles, panelX, panelY, 700.0f, 420.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
     game::AppendText(overlayTriangles, panelX + 24.0f, panelY + 24.0f, 2.2f, "HOST WORLD SETUP", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-    const std::array<std::string, 9> rows = {
-        std::string("WORLD WIDTH ") + std::to_string(pendingWorldSettings_.worldWidth),
-        std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight),
-        std::string("WORLD DEPTH ") + std::to_string(pendingWorldSettings_.worldDepth),
-        std::string("ACTIVE CHUNK ") + std::to_string(pendingWorldSettings_.activeChunkSize),
-        std::string("CELL SCALE ") + FormatFloat(pendingWorldSettings_.cellSize, 2),
+    const std::array<std::string, kHostSetupRowCount> rows = {
+        std::string("WORLD SLOT ") + std::to_string(selectedWorldSlot_) + (selectedSlotHasSave ? "  SAVED" : "  EMPTY"),
+        std::string("START MODE ") + (hostSetupCreateNewWorld_ ? "CREATE NEW WORLD" : "LOAD SAVED WORLD"),
+        std::string("WORLD WIDTH ") + std::to_string(pendingWorldSettings_.worldWidth) + " CELLS",
+        std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight) + " CELLS",
+        std::string("WORLD DEPTH ") + std::to_string(pendingWorldSettings_.worldDepth) + " CELLS",
+        std::string("ACTIVE CHUNK ") + std::to_string(pendingWorldSettings_.activeChunkSize) + " CELLS",
+        std::string("CELL SCALE ") + FormatFloat(pendingWorldSettings_.cellSize, 2) + " M",
         std::string("SEED ") + std::to_string(pendingWorldSettings_.seed),
         std::string("RELIEF ") + FormatFloat(pendingWorldSettings_.terrainRelief, 2),
         std::string("WATER LEVEL ") + FormatFloat(pendingWorldSettings_.waterLevel, 2),
@@ -1072,7 +1411,7 @@ void Application::BuildHostSetupMenu(std::vector<render::ColorVertex2D>& overlay
     {
         if (index == hostSetupSelection_)
         {
-            game::AppendRect(overlayTriangles, panelX + 18.0f, rowY - 4.0f, 604.0f, 24.0f, MakeColor(0.20f, 0.28f, 0.36f, 0.90f), screenWidth, screenHeight);
+            game::AppendRect(overlayTriangles, panelX + 18.0f, rowY - 4.0f, 664.0f, 24.0f, MakeColor(0.20f, 0.28f, 0.36f, 0.90f), screenWidth, screenHeight);
         }
         game::AppendText(
             overlayTriangles,
@@ -1085,6 +1424,25 @@ void Application::BuildHostSetupMenu(std::vector<render::ColorVertex2D>& overlay
             screenHeight);
         rowY += 28.0f;
     }
+
+    game::AppendText(
+        overlayTriangles,
+        panelX + 24.0f,
+        panelY + 376.0f,
+        1.6f,
+        "LEFT RIGHT OR DRAG VALUES  SHIFT COARSE  ENTER OR CLICK TO ACTIVATE",
+        MakeColor(0.82f, 0.87f, 0.93f, 1.0f),
+        screenWidth,
+        screenHeight);
+    game::AppendText(
+        overlayTriangles,
+        panelX + 24.0f,
+        panelY + 396.0f,
+        1.6f,
+        "LOAD RESUMES THE SLOT IF SAVED; CREATE NEW USES THESE SETTINGS",
+        MakeColor(0.82f, 0.87f, 0.93f, 1.0f),
+        screenWidth,
+        screenHeight);
 }
 
 void Application::BuildBrowserMenu(std::vector<render::ColorVertex2D>& overlayTriangles) const
@@ -1140,7 +1498,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
     if (screenState_ == ScreenState::OfflineSession)
     {
         const float panelWidth = 660.0f;
-        const float panelHeight = 380.0f;
+        const float panelHeight = 428.0f;
         const float panelX = screenWidth * 0.5f - panelWidth * 0.5f;
         const float panelY = screenHeight * 0.5f - panelHeight * 0.5f;
 
@@ -1148,7 +1506,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
         game::AppendRect(overlayTriangles, panelX + 14.0f, panelY + 14.0f, panelWidth - 28.0f, 30.0f, MakeColor(0.12f, 0.15f, 0.20f, 0.95f), screenWidth, screenHeight);
         game::AppendText(overlayTriangles, panelX + 28.0f, panelY + 24.0f, 2.0f, "PAUSE MENU", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-        const std::array<std::string, 12> rows = {
+        const std::array<std::string, 14> rows = {
             "RESUME",
             std::string("WORLD WIDTH ") + std::to_string(pendingWorldSettings_.worldWidth) + " CELLS",
             std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight) + " CELLS",
@@ -1161,6 +1519,8 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
             std::string("DRAW DIST ") + FormatFloat(renderOptions_.terrainDrawDistanceMeters, 0) + " M",
             std::string("TARGET FPS ") + std::to_string(targetFrameRate_),
             "APPLY REBUILD",
+            "MAIN MENU",
+            "QUIT GAME",
         };
 
         float rowY = panelY + 58.0f;
@@ -1196,7 +1556,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
             panelX + 28.0f,
             panelY + panelHeight - 24.0f,
             1.7f,
-            "CLICK RESUME/APPLY  ENTER APPLY  ESC CLOSE",
+            "CLICK OR ENTER TO ACTIVATE  ESC CLOSE",
             MakeColor(0.84f, 0.88f, 0.93f, 1.0f),
             screenWidth,
             screenHeight);
@@ -1204,17 +1564,18 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
     }
 
     const float panelX = screenWidth * 0.5f - 260.0f;
-    const float panelY = screenHeight * 0.5f - 126.0f;
-    game::AppendRect(overlayTriangles, panelX, panelY, 520.0f, 252.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
+    const float panelY = screenHeight * 0.5f - 154.0f;
+    game::AppendRect(overlayTriangles, panelX, panelY, 520.0f, 308.0f, MakeColor(0.08f, 0.09f, 0.12f, 0.92f), screenWidth, screenHeight);
     game::AppendText(overlayTriangles, panelX + 24.0f, panelY + 24.0f, 2.2f, "SESSION MENU", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-    const std::array<std::string, 6> rows = {
+    const std::array<std::string, 7> rows = {
         "RESUME",
         std::string("DRAW DIST ") + FormatFloat(renderOptions_.terrainDrawDistanceMeters, 0) + " M",
         "INVITE OR BROWSE",
         "SAVE WORLD",
         "RESTART WORLD",
-        "DISCONNECT",
+        "MAIN MENU",
+        "QUIT GAME",
     };
     float rowY = panelY + 72.0f;
     for (int index = 0; index < static_cast<int>(rows.size()); ++index)
@@ -1238,7 +1599,7 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
     game::AppendText(
         overlayTriangles,
         panelX + 24.0f,
-        panelY + 220.0f,
+        panelY + 276.0f,
         1.6f,
         "LEFT RIGHT OR DRAG DRAW DISTANCE",
         MakeColor(0.82f, 0.87f, 0.93f, 1.0f),
@@ -1249,9 +1610,9 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
 void Application::HandleMainMenuInput(const platform::InputState& input, bool& running)
 {
     const auto [width, height] = platform_->DrawableSize();
-    const float panelX = static_cast<float>(width) * 0.5f - 280.0f;
-    const float panelY = static_cast<float>(height) * 0.5f - 120.0f;
-    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 78.0f, 524.0f, 28.0f, 4);
+    const float panelX = static_cast<float>(width) * 0.5f - 310.0f;
+    const float panelY = static_cast<float>(height) * 0.5f - 160.0f;
+    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 78.0f, 584.0f, 28.0f, kMainMenuRowCount);
     if (hoveredRow >= 0)
     {
         mainMenuSelection_ = hoveredRow;
@@ -1259,11 +1620,47 @@ void Application::HandleMainMenuInput(const platform::InputState& input, bool& r
 
     if (input.KeyPressed(SDL_SCANCODE_UP))
     {
-        mainMenuSelection_ = (mainMenuSelection_ + 3) % 4;
+        mainMenuSelection_ = (mainMenuSelection_ + kMainMenuRowCount - 1) % kMainMenuRowCount;
     }
     if (input.KeyPressed(SDL_SCANCODE_DOWN))
     {
-        mainMenuSelection_ = (mainMenuSelection_ + 1) % 4;
+        mainMenuSelection_ = (mainMenuSelection_ + 1) % kMainMenuRowCount;
+    }
+
+    const auto adjustWorldSlot = [&](const float scalar)
+    {
+        if (std::abs(scalar) <= 1.0e-4f)
+        {
+            return;
+        }
+
+        const int direction = scalar >= 0.0f ? 1 : -1;
+        const int magnitude = std::max(1, static_cast<int>(std::round(std::abs(scalar))));
+        selectedWorldSlot_ = std::max(1, selectedWorldSlot_ + direction * magnitude);
+    };
+
+    if ((input.KeyPressed(SDL_SCANCODE_LEFT) || input.KeyPressed(SDL_SCANCODE_RIGHT)) && mainMenuSelection_ == kMainMenuWorldSlotRow)
+    {
+        adjustWorldSlot(input.KeyPressed(SDL_SCANCODE_RIGHT) ? 1.0f : -1.0f);
+    }
+
+    if (input.MousePressed(SDL_BUTTON_LEFT))
+    {
+        mainMenuDragItem_ = -1;
+        if (hoveredRow == kMainMenuWorldSlotRow)
+        {
+            mainMenuDragItem_ = hoveredRow;
+            return;
+        }
+    }
+
+    if (!input.MouseDown(SDL_BUTTON_LEFT))
+    {
+        mainMenuDragItem_ = -1;
+    }
+    else if (mainMenuDragItem_ == kMainMenuWorldSlotRow && std::abs(input.mouseDeltaX) > 0.0f)
+    {
+        adjustWorldSlot(input.mouseDeltaX * 0.12f);
     }
 
     const bool activate = input.KeyPressed(SDL_SCANCODE_RETURN) || (hoveredRow >= 0 && input.MousePressed(SDL_BUTTON_LEFT));
@@ -1274,20 +1671,27 @@ void Application::HandleMainMenuInput(const platform::InputState& input, bool& r
 
     switch (mainMenuSelection_)
     {
-    case 0:
-        StartOfflineSession();
+    case kMainMenuContinueOfflineRow:
+        StartOfflineSession(false);
         break;
-    case 1:
+    case kMainMenuNewOfflineRow:
+        StartOfflineSession(true);
+        break;
+    case kMainMenuHostSetupRow:
         screenState_ = ScreenState::HostSetup;
+        hostSetupSelection_ = 0;
+        hostSetupDragItem_ = -1;
+        mainMenuDragItem_ = -1;
         statusText_ = "CONFIGURE HOST";
         break;
-    case 2:
+    case kMainMenuJoinWorldRow:
         steam_.RefreshBrowser();
         browserReturnState_.reset();
         screenState_ = ScreenState::Browser;
+        mainMenuDragItem_ = -1;
         statusText_ = "REFRESHING BROWSER";
         break;
-    case 3:
+    case kMainMenuQuitRow:
         running = false;
         break;
     default:
@@ -1300,13 +1704,14 @@ void Application::HandleHostSetupInput(const platform::InputState& input)
     if (input.KeyPressed(SDL_SCANCODE_ESCAPE))
     {
         screenState_ = ScreenState::MainMenu;
+        hostSetupDragItem_ = -1;
         return;
     }
 
     const auto [width, height] = platform_->DrawableSize();
-    const float panelX = static_cast<float>(width) * 0.5f - 320.0f;
-    const float panelY = static_cast<float>(height) * 0.5f - 170.0f;
-    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 72.0f, 604.0f, 28.0f, 9);
+    const float panelX = static_cast<float>(width) * 0.5f - 350.0f;
+    const float panelY = static_cast<float>(height) * 0.5f - 210.0f;
+    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 72.0f, 664.0f, 28.0f, kHostSetupRowCount);
     if (hoveredRow >= 0)
     {
         hostSetupSelection_ = hoveredRow;
@@ -1314,45 +1719,136 @@ void Application::HandleHostSetupInput(const platform::InputState& input)
 
     if (input.KeyPressed(SDL_SCANCODE_UP))
     {
-        hostSetupSelection_ = (hostSetupSelection_ + 8) % 9;
+        hostSetupSelection_ = (hostSetupSelection_ + kHostSetupRowCount - 1) % kHostSetupRowCount;
     }
     if (input.KeyPressed(SDL_SCANCODE_DOWN))
     {
-        hostSetupSelection_ = (hostSetupSelection_ + 1) % 9;
+        hostSetupSelection_ = (hostSetupSelection_ + 1) % kHostSetupRowCount;
     }
 
-    const auto adjust = [&](const float scalar)
+    const bool coarseAdjust = input.KeyDown(SDL_SCANCODE_LSHIFT) || input.KeyDown(SDL_SCANCODE_RSHIFT);
+    const auto adjustRow = [&](const int row, const float scalar)
     {
-        switch (hostSetupSelection_)
+        if (std::abs(scalar) <= 1.0e-4f)
         {
-        case 0: pendingWorldSettings_.worldWidth += static_cast<int>(scalar) * 4; break;
-        case 1: pendingWorldSettings_.worldHeight += static_cast<int>(scalar) * 2; break;
-        case 2: pendingWorldSettings_.worldDepth += static_cast<int>(scalar) * 4; break;
-        case 3: pendingWorldSettings_.activeChunkSize += static_cast<int>(scalar); break;
-        case 4: pendingWorldSettings_.cellSize += scalar * 0.01f; break;
-        case 5:
-            if (scalar > 0.0f) { pendingWorldSettings_.seed += static_cast<std::uint32_t>(scalar); }
-            else { pendingWorldSettings_.seed = pendingWorldSettings_.seed > 0u ? pendingWorldSettings_.seed - 1u : 0u; }
+            return;
+        }
+
+        const int direction = scalar >= 0.0f ? 1 : -1;
+        const int magnitude = std::max(1, static_cast<int>(std::round(std::abs(scalar))));
+        const int coarseMultiplier = coarseAdjust ? 4 : 1;
+        const auto quantized = [&](const int baseStep)
+        {
+            return direction * magnitude * baseStep * coarseMultiplier;
+        };
+
+        switch (row)
+        {
+        case kHostSetupWorldSlotRow:
+            selectedWorldSlot_ = std::max(1, selectedWorldSlot_ + quantized(1));
             break;
-        case 6: pendingWorldSettings_.terrainRelief += scalar * 0.02f; break;
-        case 7: pendingWorldSettings_.waterLevel += scalar * 0.01f; break;
-        default: break;
+        case kHostSetupStartModeRow:
+            hostSetupCreateNewWorld_ = !hostSetupCreateNewWorld_;
+            break;
+        case kHostSetupWorldWidthRow:
+            pendingWorldSettings_.worldWidth += quantized(4);
+            break;
+        case kHostSetupWorldHeightRow:
+            pendingWorldSettings_.worldHeight += quantized(2);
+            break;
+        case kHostSetupWorldDepthRow:
+            pendingWorldSettings_.worldDepth += quantized(4);
+            break;
+        case kHostSetupActiveChunkRow:
+            pendingWorldSettings_.activeChunkSize += quantized(1);
+            break;
+        case kHostSetupCellScaleRow:
+            pendingWorldSettings_.cellSize += scalar * (coarseAdjust ? 0.04f : 0.01f);
+            break;
+        case kHostSetupSeedRow:
+        {
+            const std::uint32_t amount = static_cast<std::uint32_t>(std::abs(quantized(1)));
+            if (direction > 0)
+            {
+                pendingWorldSettings_.seed += amount;
+            }
+            else
+            {
+                pendingWorldSettings_.seed = pendingWorldSettings_.seed > amount ? pendingWorldSettings_.seed - amount : 0u;
+            }
+            break;
+        }
+        case kHostSetupReliefRow:
+            pendingWorldSettings_.terrainRelief += scalar * (coarseAdjust ? 0.08f : 0.02f);
+            break;
+        case kHostSetupWaterLevelRow:
+            pendingWorldSettings_.waterLevel += scalar * (coarseAdjust ? 0.04f : 0.01f);
+            break;
+        default:
+            break;
         }
         pendingWorldSettings_ = world::DemoWorld::ClampGenerationSettings(pendingWorldSettings_);
     };
 
     if (input.KeyPressed(SDL_SCANCODE_LEFT))
     {
-        adjust(-1.0f);
+        adjustRow(hostSetupSelection_, -1.0f);
     }
     if (input.KeyPressed(SDL_SCANCODE_RIGHT))
     {
-        adjust(1.0f);
+        adjustRow(hostSetupSelection_, 1.0f);
     }
 
-    if ((input.KeyPressed(SDL_SCANCODE_RETURN) || (hoveredRow >= 0 && input.MousePressed(SDL_BUTTON_LEFT))) && hostSetupSelection_ == 8)
+    const auto rowIsDraggable = [](const int row)
     {
-        StartListenSession();
+        return row == kHostSetupWorldSlotRow || (row >= kHostSetupWorldWidthRow && row <= kHostSetupWaterLevelRow);
+    };
+
+    if (input.MousePressed(SDL_BUTTON_LEFT))
+    {
+        hostSetupDragItem_ = -1;
+        if (hoveredRow >= 0)
+        {
+            hostSetupSelection_ = hoveredRow;
+            if (hoveredRow == kHostSetupStartHostingRow)
+            {
+                StartListenSession(hostSetupCreateNewWorld_);
+                return;
+            }
+            if (hoveredRow == kHostSetupStartModeRow)
+            {
+                hostSetupCreateNewWorld_ = !hostSetupCreateNewWorld_;
+                return;
+            }
+            if (rowIsDraggable(hoveredRow))
+            {
+                hostSetupDragItem_ = hoveredRow;
+                return;
+            }
+        }
+    }
+
+    if (!input.MouseDown(SDL_BUTTON_LEFT))
+    {
+        hostSetupDragItem_ = -1;
+    }
+    else if (hostSetupDragItem_ >= 0 && std::abs(input.mouseDeltaX) > 0.0f)
+    {
+        adjustRow(hostSetupDragItem_, input.mouseDeltaX * 0.12f);
+    }
+
+    if (!input.KeyPressed(SDL_SCANCODE_RETURN))
+    {
+        return;
+    }
+
+    if (hostSetupSelection_ == kHostSetupStartHostingRow)
+    {
+        StartListenSession(hostSetupCreateNewWorld_);
+    }
+    else if (hostSetupSelection_ == kHostSetupStartModeRow)
+    {
+        hostSetupCreateNewWorld_ = !hostSetupCreateNewWorld_;
     }
 }
 
@@ -1404,7 +1900,7 @@ void Application::HandleBrowserInput(const platform::InputState& input)
     }
 }
 
-void Application::HandleSessionOverlayInput(const platform::InputState& input)
+void Application::HandleSessionOverlayInput(const platform::InputState& input, bool& running)
 {
     if (screenState_ == ScreenState::OfflineSession)
     {
@@ -1496,7 +1992,7 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
 
         const auto [width, height] = platform_->DrawableSize();
         const float panelX = static_cast<float>(width) * 0.5f - 330.0f;
-        const float panelY = static_cast<float>(height) * 0.5f - 190.0f;
+        const float panelY = static_cast<float>(height) * 0.5f - 214.0f;
         const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 58.0f, 624.0f, 24.0f, OfflinePauseItemCount());
         if (hoveredRow >= 0)
         {
@@ -1518,6 +2014,16 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
                 if (item == OfflinePauseItem::ApplyAndRebuild)
                 {
                     ApplyPendingWorldSettings();
+                    return;
+                }
+                if (item == OfflinePauseItem::MainMenu)
+                {
+                    DisconnectToMenu();
+                    return;
+                }
+                if (item == OfflinePauseItem::QuitGame)
+                {
+                    running = false;
                     return;
                 }
                 sessionMenuDragItem_ = hoveredRow;
@@ -1546,6 +2052,12 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
         case OfflinePauseItem::ApplyAndRebuild:
             ApplyPendingWorldSettings();
             break;
+        case OfflinePauseItem::MainMenu:
+            DisconnectToMenu();
+            break;
+        case OfflinePauseItem::QuitGame:
+            running = false;
+            break;
         default:
             break;
         }
@@ -1554,8 +2066,8 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
 
     const auto [width, height] = platform_->DrawableSize();
     const float panelX = static_cast<float>(width) * 0.5f - 260.0f;
-    const float panelY = static_cast<float>(height) * 0.5f - 126.0f;
-    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 72.0f, 484.0f, 28.0f, 6);
+    const float panelY = static_cast<float>(height) * 0.5f - 154.0f;
+    const int hoveredRow = HoveredMenuRow(input, panelX, panelY + 72.0f, 484.0f, 28.0f, 7);
     if (hoveredRow >= 0)
     {
         sessionMenuSelection_ = hoveredRow;
@@ -1578,11 +2090,11 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
 
     if (input.KeyPressed(SDL_SCANCODE_UP))
     {
-        sessionMenuSelection_ = (sessionMenuSelection_ + 5) % 6;
+        sessionMenuSelection_ = (sessionMenuSelection_ + 6) % 7;
     }
     if (input.KeyPressed(SDL_SCANCODE_DOWN))
     {
-        sessionMenuSelection_ = (sessionMenuSelection_ + 1) % 6;
+        sessionMenuSelection_ = (sessionMenuSelection_ + 1) % 7;
     }
     if ((input.KeyPressed(SDL_SCANCODE_LEFT) || input.KeyPressed(SDL_SCANCODE_RIGHT)) &&
         static_cast<SessionMenuItem>(sessionMenuSelection_) == SessionMenuItem::RenderDistance)
@@ -1652,8 +2164,11 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input)
             statusText_ = "WORLD RESTARTED";
         }
         break;
-    case SessionMenuItem::Disconnect:
+    case SessionMenuItem::MainMenu:
         DisconnectToMenu();
+        break;
+    case SessionMenuItem::QuitGame:
+        running = false;
         break;
     default:
         break;

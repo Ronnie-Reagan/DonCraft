@@ -12,6 +12,10 @@ namespace df::net
 {
 namespace
 {
+constexpr float kPredictionCorrectionSmoothingRate = 14.0f;
+constexpr float kMaximumSmoothedPredictionCorrection = 2.5f;
+constexpr double kRenderInterpolationDelayTicks = 8.0;
+
 auto SequenceGreaterThan(const std::uint32_t lhs, const std::uint32_t rhs) -> bool
 {
     return static_cast<std::int32_t>(lhs - rhs) > 0;
@@ -148,6 +152,7 @@ void SessionClient::ResetSessionState()
     serverPeerId_ = kInvalidPeerId;
     helloSent_ = false;
     worldReady_ = false;
+    actorSnapshotReady_ = false;
     localPlayerId_ = game::kInvalidPlayerId;
     sessionMode_ = game::SessionMode::Client;
     sessionName_.clear();
@@ -156,8 +161,12 @@ void SessionClient::ResetSessionState()
     actorFrame_ = {};
     actorHistory_ = {};
     actorHistoryCount_ = 0;
-    pendingCommands_ = {};
+    lastAudioCueServerTick_ = 0;
+    pendingAudioCues_.clear();
+    pendingCommands_.clear();
     predictedPlayerValid_ = false;
+    renderedPredictedPlayerValid_ = false;
+    predictedRenderOffset_ = {};
 }
 
 void SessionClient::Shutdown()
@@ -168,12 +177,7 @@ void SessionClient::Shutdown()
     helloResendSeconds_ = 0.0f;
     disconnected_ = false;
     lastDisconnectText_.clear();
-    pendingWorldSnapshot_ = {};
-    actorFrame_ = {};
-    actorHistory_ = {};
-    actorHistoryCount_ = 0;
-    pendingCommands_ = {};
-    predictedPlayerValid_ = false;
+    ResetSessionState();
 }
 
 void SessionClient::Tick(const float dt, const game::PlayerCommandFrame& localCommand)
@@ -219,25 +223,27 @@ void SessionClient::Tick(const float dt, const game::PlayerCommandFrame& localCo
     if (serverPeerId_ != kInvalidPeerId && helloSent_)
     {
         AdvancePredictedLocalPlayer(localCommand.control, dt);
+        StorePendingCommand(localCommand, dt);
 
-        const std::vector<std::byte> payload = EncodeMessage(MessageType::CommandFrame, EncodeCommandFrame(localCommand));
+        const std::vector<game::PlayerCommandFrame> commandBundle = BuildCommandBundle(localCommand);
+        const std::vector<std::byte> payload = commandBundle.size() > 1u
+            ? EncodeMessage(MessageType::CommandBundle, EncodeCommandBundle(commandBundle))
+            : EncodeMessage(MessageType::CommandFrame, EncodeCommandFrame(localCommand));
         const bool sent = transport_->Send({
             .peerId = serverPeerId_,
             .payload = payload,
             .reliable = false,
             .channel = TransportChannel::State,
         });
-        if (sent)
-        {
-            StorePendingCommand(localCommand, dt);
-        }
-        else
+        if (!sent)
         {
             LogWarning("Session client failed to send command frame sequence=", localCommand.sequence);
         }
     }
 
     ProcessPackets();
+    world_.TickRenderState(dt);
+    UpdatePredictionSmoothing(dt);
 }
 
 void SessionClient::SendClientHello()
@@ -349,6 +355,7 @@ void SessionClient::ProcessPackets()
                 localPlayerId_ = welcome.playerId;
                 sessionMode_ = welcome.sessionMode;
                 sessionName_ = welcome.sessionName;
+                actorSnapshotReady_ = FindActor(localPlayerId_) != nullptr;
                 disconnected_ = false;
                 handshakeElapsedSeconds_ = 0.0f;
                 helloResendSeconds_ = 0.0f;
@@ -356,6 +363,10 @@ void SessionClient::ProcessPackets()
                     "Session client received welcome player_id=", localPlayerId_,
                     " mode=", static_cast<int>(sessionMode_),
                     " session='", sessionName_, "'");
+                if (worldReady_ && actorSnapshotReady_)
+                {
+                    RebuildPredictedLocalPlayer();
+                }
                 break;
             }
 
@@ -394,14 +405,15 @@ void SessionClient::ProcessPackets()
                     throw std::runtime_error("World snapshot segments arrived out of order.");
                 }
 
-                if (!snapshot.cells.empty())
+                const std::vector<std::uint8_t> decodedCells = DecodeWorldSnapshotCells(snapshot);
+                if (!decodedCells.empty())
                 {
                     std::copy(
-                        snapshot.cells.begin(),
-                        snapshot.cells.end(),
+                        decodedCells.begin(),
+                        decodedCells.end(),
                         pendingWorldSnapshot_.snapshot.cells.begin() + static_cast<std::ptrdiff_t>(snapshot.cellOffset));
                 }
-                pendingWorldSnapshot_.nextCellOffset += static_cast<std::uint32_t>(snapshot.cells.size());
+                pendingWorldSnapshot_.nextCellOffset += snapshot.decodedCellCount;
                 handshakeElapsedSeconds_ = 0.0f;
 
                 if (pendingWorldSnapshot_.nextCellOffset == snapshot.totalCellCount)
@@ -412,7 +424,10 @@ void SessionClient::ProcessPackets()
                     if (worldReady_)
                     {
                         handshakeElapsedSeconds_ = 0.0f;
-                        RebuildPredictedLocalPlayer();
+                        if (actorSnapshotReady_)
+                        {
+                            RebuildPredictedLocalPlayer();
+                        }
                         LogInfo(
                             "Session client applied full world snapshot tick=", snapshot.serverTick,
                             " cells=", worldBaseline_.cells.size());
@@ -432,19 +447,35 @@ void SessionClient::ProcessPackets()
                     {
                         worldReady_ = world_.ApplySnapshot(worldBaseline_);
                     }
-                    if (worldReady_)
+                    if (worldReady_ && actorSnapshotReady_)
                     {
                         RebuildPredictedLocalPlayer();
                     }
+                    handshakeElapsedSeconds_ = 0.0f;
                 }
                 break;
             }
 
             case MessageType::ActorSnapshotFrame:
             {
-                actorFrame_ = DecodeActorSnapshotFrame(message.payload);
+                ActorSnapshotFrame incomingFrame = DecodeActorSnapshotFrame(message.payload);
+                if (incomingFrame.serverTick > lastAudioCueServerTick_ && !incomingFrame.audioCues.empty())
+                {
+                    pendingAudioCues_.insert(pendingAudioCues_.end(), incomingFrame.audioCues.begin(), incomingFrame.audioCues.end());
+                    lastAudioCueServerTick_ = incomingFrame.serverTick;
+                }
+                else if (incomingFrame.serverTick > lastAudioCueServerTick_)
+                {
+                    lastAudioCueServerTick_ = incomingFrame.serverTick;
+                }
+                actorFrame_ = std::move(incomingFrame);
                 PushActorFrame(actorFrame_);
-                RebuildPredictedLocalPlayer();
+                actorSnapshotReady_ = localPlayerId_ != game::kInvalidPlayerId && FindActor(localPlayerId_) != nullptr;
+                handshakeElapsedSeconds_ = 0.0f;
+                if (worldReady_ && actorSnapshotReady_)
+                {
+                    RebuildPredictedLocalPlayer();
+                }
                 break;
             }
 
@@ -469,11 +500,54 @@ void SessionClient::StorePendingCommand(const game::PlayerCommandFrame& command,
         return;
     }
 
-    PendingCommand& pending = pendingCommands_[command.sequence % pendingCommands_.size()];
-    pending.frame = command;
-    pending.dt = dt;
-    pending.sequence = command.sequence;
-    pending.valid = true;
+    if (!pendingCommands_.empty() && !SequenceGreaterThan(command.sequence, pendingCommands_.back().sequence))
+    {
+        return;
+    }
+
+    pendingCommands_.push_back({
+        .frame = command,
+        .dt = dt,
+        .sequence = command.sequence,
+        .valid = true,
+    });
+
+    while (pendingCommands_.size() > kPendingCommandHistorySize)
+    {
+        pendingCommands_.pop_front();
+    }
+}
+
+auto SessionClient::BuildCommandBundle(const game::PlayerCommandFrame& currentCommand) const -> std::vector<game::PlayerCommandFrame>
+{
+    std::vector<game::PlayerCommandFrame> frames;
+    const std::size_t pendingCount = pendingCommands_.size();
+    if (pendingCount == 0u)
+    {
+        frames.push_back(currentCommand);
+        return frames;
+    }
+
+    const std::size_t bundleCount = std::min(pendingCount, kMaxCommandBundleFrames);
+    frames.reserve(bundleCount);
+    const std::size_t firstPending = pendingCount - bundleCount;
+    for (std::size_t index = firstPending; index < pendingCount; ++index)
+    {
+        if (pendingCommands_[index].valid)
+        {
+            frames.push_back(pendingCommands_[index].frame);
+        }
+    }
+
+    if (frames.empty() || frames.back().sequence != currentCommand.sequence)
+    {
+        if (frames.size() == kMaxCommandBundleFrames)
+        {
+            frames.erase(frames.begin());
+        }
+        frames.push_back(currentCommand);
+    }
+    return frames;
 }
 
 void SessionClient::AdvancePredictedLocalPlayer(const game::ControlState& control, const float dt)
@@ -488,12 +562,11 @@ void SessionClient::AdvancePredictedLocalPlayer(const game::ControlState& contro
 
 void SessionClient::ClearAcknowledgedPendingCommands(const std::uint32_t lastAppliedSequence)
 {
-    for (PendingCommand& pending : pendingCommands_)
+    while (!pendingCommands_.empty() &&
+           pendingCommands_.front().valid &&
+           SequenceLessOrEqual(pendingCommands_.front().sequence, lastAppliedSequence))
     {
-        if (pending.valid && SequenceLessOrEqual(pending.sequence, lastAppliedSequence))
-        {
-            pending = {};
-        }
+        pendingCommands_.pop_front();
     }
 }
 
@@ -529,19 +602,31 @@ void SessionClient::PushActorFrame(const ActorSnapshotFrame& frame)
 
 void SessionClient::RebuildPredictedLocalPlayer()
 {
+    if (!worldReady_ || !actorSnapshotReady_)
+    {
+        predictedPlayerValid_ = false;
+        renderedPredictedPlayerValid_ = false;
+        predictedRenderOffset_ = {};
+        return;
+    }
+
     const ActorSnapshot* const localActor = FindActor(localPlayerId_);
     if (localActor == nullptr)
     {
+        actorSnapshotReady_ = false;
         predictedPlayerValid_ = false;
+        renderedPredictedPlayerValid_ = false;
+        predictedRenderOffset_ = {};
         return;
     }
+
+    const bool hadRenderedPrediction = renderedPredictedPlayerValid_;
+    const Vec3 previousRenderedPosition = hadRenderedPrediction ? renderedPredictedPlayer_.Position() : Vec3{};
 
     ClearAcknowledgedPendingCommands(localActor->lastAppliedCommandSequence);
 
     predictedPlayer_.PlaceAt(localActor->position, localActor->yawRadians, localActor->pitchRadians);
 
-    std::vector<const PendingCommand*> replayCommands;
-    replayCommands.reserve(pendingCommands_.size());
     for (const PendingCommand& pending : pendingCommands_)
     {
         if (!pending.valid || !SequenceGreaterThan(pending.sequence, localActor->lastAppliedCommandSequence))
@@ -549,20 +634,72 @@ void SessionClient::RebuildPredictedLocalPlayer()
             continue;
         }
 
-        replayCommands.push_back(&pending);
-    }
-
-    std::sort(replayCommands.begin(), replayCommands.end(), [](const PendingCommand* const left, const PendingCommand* const right)
-    {
-        return left->sequence < right->sequence;
-    });
-
-    for (const PendingCommand* const pending : replayCommands)
-    {
-        predictedPlayer_.Tick(pending->frame.control, world_, pending->dt);
+        predictedPlayer_.Tick(pending.frame.control, world_, pending.dt);
     }
 
     predictedPlayerValid_ = true;
+    if (hadRenderedPrediction)
+    {
+        const Vec3 correction = previousRenderedPosition - predictedPlayer_.Position();
+        if (LengthSquared(correction) <= kMaximumSmoothedPredictionCorrection * kMaximumSmoothedPredictionCorrection)
+        {
+            predictedRenderOffset_ = correction;
+        }
+        else
+        {
+            predictedRenderOffset_ = {};
+        }
+    }
+    else
+    {
+        predictedRenderOffset_ = {};
+    }
+
+    RefreshRenderedPredictedPlayer();
+}
+
+auto SessionClient::ConsumeAudioCues() -> std::vector<AudioCueSnapshot>
+{
+    std::vector<AudioCueSnapshot> drained;
+    drained.swap(pendingAudioCues_);
+    return drained;
+}
+
+void SessionClient::RefreshRenderedPredictedPlayer()
+{
+    if (!predictedPlayerValid_)
+    {
+        renderedPredictedPlayerValid_ = false;
+        return;
+    }
+
+    renderedPredictedPlayer_ = predictedPlayer_;
+    if (LengthSquared(predictedRenderOffset_) > 1.0e-8f)
+    {
+        renderedPredictedPlayer_.Translate(predictedRenderOffset_);
+    }
+    renderedPredictedPlayerValid_ = true;
+}
+
+void SessionClient::UpdatePredictionSmoothing(const float dt)
+{
+    if (!predictedPlayerValid_)
+    {
+        renderedPredictedPlayerValid_ = false;
+        predictedRenderOffset_ = {};
+        return;
+    }
+
+    if (LengthSquared(predictedRenderOffset_) > 1.0e-8f)
+    {
+        predictedRenderOffset_ = Lerp(predictedRenderOffset_, Vec3{}, Clamp(dt * kPredictionCorrectionSmoothingRate, 0.0f, 1.0f));
+        if (LengthSquared(predictedRenderOffset_) <= 1.0e-6f)
+        {
+            predictedRenderOffset_ = {};
+        }
+    }
+
+    RefreshRenderedPredictedPlayer();
 }
 
 auto SessionClient::FindActor(const game::PlayerId id) const -> const ActorSnapshot*
@@ -597,12 +734,9 @@ auto SessionClient::BuildRenderActorFrame(const float interpolationAlpha) const 
 
     const ActorSnapshotFrame& latest = actorHistory_[actorHistoryCount_ - 1u];
     const float clampedAlpha = Clamp(interpolationAlpha, 0.0f, 1.0f);
-    double targetTick = static_cast<double>(latest.serverTick);
-    if (latest.serverTick >= 2u)
-    {
-        targetTick -= 2.0;
-    }
-    targetTick = std::min(targetTick + static_cast<double>(clampedAlpha), static_cast<double>(latest.serverTick));
+    const double earliestTick = static_cast<double>(actorHistory_[0u].serverTick);
+    double targetTick = static_cast<double>(latest.serverTick) - kRenderInterpolationDelayTicks + static_cast<double>(clampedAlpha);
+    targetTick = std::clamp(targetTick, earliestTick, static_cast<double>(latest.serverTick));
 
     const ActorSnapshotFrame* from = &actorHistory_[0u];
     const ActorSnapshotFrame* to = from;

@@ -750,21 +750,36 @@ void VulkanRenderer::CreateCommandPool()
 
 void VulkanRenderer::CreateDescriptorResources()
 {
-    VkDescriptorSetLayoutBinding shadowBinding{};
-    shadowBinding.binding = 0;
-    shadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    shadowBinding.descriptorCount = 1;
-    shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    const std::array<VkDescriptorSetLayoutBinding, 3> bindings = {{
+        VkDescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        VkDescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        VkDescriptorSetLayoutBinding{
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+    }};
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 1;
-    layoutInfo.pBindings = &shadowBinding;
-    CheckVk(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorSetLayout_), "Failed to create the shadow descriptor set layout.");
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    CheckVk(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorSetLayout_), "Failed to create the scene descriptor set layout.");
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 1;
+    poolSize.descriptorCount = static_cast<std::uint32_t>(bindings.size());
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -778,7 +793,7 @@ void VulkanRenderer::CreateDescriptorResources()
     allocateInfo.descriptorPool = descriptorPool_;
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &descriptorSetLayout_;
-    CheckVk(vkAllocateDescriptorSets(device_, &allocateInfo, &shadowDescriptorSet_), "Failed to allocate the shadow descriptor set.");
+    CheckVk(vkAllocateDescriptorSets(device_, &allocateInfo, &shadowDescriptorSet_), "Failed to allocate the scene descriptor set.");
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -791,10 +806,25 @@ void VulkanRenderer::CreateDescriptorResources()
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
     samplerInfo.maxAnisotropy = 1.0f;
     CheckVk(vkCreateSampler(device_, &samplerInfo, nullptr, &shadowSampler_), "Failed to create the shadow sampler.");
+
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    CheckVk(vkCreateSampler(device_, &samplerInfo, nullptr, &sceneSampler_), "Failed to create the scene color sampler.");
 }
 
 void VulkanRenderer::DestroyDescriptorResources()
 {
+    if (sceneSampler_ != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(device_, sceneSampler_, nullptr);
+        sceneSampler_ = VK_NULL_HANDLE;
+    }
+
     if (shadowSampler_ != VK_NULL_HANDLE)
     {
         vkDestroySampler(device_, shadowSampler_, nullptr);
@@ -857,7 +887,7 @@ void VulkanRenderer::CreateShadowResources()
     CheckVk(vkCreateImageView(device_, &viewInfo, nullptr, &shadowImage_.view), "Failed to create the shadow depth image view.");
 
     shadowImage_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    UpdateShadowDescriptorSet();
+    UpdateSceneDescriptorSet();
 }
 
 void VulkanRenderer::DestroyShadowResources()
@@ -883,26 +913,47 @@ void VulkanRenderer::DestroyShadowResources()
     shadowImage_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
-void VulkanRenderer::UpdateShadowDescriptorSet()
+void VulkanRenderer::UpdateSceneDescriptorSet()
 {
-    if (shadowDescriptorSet_ == VK_NULL_HANDLE || shadowSampler_ == VK_NULL_HANDLE || shadowImage_.view == VK_NULL_HANDLE)
+    if (shadowDescriptorSet_ == VK_NULL_HANDLE ||
+        shadowSampler_ == VK_NULL_HANDLE ||
+        sceneSampler_ == VK_NULL_HANDLE ||
+        shadowImage_.view == VK_NULL_HANDLE ||
+        oitAccumulationImage_.view == VK_NULL_HANDLE ||
+        oitRevealageImage_.view == VK_NULL_HANDLE)
     {
         return;
     }
 
-    VkDescriptorImageInfo imageInfo{};
-    imageInfo.sampler = shadowSampler_;
-    imageInfo.imageView = shadowImage_.view;
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    const std::array<VkDescriptorImageInfo, 3> imageInfos = {{
+        VkDescriptorImageInfo{
+            .sampler = shadowSampler_,
+            .imageView = shadowImage_.view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = sceneSampler_,
+            .imageView = oitAccumulationImage_.view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = sceneSampler_,
+            .imageView = oitRevealageImage_.view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+    }};
 
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = shadowDescriptorSet_;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &imageInfo;
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (std::uint32_t bindingIndex = 0; bindingIndex < writes.size(); ++bindingIndex)
+    {
+        writes[bindingIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[bindingIndex].dstSet = shadowDescriptorSet_;
+        writes[bindingIndex].dstBinding = bindingIndex;
+        writes[bindingIndex].descriptorCount = 1;
+        writes[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[bindingIndex].pImageInfo = &imageInfos[bindingIndex];
+    }
+    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void VulkanRenderer::CreatePipelineLayout()
@@ -1030,50 +1081,99 @@ void VulkanRenderer::CreateSwapchain()
 
 void VulkanRenderer::CreateDepthResources()
 {
-    VkImageCreateInfo imageInfo{};
-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.extent.width = swapchainExtent_.width;
-    imageInfo.extent.height = swapchainExtent_.height;
-    imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = 1;
-    imageInfo.format = depthFormat_;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const auto createImage = [this](
+                                 ImageResource& image,
+                                 const VkFormat format,
+                                 const VkImageUsageFlags usage,
+                                 const VkImageAspectFlags aspectMask,
+                                 const char* const debugName)
+    {
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = swapchainExtent_.width;
+        imageInfo.extent.height = swapchainExtent_.height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = format;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = usage;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    CheckVk(vkCreateImage(device_, &imageInfo, nullptr, &depthImage_.image), "Failed to create the depth image.");
+        CheckVk(vkCreateImage(device_, &imageInfo, nullptr, &image.image), debugName);
 
-    VkMemoryRequirements memoryRequirements{};
-    vkGetImageMemoryRequirements(device_, depthImage_.image, &memoryRequirements);
+        VkMemoryRequirements memoryRequirements{};
+        vkGetImageMemoryRequirements(device_, image.image, &memoryRequirements);
 
-    VkMemoryAllocateInfo allocateInfo{};
-    allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocateInfo.allocationSize = memoryRequirements.size;
-    allocateInfo.memoryTypeIndex = FindMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    CheckVk(vkAllocateMemory(device_, &allocateInfo, nullptr, &depthImage_.memory), "Failed to allocate depth image memory.");
-    CheckVk(vkBindImageMemory(device_, depthImage_.image, depthImage_.memory, 0), "Failed to bind depth image memory.");
+        VkMemoryAllocateInfo allocateInfo{};
+        allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocateInfo.allocationSize = memoryRequirements.size;
+        allocateInfo.memoryTypeIndex = FindMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        CheckVk(vkAllocateMemory(device_, &allocateInfo, nullptr, &image.memory), "Failed to allocate image memory.");
+        CheckVk(vkBindImageMemory(device_, image.image, image.memory, 0), "Failed to bind image memory.");
 
-    VkImageViewCreateInfo viewInfo{};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = depthImage_.image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = depthFormat_;
-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = 1;
-    viewInfo.subresourceRange.baseArrayLayer = 0;
-    viewInfo.subresourceRange.layerCount = 1;
-    CheckVk(vkCreateImageView(device_, &viewInfo, nullptr, &depthImage_.view), "Failed to create the depth image view.");
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = image.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        viewInfo.subresourceRange.aspectMask = aspectMask;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        CheckVk(vkCreateImageView(device_, &viewInfo, nullptr, &image.view), "Failed to create an image view.");
 
-    depthImage_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        image.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
+    createImage(depthImage_, depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, "Failed to create the depth image.");
+    createImage(
+        oitAccumulationImage_,
+        oitAccumulationFormat_,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        "Failed to create the OIT accumulation image.");
+    createImage(
+        oitRevealageImage_,
+        oitRevealageFormat_,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        "Failed to create the OIT revealage image.");
+    UpdateSceneDescriptorSet();
 }
 
 void VulkanRenderer::DestroyDepthResources()
 {
+    const auto destroyImage = [this](ImageResource& image)
+    {
+        if (image.view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device_, image.view, nullptr);
+            image.view = VK_NULL_HANDLE;
+        }
+
+        if (image.image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(device_, image.image, nullptr);
+            image.image = VK_NULL_HANDLE;
+        }
+
+        if (image.memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device_, image.memory, nullptr);
+            image.memory = VK_NULL_HANDLE;
+        }
+
+        image.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
+    destroyImage(oitRevealageImage_);
+    destroyImage(oitAccumulationImage_);
+
     if (depthImage_.view != VK_NULL_HANDLE)
     {
         vkDestroyImageView(device_, depthImage_.view, nullptr);
@@ -1153,6 +1253,10 @@ void VulkanRenderer::CreatePipelines()
     const VkShaderModule worldVertexShader = LoadShaderModule("world_3d.vert.spv");
     const VkShaderModule worldFragmentShader = LoadShaderModule("world_3d.frag.spv");
     const VkShaderModule unshadowedWorldFragmentShader = LoadShaderModule("world_unshadowed.frag.spv");
+    const VkShaderModule oitShadowedFragmentShader = LoadShaderModule("oit_weighted_shadowed.frag.spv");
+    const VkShaderModule oitUnshadowedFragmentShader = LoadShaderModule("oit_weighted_unshadowed.frag.spv");
+    const VkShaderModule oitCompositeVertexShader = LoadShaderModule("oit_composite.vert.spv");
+    const VkShaderModule oitCompositeFragmentShader = LoadShaderModule("oit_composite.frag.spv");
     const VkShaderModule shadowVertexShader = LoadShaderModule("shadow_depth.vert.spv");
     const VkShaderModule overlayVertexShader = LoadShaderModule("overlay_2d.vert.spv");
     const VkShaderModule overlayFragmentShader = LoadShaderModule("overlay_2d.frag.spv");
@@ -1194,6 +1298,24 @@ void VulkanRenderer::CreatePipelines()
     alphaBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     alphaBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 
+    VkPipelineColorBlendAttachmentState additiveBlendAttachment = opaqueColorBlendAttachment;
+    additiveBlendAttachment.blendEnable = VK_TRUE;
+    additiveBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    additiveBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    additiveBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    additiveBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    additiveBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    additiveBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+    VkPipelineColorBlendAttachmentState revealageBlendAttachment = opaqueColorBlendAttachment;
+    revealageBlendAttachment.blendEnable = VK_TRUE;
+    revealageBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    revealageBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    revealageBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    revealageBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    revealageBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    revealageBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
     VkPipelineColorBlendStateCreateInfo opaqueBlendState{};
     opaqueBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     opaqueBlendState.attachmentCount = 1;
@@ -1203,6 +1325,15 @@ void VulkanRenderer::CreatePipelines()
     alphaBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     alphaBlendState.attachmentCount = 1;
     alphaBlendState.pAttachments = &alphaBlendAttachment;
+
+    const std::array<VkPipelineColorBlendAttachmentState, 2> oitAttachments = {
+        additiveBlendAttachment,
+        revealageBlendAttachment,
+    };
+    VkPipelineColorBlendStateCreateInfo oitBlendState{};
+    oitBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    oitBlendState.attachmentCount = static_cast<std::uint32_t>(oitAttachments.size());
+    oitBlendState.pAttachments = oitAttachments.data();
 
     VkPipelineColorBlendStateCreateInfo shadowBlendState{};
     shadowBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -1235,6 +1366,21 @@ void VulkanRenderer::CreatePipelines()
     sceneRenderingInfo.pColorAttachmentFormats = &swapchainFormat_;
     sceneRenderingInfo.depthAttachmentFormat = depthFormat_;
 
+    const std::array<VkFormat, 2> oitColorFormats = {
+        oitAccumulationFormat_,
+        oitRevealageFormat_,
+    };
+    VkPipelineRenderingCreateInfo oitRenderingInfo{};
+    oitRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    oitRenderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(oitColorFormats.size());
+    oitRenderingInfo.pColorAttachmentFormats = oitColorFormats.data();
+    oitRenderingInfo.depthAttachmentFormat = depthFormat_;
+
+    VkPipelineRenderingCreateInfo compositeRenderingInfo{};
+    compositeRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    compositeRenderingInfo.colorAttachmentCount = 1;
+    compositeRenderingInfo.pColorAttachmentFormats = &swapchainFormat_;
+
     VkPipelineRenderingCreateInfo shadowRenderingInfo{};
     shadowRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     shadowRenderingInfo.colorAttachmentCount = 0;
@@ -1245,7 +1391,8 @@ void VulkanRenderer::CreatePipelines()
                               const VkShaderModule vertexShader,
                               const VkShaderModule fragmentShader,
                               const VkPrimitiveTopology topology,
-                              const VkVertexInputBindingDescription& bindingDescription,
+                              const VkVertexInputBindingDescription* const bindingDescription,
+                              const std::uint32_t bindingDescriptionCount,
                               const VkVertexInputAttributeDescription* attributes,
                               const std::uint32_t attributeCount,
                               const VkPipelineColorBlendStateCreateInfo& blendState,
@@ -1274,8 +1421,8 @@ void VulkanRenderer::CreatePipelines()
 
         VkPipelineVertexInputStateCreateInfo vertexInputState{};
         vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputState.vertexBindingDescriptionCount = 1;
-        vertexInputState.pVertexBindingDescriptions = &bindingDescription;
+        vertexInputState.vertexBindingDescriptionCount = bindingDescriptionCount;
+        vertexInputState.pVertexBindingDescriptions = bindingDescription;
         vertexInputState.vertexAttributeDescriptionCount = attributeCount;
         vertexInputState.pVertexAttributeDescriptions = attributes;
 
@@ -1318,17 +1465,24 @@ void VulkanRenderer::CreatePipelines()
         VkVertexInputAttributeDescription{1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<std::uint32_t>(offsetof(ColorVertex2D, color))},
     }};
 
-    shadowPipeline_ = createPipeline(shadowVertexShader, VK_NULL_HANDLE, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, shadowAttributes.data(), static_cast<std::uint32_t>(shadowAttributes.size()), shadowBlendState, shadowDepthState, shadowRenderingInfo);
-    terrainPipeline_ = createPipeline(worldVertexShader, worldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), opaqueBlendState, terrainDepthState, sceneRenderingInfo);
-    translucentTerrainPipeline_ = createPipeline(worldVertexShader, worldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), alphaBlendState, translucentTerrainDepthState, sceneRenderingInfo);
-    effectPipeline_ = createPipeline(worldVertexShader, unshadowedWorldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), opaqueBlendState, terrainDepthState, sceneRenderingInfo);
-    linePipeline_ = createPipeline(worldVertexShader, unshadowedWorldFragmentShader, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, worldBindingDescription, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), alphaBlendState, lineDepthState, sceneRenderingInfo);
-    overlayPipeline_ = createPipeline(overlayVertexShader, overlayFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, overlayBindingDescription, overlayAttributes.data(), static_cast<std::uint32_t>(overlayAttributes.size()), alphaBlendState, overlayDepthState, sceneRenderingInfo);
+    shadowPipeline_ = createPipeline(shadowVertexShader, VK_NULL_HANDLE, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &worldBindingDescription, 1, shadowAttributes.data(), static_cast<std::uint32_t>(shadowAttributes.size()), shadowBlendState, shadowDepthState, shadowRenderingInfo);
+    terrainPipeline_ = createPipeline(worldVertexShader, worldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &worldBindingDescription, 1, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), opaqueBlendState, terrainDepthState, sceneRenderingInfo);
+    translucentTerrainPipeline_ = createPipeline(worldVertexShader, worldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &worldBindingDescription, 1, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), alphaBlendState, translucentTerrainDepthState, sceneRenderingInfo);
+    translucentTerrainOitPipeline_ = createPipeline(worldVertexShader, oitShadowedFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &worldBindingDescription, 1, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), oitBlendState, translucentTerrainDepthState, oitRenderingInfo);
+    effectPipeline_ = createPipeline(worldVertexShader, unshadowedWorldFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &worldBindingDescription, 1, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), opaqueBlendState, terrainDepthState, sceneRenderingInfo);
+    effectOitPipeline_ = createPipeline(worldVertexShader, oitUnshadowedFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &worldBindingDescription, 1, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), oitBlendState, translucentTerrainDepthState, oitRenderingInfo);
+    linePipeline_ = createPipeline(worldVertexShader, unshadowedWorldFragmentShader, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, &worldBindingDescription, 1, worldAttributes.data(), static_cast<std::uint32_t>(worldAttributes.size()), alphaBlendState, lineDepthState, sceneRenderingInfo);
+    overlayPipeline_ = createPipeline(overlayVertexShader, overlayFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &overlayBindingDescription, 1, overlayAttributes.data(), static_cast<std::uint32_t>(overlayAttributes.size()), alphaBlendState, overlayDepthState, sceneRenderingInfo);
+    oitCompositePipeline_ = createPipeline(oitCompositeVertexShader, oitCompositeFragmentShader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, nullptr, 0, nullptr, 0, alphaBlendState, overlayDepthState, compositeRenderingInfo);
 
     vkDestroyShaderModule(device_, shadowVertexShader, nullptr);
     vkDestroyShaderModule(device_, worldVertexShader, nullptr);
     vkDestroyShaderModule(device_, worldFragmentShader, nullptr);
     vkDestroyShaderModule(device_, unshadowedWorldFragmentShader, nullptr);
+    vkDestroyShaderModule(device_, oitShadowedFragmentShader, nullptr);
+    vkDestroyShaderModule(device_, oitUnshadowedFragmentShader, nullptr);
+    vkDestroyShaderModule(device_, oitCompositeVertexShader, nullptr);
+    vkDestroyShaderModule(device_, oitCompositeFragmentShader, nullptr);
     vkDestroyShaderModule(device_, overlayVertexShader, nullptr);
     vkDestroyShaderModule(device_, overlayFragmentShader, nullptr);
 }
@@ -1353,16 +1507,34 @@ void VulkanRenderer::DestroyPipelines()
         translucentTerrainPipeline_ = VK_NULL_HANDLE;
     }
 
+    if (translucentTerrainOitPipeline_ != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device_, translucentTerrainOitPipeline_, nullptr);
+        translucentTerrainOitPipeline_ = VK_NULL_HANDLE;
+    }
+
     if (effectPipeline_ != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(device_, effectPipeline_, nullptr);
         effectPipeline_ = VK_NULL_HANDLE;
     }
 
+    if (effectOitPipeline_ != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device_, effectOitPipeline_, nullptr);
+        effectOitPipeline_ = VK_NULL_HANDLE;
+    }
+
     if (linePipeline_ != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(device_, linePipeline_, nullptr);
         linePipeline_ = VK_NULL_HANDLE;
+    }
+
+    if (oitCompositePipeline_ != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device_, oitCompositePipeline_, nullptr);
+        oitCompositePipeline_ = VK_NULL_HANDLE;
     }
 
     if (overlayPipeline_ != VK_NULL_HANDLE)
@@ -1500,8 +1672,6 @@ void VulkanRenderer::RecordFrame(
     renderingInfo.pColorAttachments = &colorAttachment;
     renderingInfo.pDepthAttachment = &depthAttachment;
 
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
-
     const VkViewport viewport{
         0.0f,
         0.0f,
@@ -1511,10 +1681,32 @@ void VulkanRenderer::RecordFrame(
         1.0f,
     };
     const VkRect2D scissor{{0, 0}, swapchainExtent_};
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &shadowDescriptorSet_, 0, nullptr);
 
-    const auto drawScene = [&](const ScenePushConstants& scenePushConstants, const VkViewport& sceneViewport, const VkRect2D& sceneScissor)
+    const auto beginSwapchainPass = [&](const bool clearColor, const bool clearDepth)
     {
+        colorAttachment.loadOp = clearColor ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        depthAttachment.loadOp = clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.pDepthAttachment = &depthAttachment;
+        vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    };
+
+    const auto beginOverlayPass = [&]()
+    {
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        renderingInfo.pColorAttachments = &colorAttachment;
+        renderingInfo.pDepthAttachment = nullptr;
+        vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    };
+
+    const auto bindSceneDescriptors = [&]()
+    {
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &shadowDescriptorSet_, 0, nullptr);
+    };
+
+    const auto drawOpaqueScene = [&](const ScenePushConstants& scenePushConstants, const VkViewport& sceneViewport, const VkRect2D& sceneScissor)
+    {
+        bindSceneDescriptors();
         vkCmdSetViewport(commandBuffer, 0, 1, &sceneViewport);
         vkCmdSetScissor(commandBuffer, 0, 1, &sceneScissor);
 
@@ -1536,10 +1728,33 @@ void VulkanRenderer::RecordFrame(
             vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTriangles.size()), 1, 0, 0);
         }
 
+        if (!frameData.debugLines.empty())
+        {
+            const VkBuffer vertexBuffer = frame.lineVertexBuffer.buffer;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, linePipeline_);
+            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.debugLines.size()), 1, 0, 0);
+        }
+    };
+
+    const auto hasAnyTranslucency = [&]() -> bool
+    {
+        return !frameData.translucentTerrainTriangles.empty() ||
+               !frameData.dynamicTranslucentTriangles.empty() ||
+               !frameData.effectTriangles.empty();
+    };
+
+    const auto drawOitGeometry = [&](const ScenePushConstants& scenePushConstants, const VkViewport& sceneViewport, const VkRect2D& sceneScissor)
+    {
+        bindSceneDescriptors();
+        vkCmdSetViewport(commandBuffer, 0, 1, &sceneViewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &sceneScissor);
+
         if (!frameData.translucentTerrainTriangles.empty())
         {
             const VkBuffer vertexBuffer = frame.translucentTerrainVertexBuffer.buffer;
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainPipeline_);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainOitPipeline_);
             vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
             vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.translucentTerrainTriangles.size()), 1, 0, 0);
@@ -1548,7 +1763,7 @@ void VulkanRenderer::RecordFrame(
         if (!frameData.dynamicTranslucentTriangles.empty())
         {
             const VkBuffer vertexBuffer = frame.dynamicTranslucentVertexBuffer.buffer;
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainPipeline_);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, translucentTerrainOitPipeline_);
             vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
             vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.dynamicTranslucentTriangles.size()), 1, 0, 0);
@@ -1557,19 +1772,10 @@ void VulkanRenderer::RecordFrame(
         if (!frameData.effectTriangles.empty())
         {
             const VkBuffer vertexBuffer = frame.effectVertexBuffer.buffer;
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, effectPipeline_);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, effectOitPipeline_);
             vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
             vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
             vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.effectTriangles.size()), 1, 0, 0);
-        }
-
-        if (!frameData.debugLines.empty())
-        {
-            const VkBuffer vertexBuffer = frame.lineVertexBuffer.buffer;
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, linePipeline_);
-            vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
-            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
-            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.debugLines.size()), 1, 0, 0);
         }
     };
 
@@ -1581,6 +1787,7 @@ void VulkanRenderer::RecordFrame(
         }
 
         const VkBuffer vertexBuffer = buffer.buffer;
+        bindSceneDescriptors();
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline_);
         vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
         vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
@@ -1589,7 +1796,96 @@ void VulkanRenderer::RecordFrame(
         vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(vertexCount), 1, 0, 0);
     };
 
-    drawScene(pushConstants, viewport, scissor);
+    const auto renderTranslucency = [&](const ScenePushConstants& scenePushConstants, const VkViewport& sceneViewport, const VkRect2D& sceneScissor)
+    {
+        if (!hasAnyTranslucency())
+        {
+            return;
+        }
+
+        if (oitAccumulationImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED)
+        {
+            TransitionImage(commandBuffer, oitAccumulationImage_.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
+        else if (oitAccumulationImage_.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        {
+            TransitionImage(commandBuffer, oitAccumulationImage_.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
+        oitAccumulationImage_.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        if (oitRevealageImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED)
+        {
+            TransitionImage(commandBuffer, oitRevealageImage_.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
+        else if (oitRevealageImage_.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        {
+            TransitionImage(commandBuffer, oitRevealageImage_.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
+        oitRevealageImage_.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkClearValue oitAccumulationClear{};
+        oitAccumulationClear.color.float32[0] = 0.0f;
+        oitAccumulationClear.color.float32[1] = 0.0f;
+        oitAccumulationClear.color.float32[2] = 0.0f;
+        oitAccumulationClear.color.float32[3] = 0.0f;
+
+        VkClearValue oitRevealageClear{};
+        oitRevealageClear.color.float32[0] = 1.0f;
+
+        VkRenderingAttachmentInfo accumulationAttachment{};
+        accumulationAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        accumulationAttachment.imageView = oitAccumulationImage_.view;
+        accumulationAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        accumulationAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        accumulationAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        accumulationAttachment.clearValue = oitAccumulationClear;
+
+        VkRenderingAttachmentInfo revealageAttachment{};
+        revealageAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        revealageAttachment.imageView = oitRevealageImage_.view;
+        revealageAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        revealageAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        revealageAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        revealageAttachment.clearValue = oitRevealageClear;
+
+        const std::array<VkRenderingAttachmentInfo, 2> oitAttachments = {
+            accumulationAttachment,
+            revealageAttachment,
+        };
+
+        VkRenderingAttachmentInfo oitDepthAttachment = depthAttachment;
+        oitDepthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        oitDepthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+        VkRenderingInfo oitRenderingInfo{};
+        oitRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        oitRenderingInfo.renderArea.extent = swapchainExtent_;
+        oitRenderingInfo.layerCount = 1;
+        oitRenderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(oitAttachments.size());
+        oitRenderingInfo.pColorAttachments = oitAttachments.data();
+        oitRenderingInfo.pDepthAttachment = &oitDepthAttachment;
+        vkCmdBeginRendering(commandBuffer, &oitRenderingInfo);
+        drawOitGeometry(scenePushConstants, sceneViewport, sceneScissor);
+        vkCmdEndRendering(commandBuffer);
+
+        TransitionImage(commandBuffer, oitAccumulationImage_.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        TransitionImage(commandBuffer, oitRevealageImage_.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        oitAccumulationImage_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        oitRevealageImage_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        beginOverlayPass();
+        bindSceneDescriptors();
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, oitCompositePipeline_);
+        vkCmdSetViewport(commandBuffer, 0, 1, &sceneViewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &sceneScissor);
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        vkCmdEndRendering(commandBuffer);
+    };
+
+    beginSwapchainPass(true, true);
+    drawOpaqueScene(pushConstants, viewport, scissor);
+    vkCmdEndRendering(commandBuffer);
+    renderTranslucency(pushConstants, viewport, scissor);
 
     const bool scopedPassEnabled =
         frameData.scopedView.enabled &&
@@ -1598,6 +1894,7 @@ void VulkanRenderer::RecordFrame(
 
     if (scopedPassEnabled)
     {
+        beginSwapchainPass(false, false);
         drawViewModelBuffer(frame.viewModelVertexBuffer, frameData.viewModelTriangles.size(), pushConstants);
 
         std::array<VkClearAttachment, 2> scopedClearAttachments{};
@@ -1644,25 +1941,32 @@ void VulkanRenderer::RecordFrame(
             frameData.scopedView.worldToClip,
             worldToShadowClip,
         };
-        drawScene(scopedPushConstants, scopedViewport, scopedScissor);
+        drawOpaqueScene(scopedPushConstants, scopedViewport, scopedScissor);
+        vkCmdEndRendering(commandBuffer);
+        renderTranslucency(scopedPushConstants, scopedViewport, scopedScissor);
+
+        beginSwapchainPass(false, false);
         drawViewModelBuffer(frame.viewModelPostScopeVertexBuffer, frameData.viewModelPostScopeTriangles.size(), pushConstants);
+        vkCmdEndRendering(commandBuffer);
     }
     else
     {
+        beginSwapchainPass(false, false);
         drawViewModelBuffer(frame.viewModelVertexBuffer, frameData.viewModelTriangles.size(), pushConstants);
+        vkCmdEndRendering(commandBuffer);
     }
 
     if (!frameData.overlayTriangles.empty())
     {
+        beginOverlayPass();
         const VkBuffer vertexBuffer = frame.overlayVertexBuffer.buffer;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
         vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
         vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(frameData.overlayTriangles.size()), 1, 0, 0);
+        vkCmdEndRendering(commandBuffer);
     }
-
-    vkCmdEndRendering(commandBuffer);
 
     TransitionSwapchainImage(commandBuffer, swapchainImages_[imageIndex], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     CheckVk(vkEndCommandBuffer(commandBuffer), "Failed to finish recording the frame command buffer.");
@@ -1710,6 +2014,20 @@ void VulkanRenderer::TransitionImage(
         barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         destinationStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    }
+    else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    {
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        sourceStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+    else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    {
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     }
     else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL)
     {

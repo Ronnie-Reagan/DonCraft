@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace df::net
 {
@@ -35,10 +36,7 @@ public:
         return runtime_;
     }
 
-    [[nodiscard]] auto ConsumeAudioCues() -> std::vector<game::SessionRuntime::AudioCue>
-    {
-        return runtime_.ConsumeAudioCues();
-    }
+    [[nodiscard]] auto ConsumeAudioCues() -> std::vector<game::SessionRuntime::AudioCue>;
 
     [[nodiscard]] auto PeerInfos() const -> std::vector<PeerInfo>
     {
@@ -55,12 +53,13 @@ private:
         world::DenseWorldSnapshot baselineWorld{};
         std::uint64_t baselineWorldVersion = 0;
         std::deque<std::vector<std::byte>> reliableQueue{};
+        std::size_t reliableQueueBytes = 0u;
         bool reliableQueueBlocked = false;
     };
 
     void RefreshWorldSnapshotCache();
     [[nodiscard]] auto BuildActorFrame() const -> ActorSnapshotFrame;
-    void QueueReliablePayload(RemotePeerState& peer, std::vector<std::byte> payload);
+    [[nodiscard]] bool QueueReliablePayload(PeerId peerId, RemotePeerState& peer, std::vector<std::byte> payload);
     void FlushReliableQueue(PeerId peerId, RemotePeerState& peer);
     void SendWelcome(PeerId peerId, RemotePeerState& peer, game::PlayerId playerId);
     void SendWorldSnapshot(PeerId peerId, RemotePeerState& peer, const world::DenseWorldSnapshot& snapshot);
@@ -78,5 +77,10 @@ private:
     game::PlayerId nextRemotePlayerId_ = 2u;
     world::DenseWorldSnapshot worldSnapshotCache_{};
     std::uint64_t worldSnapshotVersion_ = 0;
+    std::uint64_t cachedWorldDeltaBaselineVersion_ = 0;
+    std::uint64_t cachedWorldDeltaTargetVersion_ = 0;
+    std::vector<ChunkDelta> cachedWorldDeltas_{};
+    std::vector<game::SessionRuntime::AudioCue> localAudioCues_{};
+    std::vector<game::SessionRuntime::AudioCue> tickAudioCues_{};
 };
 }

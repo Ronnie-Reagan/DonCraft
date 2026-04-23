@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -16,8 +17,15 @@ namespace
 {
 constexpr float kGrenadeRadius = 0.16f;
 constexpr float kBulletRadius = 0.035f;
+constexpr Vec3 kPlayerHitHalfExtents{0.35f, 0.90f, 0.35f};
 constexpr Vec3 kWorldUp{0.0f, 1.0f, 0.0f};
 constexpr float kDigRepeatCooldownSeconds = 0.42f;
+constexpr float kBuildRepeatCooldownSeconds = 0.18f;
+constexpr int kPlayerMaxHealth = 100;
+constexpr int kRifleDamage = 55;
+constexpr int kSmgDamage = 18;
+constexpr int kGrenadeMaxDamage = 120;
+constexpr float kGrenadeDamageRadius = 5.4f;
 
 auto WeaponCycleDecayRate(const ToolType tool) -> float
 {
@@ -55,6 +63,51 @@ auto SequenceGreaterThan(const std::uint32_t lhs, const std::uint32_t rhs) -> bo
     return static_cast<std::int32_t>(lhs - rhs) > 0;
 }
 
+auto SegmentIntersectsExpandedAabb(
+    const Vec3& start,
+    const Vec3& end,
+    const Vec3& minimum,
+    const Vec3& maximum) -> std::optional<float>
+{
+    const Vec3 delta = end - start;
+    float tMin = 0.0f;
+    float tMax = 1.0f;
+
+    const auto clipAxis = [&](const float startAxis, const float deltaAxis, const float minAxis, const float maxAxis) -> bool
+    {
+        if (std::abs(deltaAxis) <= 1.0e-6f)
+        {
+            return startAxis >= minAxis && startAxis <= maxAxis;
+        }
+
+        const float inverseDelta = 1.0f / deltaAxis;
+        float entry = (minAxis - startAxis) * inverseDelta;
+        float exit = (maxAxis - startAxis) * inverseDelta;
+        if (entry > exit)
+        {
+            std::swap(entry, exit);
+        }
+
+        tMin = std::max(tMin, entry);
+        tMax = std::min(tMax, exit);
+        return tMin <= tMax;
+    };
+
+    if (!clipAxis(start.x, delta.x, minimum.x, maximum.x) ||
+        !clipAxis(start.y, delta.y, minimum.y, maximum.y) ||
+        !clipAxis(start.z, delta.z, minimum.z, maximum.z))
+    {
+        return std::nullopt;
+    }
+
+    return Clamp(tMin, 0.0f, 1.0f);
+}
+
+auto DamageForFirearmTool(const ToolType tool) -> int
+{
+    return tool == ToolType::Smg ? kSmgDamage : kRifleDamage;
+}
+
 void ResetPlayerWeaponInventories(SessionRuntime::PlayerState& player)
 {
     player.weaponInventories = {};
@@ -65,6 +118,15 @@ void ResetPlayerWeaponInventories(SessionRuntime::PlayerState& player)
         inventory.ammoInMagazine = definition.magazineCapacity;
         inventory.reserveAmmo = definition.startingReserveAmmo;
     }
+}
+
+void ClearTransientCommandEdges(PlayerCommandFrame& command)
+{
+    command.control.jumpPressed = false;
+    command.primaryPressed = false;
+    command.quickGrenadePressed = false;
+    command.interactPressed = false;
+    command.reloadPressed = false;
 }
 
 auto ActiveWeaponInventory(SessionRuntime::PlayerState& player) -> SessionRuntime::PlayerState::WeaponInventory&
@@ -160,6 +222,24 @@ auto BuildGunMuzzlePosition(const SessionRuntime::PlayerState& player) -> Vec3
     return model::TransformPoint(heldItemBasis, WeaponMuzzleLocalPoint(player.tool));
 }
 
+auto CueAt(
+    const Vec3& position,
+    const float baseFrequency,
+    const float durationSeconds,
+    const float amplitude,
+    const float noise,
+    const float sweep) -> SessionRuntime::AudioCue
+{
+    return {
+        .position = position,
+        .baseFrequency = baseFrequency,
+        .durationSeconds = durationSeconds,
+        .amplitude = amplitude,
+        .noise = noise,
+        .sweep = sweep,
+    };
+}
+
 void IntegrateOrientation(Vec3& forward, Vec3& up, const Vec3& angularVelocity, const float dt)
 {
     const float angularSpeed = Length(angularVelocity);
@@ -249,6 +329,7 @@ bool SessionRuntime::AddPlayer(const PlayerId id, const std::string_view name)
     state.name = std::string(name);
     state.controller.Spawn(world_);
     ResetPlayerWeaponInventories(state);
+    state.health = kPlayerMaxHealth;
     players_.emplace(id, std::move(state));
     return true;
 }
@@ -282,15 +363,54 @@ bool SessionRuntime::SubmitCommand(const PlayerId id, const PlayerCommandFrame& 
         return false;
     }
 
-    if (player->tool != command.selectedTool)
+    PlayerCommandFrame resolved = command;
+    const bool jumpPressed = command.control.jumpPressed || command.jumpPressCount != player->lastJumpPressCount;
+    const bool primaryPressed = command.primaryPressed || command.primaryPressCount != player->lastPrimaryPressCount;
+    const bool quickGrenadePressed = command.quickGrenadePressed || command.quickGrenadePressCount != player->lastQuickGrenadePressCount;
+    const bool interactPressed = command.interactPressed || command.interactPressCount != player->lastInteractPressCount;
+    const bool reloadPressed = command.reloadPressed || command.reloadPressCount != player->lastReloadPressCount;
+    const float recoveredLookYawDelta = command.cumulativeLookYawDelta - player->lastCumulativeLookYawDelta;
+    const float recoveredLookPitchDelta = command.cumulativeLookPitchDelta - player->lastCumulativeLookPitchDelta;
+    const bool hasCumulativeLook =
+        command.hasCumulativeLook &&
+        std::isfinite(recoveredLookYawDelta) &&
+        std::isfinite(recoveredLookPitchDelta);
+    if (command.jumpPressCount != player->lastJumpPressCount)
+    {
+        player->lastJumpPressCount = command.jumpPressCount;
+    }
+    if (command.primaryPressCount != player->lastPrimaryPressCount)
+    {
+        player->lastPrimaryPressCount = command.primaryPressCount;
+    }
+    if (command.quickGrenadePressCount != player->lastQuickGrenadePressCount)
+    {
+        player->lastQuickGrenadePressCount = command.quickGrenadePressCount;
+    }
+    if (command.interactPressCount != player->lastInteractPressCount)
+    {
+        player->lastInteractPressCount = command.interactPressCount;
+    }
+    if (command.reloadPressCount != player->lastReloadPressCount)
+    {
+        player->lastReloadPressCount = command.reloadPressCount;
+    }
+    resolved.control.jumpPressed = jumpPressed || player->command.control.jumpPressed;
+    resolved.control.lookYawDelta = hasCumulativeLook ? recoveredLookYawDelta : command.control.lookYawDelta;
+    resolved.control.lookPitchDelta = hasCumulativeLook ? recoveredLookPitchDelta : command.control.lookPitchDelta;
+    resolved.primaryPressed = primaryPressed || player->command.primaryPressed;
+    resolved.quickGrenadePressed = quickGrenadePressed || player->command.quickGrenadePressed;
+    resolved.interactPressed = interactPressed || player->command.interactPressed;
+    resolved.reloadPressed = reloadPressed || player->command.reloadPressed;
+    if (player->tool != resolved.selectedTool)
     {
         player->reloading = false;
         player->reloadTimer = 0.0f;
         player->reloadDuration = 0.0f;
     }
-    player->command = command;
+    player->command = resolved;
     player->hasReceivedCommand = true;
-    player->tool = command.selectedTool;
+    player->tool = resolved.selectedTool;
     return true;
 }
 
@@ -402,13 +522,23 @@ void SessionRuntime::ResetActors()
         ResetPlayerWeaponInventories(player);
         player.fireCooldown = 0.0f;
         player.digCooldown = 0.0f;
+        player.buildCooldown = 0.0f;
         player.reloadTimer = 0.0f;
         player.reloadDuration = 0.0f;
         player.weaponCycle = 0.0f;
         player.footstepCooldown = 0.0f;
         player.reloading = false;
+        player.buildRotationQuarterTurns = 0u;
         player.crosshairMaterial = world::MaterialId::Air;
         player.lastAppliedCommandSequence = 0;
+        player.lastJumpPressCount = 0;
+        player.lastPrimaryPressCount = 0;
+        player.lastQuickGrenadePressCount = 0;
+        player.lastInteractPressCount = 0;
+        player.lastReloadPressCount = 0;
+        player.lastCumulativeLookYawDelta = 0.0f;
+        player.lastCumulativeLookPitchDelta = 0.0f;
+        player.health = kPlayerMaxHealth;
         player.command = {};
         player.hasReceivedCommand = false;
     }
@@ -425,6 +555,7 @@ void SessionRuntime::TickPlayers(const float dt)
     {
         player.fireCooldown = std::max(0.0f, player.fireCooldown - dt);
         player.digCooldown = std::max(0.0f, player.digCooldown - dt);
+        player.buildCooldown = std::max(0.0f, player.buildCooldown - dt);
         player.weaponCycle = std::max(0.0f, player.weaponCycle - dt * WeaponCycleDecayRate(player.tool));
         player.footstepCooldown = std::max(0.0f, player.footstepCooldown - dt);
         if (player.reloading)
@@ -444,13 +575,13 @@ void SessionRuntime::TickPlayers(const float dt)
                 truckDriverId_ = kInvalidPlayerId;
                 const Vec3 forward = truck_.ForwardVector();
                 player.controller.PlaceAt(truck_.ExitPosition(), std::atan2(forward.z, forward.x), DegreesToRadians(-10.0f));
-                QueueAudioCue({180.0f, 0.10f, 0.16f, 0.30f, -70.0f});
+                QueueAudioCue(CueAt(truck_.Position(), 180.0f, 0.10f, 0.16f, 0.30f, -70.0f));
             }
             else if (truckDriverId_ == kInvalidPlayerId && truck_.CanEnter(player.controller.Position()))
             {
                 player.drivingTruck = true;
                 truckDriverId_ = id;
-                QueueAudioCue({140.0f, 0.14f, 0.18f, 0.18f, 90.0f});
+                QueueAudioCue(CueAt(truck_.Position(), 140.0f, 0.14f, 0.18f, 0.18f, 90.0f));
             }
         }
 
@@ -464,35 +595,38 @@ void SessionRuntime::TickPlayers(const float dt)
             if (movingOnFoot && player.footstepCooldown <= 0.0f)
             {
                 const world::MaterialId footMaterial = player.controller.MaterialUnderFeet(world_);
+                const Vec3 footstepPosition = player.controller.Position();
                 switch (footMaterial)
                 {
                 case world::MaterialId::ShallowWater:
-                    QueueAudioCue({84.0f, 0.16f, 0.14f, 0.74f, -8.0f});
+                    QueueAudioCue(CueAt(footstepPosition, 84.0f, 0.16f, 0.14f, 0.74f, -8.0f));
                     player.footstepCooldown = 0.28f;
                     break;
                 case world::MaterialId::WetMud:
-                    QueueAudioCue({72.0f, 0.14f, 0.13f, 0.68f, -12.0f});
+                    QueueAudioCue(CueAt(footstepPosition, 72.0f, 0.14f, 0.13f, 0.68f, -12.0f));
                     player.footstepCooldown = 0.30f;
                     break;
                 case world::MaterialId::DrySand:
-                    QueueAudioCue({102.0f, 0.10f, 0.10f, 0.42f, -10.0f});
+                    QueueAudioCue(CueAt(footstepPosition, 102.0f, 0.10f, 0.10f, 0.42f, -10.0f));
                     player.footstepCooldown = 0.26f;
                     break;
                 case world::MaterialId::Grass:
-                    QueueAudioCue({88.0f, 0.11f, 0.09f, 0.24f, -4.0f});
+                    QueueAudioCue(CueAt(footstepPosition, 88.0f, 0.11f, 0.09f, 0.24f, -4.0f));
                     player.footstepCooldown = 0.25f;
                     break;
                 case world::MaterialId::Gravel:
-                    QueueAudioCue({138.0f, 0.09f, 0.10f, 0.34f, -18.0f});
+                    QueueAudioCue(CueAt(footstepPosition, 138.0f, 0.09f, 0.10f, 0.34f, -18.0f));
                     player.footstepCooldown = 0.26f;
                     break;
                 default:
-                    QueueAudioCue({118.0f, 0.08f, 0.09f, 0.16f, -6.0f});
+                    QueueAudioCue(CueAt(footstepPosition, 118.0f, 0.08f, 0.09f, 0.16f, -6.0f));
                     player.footstepCooldown = 0.24f;
                     break;
                 }
             }
         }
+
+        world_.ActivateSimulationRegion(player.drivingTruck ? truck_.Position() : player.controller.Position(), 1);
 
         if (!player.drivingTruck && player.command.quickGrenadePressed)
         {
@@ -506,7 +640,15 @@ void SessionRuntime::TickPlayers(const float dt)
         {
             if (player.command.reloadPressed)
             {
-                StartReload(player);
+                if (player.tool == ToolType::Build)
+                {
+                    player.buildRotationQuarterTurns = static_cast<std::uint8_t>((player.buildRotationQuarterTurns + 1u) & 3u);
+                    QueueAudioCue(CueAt(CurrentAimPosition(player), 176.0f, 0.04f, 0.05f, 0.08f, 24.0f));
+                }
+                else
+                {
+                    StartReload(player);
+                }
             }
 
             switch (player.tool)
@@ -545,7 +687,7 @@ void SessionRuntime::TickPlayers(const float dt)
                         StartReload(player);
                         player.fireCooldown = 0.12f;
                         player.weaponCycle = std::max(player.weaponCycle, 0.22f);
-                        QueueAudioCue({190.0f, 0.03f, 0.05f, 0.05f, -40.0f});
+                        QueueAudioCue(CueAt(CurrentAimPosition(player), 190.0f, 0.03f, 0.05f, 0.05f, -40.0f));
                     }
                 }
                 break;
@@ -560,6 +702,16 @@ void SessionRuntime::TickPlayers(const float dt)
                     player.digCooldown = kDigRepeatCooldownSeconds;
                 }
                 break;
+            case ToolType::Build:
+                if (player.command.primaryPressed && player.buildCooldown <= 0.0f)
+                {
+                    player.reloading = false;
+                    player.reloadTimer = 0.0f;
+                    player.reloadDuration = 0.0f;
+                    PlaceConstruction(player);
+                    player.buildCooldown = kBuildRepeatCooldownSeconds;
+                }
+                break;
             default:
                 break;
             }
@@ -567,6 +719,12 @@ void SessionRuntime::TickPlayers(const float dt)
 
         UpdatePlayerCrosshair(player);
         player.lastAppliedCommandSequence = player.command.sequence;
+        if (player.command.hasCumulativeLook)
+        {
+            player.lastCumulativeLookYawDelta = player.command.cumulativeLookYawDelta;
+            player.lastCumulativeLookPitchDelta = player.command.cumulativeLookPitchDelta;
+        }
+        ClearTransientCommandEdges(player.command);
     }
 }
 
@@ -579,6 +737,10 @@ void SessionRuntime::TickTruck(const float dt)
     }
 
     truck_.Tick(driverControl, world_, dt, truckDriverId_ != kInvalidPlayerId);
+    if (truckDriverId_ != kInvalidPlayerId || truck_.SpeedMetersPerSecond() > 0.25f)
+    {
+        world_.ActivateSimulationRegion(truck_.Position(), 1);
+    }
 }
 
 void SessionRuntime::UpdateProjectiles(const float dt)
@@ -623,6 +785,7 @@ void SessionRuntime::FireWeapon(PlayerState& player)
     bullet.position = origin;
     bullet.previousPosition = origin;
     bullet.velocity = direction * cartridge.muzzleVelocity;
+    bullet.damage = DamageForFirearmTool(player.tool);
     bullet.ttl = 8.0f;
     bullets_.push_back(bullet);
 
@@ -632,14 +795,14 @@ void SessionRuntime::FireWeapon(PlayerState& player)
 
     if (player.tool == ToolType::Smg)
     {
-        QueueAudioCue({118.0f, 0.06f, 0.16f, 0.16f, -22.0f});
-        QueueAudioCue({360.0f, 0.03f, 0.10f, 0.12f, 24.0f});
+        QueueAudioCue(CueAt(origin, 118.0f, 0.06f, 0.16f, 0.16f, -22.0f));
+        QueueAudioCue(CueAt(origin, 360.0f, 0.03f, 0.10f, 0.12f, 24.0f));
     }
     else
     {
-        QueueAudioCue({74.0f, 0.11f, 0.26f, 0.18f, -36.0f});
-        QueueAudioCue({238.0f, 0.06f, 0.18f, 0.14f, 18.0f});
-        QueueAudioCue({820.0f, 0.03f, 0.08f, 0.30f, -140.0f});
+        QueueAudioCue(CueAt(origin, 74.0f, 0.11f, 0.26f, 0.18f, -36.0f));
+        QueueAudioCue(CueAt(origin, 238.0f, 0.06f, 0.18f, 0.14f, 18.0f));
+        QueueAudioCue(CueAt(origin, 820.0f, 0.03f, 0.08f, 0.30f, -140.0f));
     }
 }
 
@@ -662,8 +825,8 @@ void SessionRuntime::StartReload(PlayerState& player)
     player.reloadDuration = definition.reloadDurationSeconds;
     player.fireCooldown = std::max(player.fireCooldown, 0.18f);
     QueueAudioCue(player.tool == ToolType::Smg
-        ? AudioCue{148.0f, 0.08f, 0.08f, 0.14f, 18.0f}
-        : AudioCue{112.0f, 0.10f, 0.09f, 0.08f, -10.0f});
+        ? CueAt(CurrentAimPosition(player), 148.0f, 0.08f, 0.08f, 0.14f, 18.0f)
+        : CueAt(CurrentAimPosition(player), 112.0f, 0.10f, 0.09f, 0.08f, -10.0f));
 }
 
 void SessionRuntime::CompleteReload(PlayerState& player)
@@ -678,8 +841,8 @@ void SessionRuntime::CompleteReload(PlayerState& player)
     player.reloadTimer = 0.0f;
     player.reloadDuration = 0.0f;
     QueueAudioCue(player.tool == ToolType::Smg
-        ? AudioCue{210.0f, 0.05f, 0.06f, 0.06f, 28.0f}
-        : AudioCue{166.0f, 0.06f, 0.06f, 0.04f, 16.0f});
+        ? CueAt(CurrentAimPosition(player), 210.0f, 0.05f, 0.06f, 0.06f, 28.0f)
+        : CueAt(CurrentAimPosition(player), 166.0f, 0.06f, 0.06f, 0.04f, 16.0f));
 }
 
 void SessionRuntime::UseDigTool(PlayerState& player)
@@ -735,18 +898,62 @@ void SessionRuntime::UseDigTool(PlayerState& player)
     switch (contactMaterial)
     {
     case world::MaterialId::WetMud:
-        QueueAudioCue({82.0f, 0.15f, 0.14f, 0.62f, -10.0f});
+        QueueAudioCue(CueAt(contactPoint, 82.0f, 0.15f, 0.14f, 0.62f, -10.0f));
         break;
     case world::MaterialId::ShallowWater:
-        QueueAudioCue({94.0f, 0.15f, 0.14f, 0.78f, -8.0f});
+        QueueAudioCue(CueAt(contactPoint, 94.0f, 0.15f, 0.14f, 0.78f, -8.0f));
         break;
     case world::MaterialId::Grass:
-        QueueAudioCue({98.0f, 0.10f, 0.10f, 0.24f, -10.0f});
+        QueueAudioCue(CueAt(contactPoint, 98.0f, 0.10f, 0.10f, 0.24f, -10.0f));
         break;
     default:
-        QueueAudioCue({124.0f, 0.09f, 0.12f, 0.28f, -14.0f});
+        QueueAudioCue(CueAt(contactPoint, 124.0f, 0.09f, 0.12f, 0.28f, -14.0f));
         break;
     }
+}
+
+void SessionRuntime::PlaceConstruction(PlayerState& player)
+{
+    player.weaponCycle = 1.0f;
+
+    const ConstructionPlacement placement = ComputeConstructionPlacement(
+        world_,
+        CurrentAimPosition(player),
+        CurrentForwardVector(player),
+        world::MaterialId::WoodPlanks,
+        player.command.secondaryDown ? ConstructionShape::Wall : ConstructionShape::Floor,
+        player.buildRotationQuarterTurns);
+    if (!placement.valid)
+    {
+        return;
+    }
+
+    if (!placement.placeable || placement.edits.empty())
+    {
+        QueueAudioCue(CueAt(CurrentAimPosition(player), 132.0f, 0.05f, 0.05f, 0.08f, -36.0f));
+        return;
+    }
+
+    const bool applied = world_.ApplyCellEdits(placement.edits);
+    if (!applied)
+    {
+        QueueAudioCue(CueAt(CurrentAimPosition(player), 126.0f, 0.05f, 0.05f, 0.10f, -44.0f));
+        return;
+    }
+
+    Vec3 placementCenter{};
+    for (const world::DemoWorld::CellMaterialEdit& edit : placement.edits)
+    {
+        placementCenter += world_.WorldMin() + Vec3{
+            (static_cast<float>(edit.x) + 0.5f) * world_.CellSize(),
+            (static_cast<float>(edit.y) + 0.5f) * world_.CellSize(),
+            (static_cast<float>(edit.z) + 0.5f) * world_.CellSize(),
+        };
+    }
+    placementCenter /= static_cast<float>(placement.edits.size());
+
+    QueueAudioCue(CueAt(placementCenter, 214.0f, 0.05f, 0.06f, 0.10f, 34.0f));
+    QueueAudioCue(CueAt(placementCenter, 128.0f, 0.08f, 0.07f, 0.06f, -20.0f));
 }
 
 void SessionRuntime::SpawnGrenade(const PlayerState& player)
@@ -845,16 +1052,33 @@ void SessionRuntime::UpdateGrenades(const float dt)
         {
             const world::MaterialId detonationMaterial = world_.MaterialAtWorldPosition(iter->position);
             world_.ApplyExplosion(iter->position, 4.8f, 0.95f);
+            for (auto& [playerId, player] : players_)
+            {
+                if (playerId == iter->ownerId || player.drivingTruck)
+                {
+                    continue;
+                }
+
+                const float distance = Length(player.controller.Position() - iter->position);
+                if (distance > kGrenadeDamageRadius)
+                {
+                    continue;
+                }
+
+                const float proximity = 1.0f - Clamp(distance / kGrenadeDamageRadius, 0.0f, 1.0f);
+                const int damage = std::max(1, static_cast<int>(std::round(Lerp(18.0f, static_cast<float>(kGrenadeMaxDamage), proximity))));
+                ApplyDamage(player, damage, iter->ownerId, iter->position);
+            }
             switch (detonationMaterial)
             {
             case world::MaterialId::ShallowWater:
-                QueueAudioCue({82.0f, 0.55f, 0.30f, 0.78f, -44.0f});
+                QueueAudioCue(CueAt(iter->position, 82.0f, 0.55f, 0.30f, 0.78f, -44.0f));
                 break;
             case world::MaterialId::WetMud:
-                QueueAudioCue({76.0f, 0.48f, 0.28f, 0.66f, -38.0f});
+                QueueAudioCue(CueAt(iter->position, 76.0f, 0.48f, 0.28f, 0.66f, -38.0f));
                 break;
             default:
-                QueueAudioCue({92.0f, 0.42f, 0.32f, 0.40f, -70.0f});
+                QueueAudioCue(CueAt(iter->position, 92.0f, 0.42f, 0.32f, 0.40f, -70.0f));
                 break;
             }
             iter = grenades_.erase(iter);
@@ -906,7 +1130,58 @@ void SessionRuntime::UpdateBullets(const float dt)
 
             const Vec3 direction = stepDelta / travelDistance;
             const world::RaycastHit hit = world_.Raycast({stepStart, direction}, travelDistance + world_.CellSize() * 0.25f);
-            if (hit.hit && hit.distance <= travelDistance + kBulletRadius)
+            float playerHitDistance = std::numeric_limits<float>::infinity();
+            PlayerState* hitPlayer = nullptr;
+            Vec3 playerHitPosition{};
+            for (auto& [playerId, player] : players_)
+            {
+                if (playerId == iter->ownerId || player.drivingTruck)
+                {
+                    continue;
+                }
+
+                const Vec3 expandedHalfExtents = kPlayerHitHalfExtents + Vec3{kBulletRadius, kBulletRadius, kBulletRadius};
+                const std::optional<float> hitFraction = SegmentIntersectsExpandedAabb(
+                    stepStart,
+                    stepStart + stepDelta,
+                    player.controller.Position() - expandedHalfExtents,
+                    player.controller.Position() + expandedHalfExtents);
+                if (!hitFraction.has_value())
+                {
+                    continue;
+                }
+
+                const float distance = travelDistance * *hitFraction;
+                if (distance >= playerHitDistance)
+                {
+                    continue;
+                }
+
+                playerHitDistance = distance;
+                hitPlayer = &player;
+                playerHitPosition = stepStart + stepDelta * *hitFraction;
+            }
+
+            const bool worldHit = hit.hit && hit.distance <= travelDistance + kBulletRadius;
+            if (hitPlayer != nullptr && (!worldHit || playerHitDistance <= hit.distance + kBulletRadius))
+            {
+                iter->position = playerHitPosition;
+
+                Beam impactBeam{};
+                impactBeam.start = stepStart;
+                impactBeam.end = playerHitPosition;
+                impactBeam.color = MakeColor(1.0f, 0.82f, 0.40f, 1.0f);
+                impactBeam.ttl = 0.08f;
+                beams_.push_back(impactBeam);
+
+                QueueAudioCue(CueAt(playerHitPosition, 168.0f, 0.035f, 0.08f, 0.24f, -18.0f));
+                ApplyDamage(*hitPlayer, iter->damage, iter->ownerId, playerHitPosition);
+
+                impacted = true;
+                break;
+            }
+
+            if (worldHit)
             {
                 iter->position = hit.position;
                 world_.ApplyRifleImpact(hit.position, direction, hit.material);
@@ -918,7 +1193,7 @@ void SessionRuntime::UpdateBullets(const float dt)
                 impactBeam.ttl = 0.08f;
                 beams_.push_back(impactBeam);
 
-                QueueBulletImpactAudio(hit.material, Length(iter->velocity));
+                QueueBulletImpactAudio(hit.position, hit.material, Length(iter->velocity));
 
                 impacted = true;
                 break;
@@ -941,7 +1216,55 @@ void SessionRuntime::UpdateBullets(const float dt)
     }
 }
 
-void SessionRuntime::QueueBulletImpactAudio(const world::MaterialId material, const float impactSpeed)
+void SessionRuntime::ApplyDamage(PlayerState& target, const int damage, const PlayerId, const Vec3& impactPosition)
+{
+    if (damage <= 0)
+    {
+        return;
+    }
+
+    target.health = std::max(0, target.health - damage);
+    QueueAudioCue(CueAt(impactPosition, 154.0f, 0.035f, 0.07f, 0.20f, -16.0f));
+    if (target.health > 0)
+    {
+        return;
+    }
+
+    QueueAudioCue(CueAt(target.controller.Position(), 92.0f, 0.16f, 0.10f, 0.30f, -32.0f));
+    RespawnPlayer(target);
+}
+
+void SessionRuntime::RespawnPlayer(PlayerState& player)
+{
+    if (player.drivingTruck || truckDriverId_ == player.id)
+    {
+        player.drivingTruck = false;
+        truckDriverId_ = kInvalidPlayerId;
+    }
+
+    player.controller.Spawn(world_);
+    player.tool = ToolType::Rifle;
+    player.command = {};
+    player.hasReceivedCommand = false;
+    ResetPlayerWeaponInventories(player);
+    player.fireCooldown = 0.0f;
+    player.digCooldown = 0.0f;
+    player.buildCooldown = 0.0f;
+    player.reloadTimer = 0.0f;
+    player.reloadDuration = 0.0f;
+    player.weaponCycle = 0.0f;
+    player.footstepCooldown = 0.0f;
+    player.reloading = false;
+    player.buildRotationQuarterTurns = 0u;
+    player.crosshairMaterial = world::MaterialId::Air;
+    player.health = kPlayerMaxHealth;
+    player.lastCumulativeLookYawDelta = 0.0f;
+    player.lastCumulativeLookPitchDelta = 0.0f;
+    world_.ActivateSimulationRegion(player.controller.Position(), 1);
+    QueueAudioCue(CueAt(player.controller.Position(), 212.0f, 0.08f, 0.07f, 0.05f, 24.0f));
+}
+
+void SessionRuntime::QueueBulletImpactAudio(const Vec3& position, const world::MaterialId material, const float impactSpeed)
 {
     const world::MaterialProperties properties = world::GetMaterialProperties(material);
     const float impactEnergy = Clamp(impactSpeed / 112.0f, 0.72f, 1.18f);
@@ -949,47 +1272,47 @@ void SessionRuntime::QueueBulletImpactAudio(const world::MaterialId material, co
 
     if (properties.isLiquid || material == world::MaterialId::ShallowWater)
     {
-        QueueAudioCue({136.0f, 0.035f, 0.16f * impactEnergy, 0.90f, -26.0f});
-        QueueAudioCue({96.0f, 0.125f, 0.12f * impactEnergy, 0.76f, -18.0f});
-        QueueAudioCue({58.0f, 0.220f, 0.07f * impactEnergy, 0.36f, -8.0f});
+        QueueAudioCue(CueAt(position, 136.0f, 0.035f, 0.16f * impactEnergy, 0.90f, -26.0f));
+        QueueAudioCue(CueAt(position, 96.0f, 0.125f, 0.12f * impactEnergy, 0.76f, -18.0f));
+        QueueAudioCue(CueAt(position, 58.0f, 0.220f, 0.07f * impactEnergy, 0.36f, -8.0f));
         return;
     }
 
     if (material == world::MaterialId::WetMud)
     {
-        QueueAudioCue({122.0f, 0.040f, 0.14f * impactEnergy, 0.76f, -30.0f});
-        QueueAudioCue({86.0f, 0.145f, 0.11f * impactEnergy, 0.62f, -16.0f});
-        QueueAudioCue({52.0f, 0.200f, 0.06f * impactEnergy, 0.22f, -10.0f});
+        QueueAudioCue(CueAt(position, 122.0f, 0.040f, 0.14f * impactEnergy, 0.76f, -30.0f));
+        QueueAudioCue(CueAt(position, 86.0f, 0.145f, 0.11f * impactEnergy, 0.62f, -16.0f));
+        QueueAudioCue(CueAt(position, 52.0f, 0.200f, 0.06f * impactEnergy, 0.22f, -10.0f));
         return;
     }
 
     if (material == world::MaterialId::Grass)
     {
-        QueueAudioCue({286.0f, 0.026f, 0.10f * impactEnergy, 0.74f, -150.0f});
-        QueueAudioCue({148.0f, 0.082f, 0.08f * impactEnergy, 0.34f, -36.0f});
-        QueueAudioCue({92.0f, 0.130f, 0.05f * impactEnergy, 0.18f, -16.0f});
+        QueueAudioCue(CueAt(position, 286.0f, 0.026f, 0.10f * impactEnergy, 0.74f, -150.0f));
+        QueueAudioCue(CueAt(position, 148.0f, 0.082f, 0.08f * impactEnergy, 0.34f, -36.0f));
+        QueueAudioCue(CueAt(position, 92.0f, 0.130f, 0.05f * impactEnergy, 0.18f, -16.0f));
         return;
     }
 
     if (material == world::MaterialId::DrySand || material == world::MaterialId::Gravel || properties.isLoose)
     {
-        QueueAudioCue({332.0f, 0.028f, 0.12f * impactEnergy, 0.82f, -170.0f});
-        QueueAudioCue({162.0f, 0.095f, 0.10f * impactEnergy, 0.40f, -44.0f});
-        QueueAudioCue({84.0f, 0.155f, 0.06f * impactEnergy, 0.26f, -18.0f});
+        QueueAudioCue(CueAt(position, 332.0f, 0.028f, 0.12f * impactEnergy, 0.82f, -170.0f));
+        QueueAudioCue(CueAt(position, 162.0f, 0.095f, 0.10f * impactEnergy, 0.40f, -44.0f));
+        QueueAudioCue(CueAt(position, 84.0f, 0.155f, 0.06f * impactEnergy, 0.26f, -18.0f));
         return;
     }
 
     if (hardness >= 0.58f)
     {
-        QueueAudioCue({980.0f, 0.018f, 0.18f * impactEnergy, 0.86f, -520.0f});
-        QueueAudioCue({Lerp(300.0f, 520.0f, hardness), 0.075f, Lerp(0.10f, 0.16f, hardness) * impactEnergy, 0.14f, -110.0f});
-        QueueAudioCue({Lerp(132.0f, 196.0f, hardness), 0.135f, 0.06f * impactEnergy, 0.05f, -22.0f});
+        QueueAudioCue(CueAt(position, 980.0f, 0.018f, 0.18f * impactEnergy, 0.86f, -520.0f));
+        QueueAudioCue(CueAt(position, Lerp(300.0f, 520.0f, hardness), 0.075f, Lerp(0.10f, 0.16f, hardness) * impactEnergy, 0.14f, -110.0f));
+        QueueAudioCue(CueAt(position, Lerp(132.0f, 196.0f, hardness), 0.135f, 0.06f * impactEnergy, 0.05f, -22.0f));
         return;
     }
 
-    QueueAudioCue({304.0f, 0.030f, 0.11f * impactEnergy, 0.72f, -140.0f});
-    QueueAudioCue({174.0f, 0.088f, 0.10f * impactEnergy, 0.28f, -32.0f});
-    QueueAudioCue({98.0f, 0.125f, 0.05f * impactEnergy, 0.12f, -12.0f});
+    QueueAudioCue(CueAt(position, 304.0f, 0.030f, 0.11f * impactEnergy, 0.72f, -140.0f));
+    QueueAudioCue(CueAt(position, 174.0f, 0.088f, 0.10f * impactEnergy, 0.28f, -32.0f));
+    QueueAudioCue(CueAt(position, 98.0f, 0.125f, 0.05f * impactEnergy, 0.12f, -12.0f));
 }
 
 auto SessionRuntime::CurrentAimPosition(const PlayerState& player) const -> Vec3

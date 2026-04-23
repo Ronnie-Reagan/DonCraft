@@ -100,7 +100,7 @@ private:
     void DestroyDescriptorResources();
     void CreateShadowResources();
     void DestroyShadowResources();
-    void UpdateShadowDescriptorSet();
+    void UpdateSceneDescriptorSet();
     void CreatePipelineLayout();
     void CreateFrameResources();
     void CreateSwapchain();
@@ -145,6 +145,7 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet shadowDescriptorSet_ = VK_NULL_HANDLE;
     VkSampler shadowSampler_ = VK_NULL_HANDLE;
+    VkSampler sceneSampler_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
@@ -155,12 +156,19 @@ private:
     std::vector<VkSemaphore> swapchainRenderCompleteSemaphores_;
     std::vector<VkFence> swapchainImageFences_;
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
+    VkFormat oitAccumulationFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat oitRevealageFormat_ = VK_FORMAT_R16_SFLOAT;
     ImageResource depthImage_{};
     ImageResource shadowImage_{};
+    ImageResource oitAccumulationImage_{};
+    ImageResource oitRevealageImage_{};
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
     VkPipeline terrainPipeline_ = VK_NULL_HANDLE;
     VkPipeline translucentTerrainPipeline_ = VK_NULL_HANDLE;
+    VkPipeline translucentTerrainOitPipeline_ = VK_NULL_HANDLE;
     VkPipeline effectPipeline_ = VK_NULL_HANDLE;
+    VkPipeline effectOitPipeline_ = VK_NULL_HANDLE;
+    VkPipeline oitCompositePipeline_ = VK_NULL_HANDLE;
     VkPipeline linePipeline_ = VK_NULL_HANDLE;
     VkPipeline overlayPipeline_ = VK_NULL_HANDLE;
 

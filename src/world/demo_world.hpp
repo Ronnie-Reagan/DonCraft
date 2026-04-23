@@ -64,6 +64,7 @@ public:
 
     void Reset();
     void Tick(float dt);
+    void TickRenderState(float dt);
     void SetGenerationSettings(const WorldGenerationSettings& settings);
     void SetFrameProfiler(FrameProfiler* profiler)
     {
@@ -75,6 +76,7 @@ public:
     [[nodiscard]] auto CaptureSnapshot() const -> DenseWorldSnapshot;
     [[nodiscard]] bool ApplySnapshot(const DenseWorldSnapshot& snapshot);
     [[nodiscard]] bool ApplyCellEdits(std::span<const CellMaterialEdit> edits);
+    void ActivateSimulationRegion(const Vec3& center, int radiusInChunks = 1);
 
     [[nodiscard]] auto GenerationSettings() const -> const WorldGenerationSettings&
     {
@@ -252,7 +254,7 @@ private:
         std::vector<ChunkCoord>* changedChunks = nullptr) -> bool;
     [[nodiscard]] auto CanWaterSpreadLaterally(int x, int y, int z) const -> bool;
     [[nodiscard]] auto CountAdjacentWater(int x, int y, int z) const -> int;
-    [[nodiscard]] auto ComputeLooseSimulationBounds() const -> std::optional<LooseSimulationBounds>;
+    [[nodiscard]] auto ComputeLooseSimulationRegions() const -> std::vector<LooseSimulationBounds>;
     void SimulateDrySandPass(const LooseSimulationBounds& bounds);
     void SimulateWetMudPass(const LooseSimulationBounds& bounds);
     void SimulateWaterFallPass(const LooseSimulationBounds& bounds);
@@ -261,7 +263,7 @@ private:
     void SimulateLooseMaterialMpm(float dt);
     void SimulateLooseMaterialSlicePass(bool slicesAlongZ, int sliceBudget);
     [[nodiscard]] auto LooseMaterialParticleMass(MaterialId material) const -> float;
-    void RebuildMeshCache();
+    void RebuildMeshCache(bool rebuildGlobalVertexCache);
     [[nodiscard]] auto LoadLegacyMaterialField(const std::filesystem::path& path) -> bool;
 
     void AppendFace(
@@ -313,6 +315,7 @@ private:
     double lastTerrainRebuildMilliseconds_ = 0.0;
     std::uint64_t terrainMeshVersion_ = 0;
     std::uint64_t terrainContentVersion_ = 0;
+    bool globalMeshCacheDirty_ = true;
     int mpmStabilizationTicks_ = 0;
     FrameProfiler* profiler_ = nullptr;
 };

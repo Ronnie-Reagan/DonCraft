@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace df::net
@@ -99,10 +100,70 @@ auto ReadChunkDelta(ByteReader& reader) -> ChunkDelta
     return DecodeChunkDelta(reader.ReadBytes(size));
 }
 
+auto EncodeWorldSnapshotCellsRle(const std::span<const std::uint8_t> cells) -> std::vector<std::uint8_t>
+{
+    std::vector<std::uint8_t> encoded;
+    encoded.reserve(cells.size());
+    std::size_t index = 0u;
+    while (index < cells.size())
+    {
+        const std::uint8_t value = cells[index];
+        std::uint16_t runLength = 1u;
+        while (index + runLength < cells.size() &&
+               cells[index + runLength] == value &&
+               runLength < std::numeric_limits<std::uint16_t>::max())
+        {
+            ++runLength;
+        }
+
+        encoded.push_back(static_cast<std::uint8_t>(runLength & 0xffu));
+        encoded.push_back(static_cast<std::uint8_t>((runLength >> 8u) & 0xffu));
+        encoded.push_back(value);
+        index += runLength;
+    }
+
+    return encoded;
+}
+
+auto DecodeWorldSnapshotCellsRle(
+    const std::span<const std::uint8_t> encoded,
+    const std::uint32_t decodedCellCount) -> std::vector<std::uint8_t>
+{
+    if ((encoded.size() % 3u) != 0u)
+    {
+        throw std::runtime_error("World snapshot RLE payload had a truncated run.");
+    }
+
+    std::vector<std::uint8_t> decoded;
+    decoded.reserve(decodedCellCount);
+    for (std::size_t index = 0u; index < encoded.size(); index += 3u)
+    {
+        const std::uint16_t runLength =
+            static_cast<std::uint16_t>(encoded[index]) |
+            (static_cast<std::uint16_t>(encoded[index + 1u]) << 8u);
+        if (runLength == 0u)
+        {
+            throw std::runtime_error("World snapshot RLE payload contained a zero-length run.");
+        }
+
+        decoded.insert(decoded.end(), runLength, encoded[index + 2u]);
+        if (decoded.size() > decodedCellCount)
+        {
+            throw std::runtime_error("World snapshot RLE payload expanded past the advertised decoded cell count.");
+        }
+    }
+
+    if (decoded.size() != decodedCellCount)
+    {
+        throw std::runtime_error("World snapshot RLE payload did not decode to the advertised cell count.");
+    }
+
+    return decoded;
+}
+
 void WriteActorSnapshot(ByteWriter& writer, const ActorSnapshot& snapshot)
 {
     writer.WritePod(snapshot.id);
-    writer.WriteString(snapshot.name);
     writer.WritePod(snapshot.position);
     writer.WritePod(snapshot.cameraPosition);
     writer.WritePod(snapshot.forward);
@@ -132,7 +193,6 @@ auto ReadActorSnapshot(ByteReader& reader) -> ActorSnapshot
 {
     ActorSnapshot snapshot{};
     snapshot.id = reader.ReadPod<game::PlayerId>();
-    snapshot.name = reader.ReadString();
     snapshot.position = reader.ReadPod<Vec3>();
     snapshot.cameraPosition = reader.ReadPod<Vec3>();
     snapshot.forward = reader.ReadPod<Vec3>();
@@ -230,6 +290,28 @@ auto ReadBeamSnapshot(ByteReader& reader) -> BeamSnapshot
     snapshot.end = reader.ReadPod<Vec3>();
     snapshot.color = reader.ReadPod<Vec4>();
     snapshot.ttl = reader.ReadPod<float>();
+    return snapshot;
+}
+
+void WriteAudioCueSnapshot(ByteWriter& writer, const AudioCueSnapshot& snapshot)
+{
+    writer.WritePod(snapshot.position);
+    writer.WritePod(snapshot.baseFrequency);
+    writer.WritePod(snapshot.durationSeconds);
+    writer.WritePod(snapshot.amplitude);
+    writer.WritePod(snapshot.noise);
+    writer.WritePod(snapshot.sweep);
+}
+
+auto ReadAudioCueSnapshot(ByteReader& reader) -> AudioCueSnapshot
+{
+    AudioCueSnapshot snapshot{};
+    snapshot.position = reader.ReadPod<Vec3>();
+    snapshot.baseFrequency = reader.ReadPod<float>();
+    snapshot.durationSeconds = reader.ReadPod<float>();
+    snapshot.amplitude = reader.ReadPod<float>();
+    snapshot.noise = reader.ReadPod<float>();
+    snapshot.sweep = reader.ReadPod<float>();
     return snapshot;
 }
 
@@ -335,6 +417,9 @@ auto EncodeCommandFrame(const game::PlayerCommandFrame& frame) -> std::vector<st
     ByteWriter writer;
     writer.WritePod(frame.sequence);
     WriteControlState(writer, frame.control);
+    writer.WritePod(frame.cumulativeLookYawDelta);
+    writer.WritePod(frame.cumulativeLookPitchDelta);
+    writer.WriteBool(frame.hasCumulativeLook);
     writer.WritePod(static_cast<std::uint8_t>(frame.selectedTool));
     writer.WriteBool(frame.primaryDown);
     writer.WriteBool(frame.primaryPressed);
@@ -342,6 +427,11 @@ auto EncodeCommandFrame(const game::PlayerCommandFrame& frame) -> std::vector<st
     writer.WriteBool(frame.quickGrenadePressed);
     writer.WriteBool(frame.interactPressed);
     writer.WriteBool(frame.reloadPressed);
+    writer.WritePod(frame.jumpPressCount);
+    writer.WritePod(frame.primaryPressCount);
+    writer.WritePod(frame.quickGrenadePressCount);
+    writer.WritePod(frame.interactPressCount);
+    writer.WritePod(frame.reloadPressCount);
     return writer.TakeData();
 }
 
@@ -351,6 +441,9 @@ auto DecodeCommandFrame(const std::span<const std::byte> bytes) -> game::PlayerC
     game::PlayerCommandFrame frame{};
     frame.sequence = reader.ReadPod<std::uint32_t>();
     frame.control = ReadControlState(reader);
+    frame.cumulativeLookYawDelta = reader.ReadPod<float>();
+    frame.cumulativeLookPitchDelta = reader.ReadPod<float>();
+    frame.hasCumulativeLook = reader.ReadBool();
     frame.selectedTool = static_cast<game::ToolType>(reader.ReadPod<std::uint8_t>());
     frame.primaryDown = reader.ReadBool();
     frame.primaryPressed = reader.ReadBool();
@@ -358,11 +451,55 @@ auto DecodeCommandFrame(const std::span<const std::byte> bytes) -> game::PlayerC
     frame.quickGrenadePressed = reader.ReadBool();
     frame.interactPressed = reader.ReadBool();
     frame.reloadPressed = reader.ReadBool();
+    frame.jumpPressCount = reader.ReadPod<std::uint32_t>();
+    frame.primaryPressCount = reader.ReadPod<std::uint32_t>();
+    frame.quickGrenadePressCount = reader.ReadPod<std::uint32_t>();
+    frame.interactPressCount = reader.ReadPod<std::uint32_t>();
+    frame.reloadPressCount = reader.ReadPod<std::uint32_t>();
     if (!reader.Empty())
     {
         throw std::runtime_error("PlayerCommandFrame had trailing bytes.");
     }
     return frame;
+}
+
+auto EncodeCommandBundle(const std::span<const game::PlayerCommandFrame> frames) -> std::vector<std::byte>
+{
+    ByteWriter writer;
+    const std::size_t frameCount = std::min(frames.size(), kMaxCommandBundleFrames);
+    const std::size_t firstFrame = frames.size() - frameCount;
+    writer.WritePod(static_cast<std::uint32_t>(frameCount));
+    for (std::size_t index = 0; index < frameCount; ++index)
+    {
+        const std::vector<std::byte> encodedFrame = EncodeCommandFrame(frames[firstFrame + index]);
+        writer.WritePod(static_cast<std::uint32_t>(encodedFrame.size()));
+        writer.WriteBytes(encodedFrame);
+    }
+    return writer.TakeData();
+}
+
+auto DecodeCommandBundle(const std::span<const std::byte> bytes) -> std::vector<game::PlayerCommandFrame>
+{
+    ByteReader reader(bytes);
+    const std::uint32_t count = reader.ReadPod<std::uint32_t>();
+    if (count > kMaxCommandBundleFrames)
+    {
+        throw std::runtime_error("CommandBundle contained too many frames.");
+    }
+
+    std::vector<game::PlayerCommandFrame> frames;
+    frames.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index)
+    {
+        const std::uint32_t size = reader.ReadPod<std::uint32_t>();
+        frames.push_back(DecodeCommandFrame(reader.ReadBytes(size)));
+    }
+
+    if (!reader.Empty())
+    {
+        throw std::runtime_error("CommandBundle had trailing bytes.");
+    }
+    return frames;
 }
 
 auto EncodeClientStateFrame(const ActorSnapshot& snapshot) -> std::vector<std::byte>
@@ -390,6 +527,8 @@ auto EncodeWorldSnapshotMessage(const WorldSnapshotMessage& message) -> std::vec
     WriteWorldSettings(writer, message.settings);
     writer.WritePod(message.totalCellCount);
     writer.WritePod(message.cellOffset);
+    writer.WritePod(message.decodedCellCount);
+    writer.WritePod(static_cast<std::uint8_t>(message.encoding));
     writer.WritePod(static_cast<std::uint32_t>(message.cells.size()));
     if (!message.cells.empty())
     {
@@ -406,6 +545,8 @@ auto DecodeWorldSnapshotMessage(const std::span<const std::byte> bytes) -> World
     message.settings = ReadWorldSettings(reader);
     message.totalCellCount = reader.ReadPod<std::uint32_t>();
     message.cellOffset = reader.ReadPod<std::uint32_t>();
+    message.decodedCellCount = reader.ReadPod<std::uint32_t>();
+    message.encoding = static_cast<WorldSnapshotMessage::Encoding>(reader.ReadPod<std::uint8_t>());
     const std::uint32_t cellCount = reader.ReadPod<std::uint32_t>();
     message.cells.resize(cellCount);
     if (cellCount > 0u)
@@ -414,7 +555,8 @@ auto DecodeWorldSnapshotMessage(const std::span<const std::byte> bytes) -> World
         std::memcpy(message.cells.data(), cellBytes.data(), cellBytes.size());
     }
     if (message.cellOffset > message.totalCellCount ||
-        static_cast<std::size_t>(message.totalCellCount - message.cellOffset) < message.cells.size())
+        message.decodedCellCount > message.totalCellCount ||
+        static_cast<std::size_t>(message.totalCellCount - message.cellOffset) < message.decodedCellCount)
     {
         throw std::runtime_error("WorldSnapshotMessage segment exceeded the advertised cell range.");
     }
@@ -425,10 +567,27 @@ auto DecodeWorldSnapshotMessage(const std::span<const std::byte> bytes) -> World
     return message;
 }
 
+auto DecodeWorldSnapshotCells(const WorldSnapshotMessage& message) -> std::vector<std::uint8_t>
+{
+    switch (message.encoding)
+    {
+    case WorldSnapshotMessage::Encoding::Raw:
+        if (message.cells.size() != message.decodedCellCount)
+        {
+            throw std::runtime_error("World snapshot raw payload size did not match the advertised decoded cell count.");
+        }
+        return message.cells;
+    case WorldSnapshotMessage::Encoding::Rle:
+        return DecodeWorldSnapshotCellsRle(message.cells, message.decodedCellCount);
+    default:
+        throw std::runtime_error("World snapshot segment used an unknown encoding.");
+    }
+}
+
 auto BuildWorldSnapshotMessages(
     const std::uint64_t serverTick,
     const world::DenseWorldSnapshot& snapshot,
-    const std::size_t maxCellsPerMessage) -> std::vector<WorldSnapshotMessage>
+    const std::size_t maxPayloadBytes) -> std::vector<WorldSnapshotMessage>
 {
     const std::size_t expectedCellCount = ExpectedWorldCellCount(snapshot.settings);
     const std::size_t totalCellCount = snapshot.cells.size();
@@ -436,7 +595,7 @@ auto BuildWorldSnapshotMessages(
     {
         throw std::runtime_error("World snapshot cell payload size did not match the advertised world dimensions.");
     }
-    const std::size_t boundedMaxCells = std::max<std::size_t>(1u, maxCellsPerMessage);
+    const std::size_t boundedMaxPayload = std::max<std::size_t>(1u, maxPayloadBytes);
 
     std::vector<WorldSnapshotMessage> messages;
     if (totalCellCount == 0u)
@@ -446,24 +605,36 @@ auto BuildWorldSnapshotMessages(
             .settings = snapshot.settings,
             .totalCellCount = 0u,
             .cellOffset = 0u,
+            .decodedCellCount = 0u,
+            .encoding = WorldSnapshotMessage::Encoding::Raw,
             .cells = {},
         });
         return messages;
     }
 
-    messages.reserve((totalCellCount + boundedMaxCells - 1u) / boundedMaxCells);
-    for (std::size_t cellOffset = 0u; cellOffset < totalCellCount; cellOffset += boundedMaxCells)
+    messages.reserve((totalCellCount + boundedMaxPayload - 1u) / boundedMaxPayload);
+    for (std::size_t cellOffset = 0u; cellOffset < totalCellCount; cellOffset += boundedMaxPayload)
     {
-        const std::size_t segmentCellCount = std::min(boundedMaxCells, totalCellCount - cellOffset);
+        const std::size_t segmentCellCount = std::min(boundedMaxPayload, totalCellCount - cellOffset);
+        const std::span<const std::uint8_t> rawCells(
+            snapshot.cells.data() + cellOffset,
+            segmentCellCount);
+        std::vector<std::uint8_t> encodedCells = EncodeWorldSnapshotCellsRle(rawCells);
+        WorldSnapshotMessage::Encoding encoding = WorldSnapshotMessage::Encoding::Rle;
+        if (encodedCells.size() >= rawCells.size())
+        {
+            encodedCells.assign(rawCells.begin(), rawCells.end());
+            encoding = WorldSnapshotMessage::Encoding::Raw;
+        }
+
         WorldSnapshotMessage message{};
         message.serverTick = serverTick;
         message.settings = snapshot.settings;
         message.totalCellCount = static_cast<std::uint32_t>(totalCellCount);
         message.cellOffset = static_cast<std::uint32_t>(cellOffset);
-        message.cells.insert(
-            message.cells.end(),
-            snapshot.cells.begin() + static_cast<std::ptrdiff_t>(cellOffset),
-            snapshot.cells.begin() + static_cast<std::ptrdiff_t>(cellOffset + segmentCellCount));
+        message.decodedCellCount = static_cast<std::uint32_t>(segmentCellCount);
+        message.encoding = encoding;
+        message.cells = std::move(encodedCells);
         messages.push_back(std::move(message));
     }
 
@@ -567,6 +738,12 @@ auto EncodeActorSnapshotFrame(const ActorSnapshotFrame& frame) -> std::vector<st
         WriteBeamSnapshot(writer, beam);
     }
 
+    writer.WritePod(static_cast<std::uint32_t>(frame.audioCues.size()));
+    for (const AudioCueSnapshot& cue : frame.audioCues)
+    {
+        WriteAudioCueSnapshot(writer, cue);
+    }
+
     return writer.TakeData();
 }
 
@@ -604,6 +781,13 @@ auto DecodeActorSnapshotFrame(const std::span<const std::byte> bytes) -> ActorSn
     for (std::uint32_t index = 0; index < beamCount; ++index)
     {
         frame.beams.push_back(ReadBeamSnapshot(reader));
+    }
+
+    const std::uint32_t audioCueCount = reader.ReadPod<std::uint32_t>();
+    frame.audioCues.reserve(audioCueCount);
+    for (std::uint32_t index = 0; index < audioCueCount; ++index)
+    {
+        frame.audioCues.push_back(ReadAudioCueSnapshot(reader));
     }
 
     if (!reader.Empty())
@@ -695,26 +879,51 @@ auto BuildChunkDeltas(const world::DenseWorldSnapshot& baseline, const world::De
         {
             for (int chunkX = 0; chunkX < chunkCountX; ++chunkX)
             {
-                ChunkDelta delta{};
-                delta.chunk = {chunkX, chunkY, chunkZ};
-
                 const int baseX = chunkX * static_cast<int>(world::kChunkSize);
                 const int baseY = chunkY * static_cast<int>(world::kChunkSize);
                 const int baseZ = chunkZ * static_cast<int>(world::kChunkSize);
-
-                for (int localZ = 0; localZ < static_cast<int>(world::kChunkSize); ++localZ)
+                const int chunkWidth = std::min(static_cast<int>(world::kChunkSize), current.settings.worldWidth - baseX);
+                const int chunkHeight = std::min(static_cast<int>(world::kChunkSize), current.settings.worldHeight - baseY);
+                const int chunkDepth = std::min(static_cast<int>(world::kChunkSize), current.settings.worldDepth - baseZ);
+                if (chunkWidth <= 0 || chunkHeight <= 0 || chunkDepth <= 0)
                 {
-                    for (int localY = 0; localY < static_cast<int>(world::kChunkSize); ++localY)
+                    continue;
+                }
+
+                bool chunkChanged = false;
+                for (int localZ = 0; localZ < chunkDepth && !chunkChanged; ++localZ)
+                {
+                    for (int localY = 0; localY < chunkHeight; ++localY)
                     {
-                        for (int localX = 0; localX < static_cast<int>(world::kChunkSize); ++localX)
+                        const std::size_t denseIndex = DenseIndex(current.settings, baseX, baseY + localY, baseZ + localZ);
+                        if (std::memcmp(
+                                baseline.cells.data() + denseIndex,
+                                current.cells.data() + denseIndex,
+                                static_cast<std::size_t>(chunkWidth)) != 0)
+                        {
+                            chunkChanged = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!chunkChanged)
+                {
+                    continue;
+                }
+
+                ChunkDelta delta{};
+                delta.chunk = {chunkX, chunkY, chunkZ};
+
+                for (int localZ = 0; localZ < chunkDepth; ++localZ)
+                {
+                    for (int localY = 0; localY < chunkHeight; ++localY)
+                    {
+                        for (int localX = 0; localX < chunkWidth; ++localX)
                         {
                             const int worldX = baseX + localX;
                             const int worldY = baseY + localY;
                             const int worldZ = baseZ + localZ;
-                            if (worldX >= current.settings.worldWidth || worldY >= current.settings.worldHeight || worldZ >= current.settings.worldDepth)
-                            {
-                                continue;
-                            }
 
                             const std::size_t denseIndex = DenseIndex(current.settings, worldX, worldY, worldZ);
                             if (baseline.cells[denseIndex] == current.cells[denseIndex])
