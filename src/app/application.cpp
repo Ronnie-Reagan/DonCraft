@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <system_error>
@@ -40,12 +42,11 @@ constexpr int kHostSetupWorldWidthRow = 2;
 constexpr int kHostSetupWorldHeightRow = 3;
 constexpr int kHostSetupWorldDepthRow = 4;
 constexpr int kHostSetupActiveChunkRow = 5;
-constexpr int kHostSetupCellScaleRow = 6;
-constexpr int kHostSetupSeedRow = 7;
-constexpr int kHostSetupReliefRow = 8;
-constexpr int kHostSetupWaterLevelRow = 9;
-constexpr int kHostSetupStartHostingRow = 10;
-constexpr int kHostSetupRowCount = 11;
+constexpr int kHostSetupSeedRow = 6;
+constexpr int kHostSetupReliefRow = 7;
+constexpr int kHostSetupWaterLevelRow = 8;
+constexpr int kHostSetupStartHostingRow = 9;
+constexpr int kHostSetupRowCount = 10;
 
 auto FormatFloat(const float value, const int decimals = 1) -> std::string
 {
@@ -83,6 +84,170 @@ auto ShouldRestartLocalWeaponCycle(const game::PlayerCommandFrame& command, cons
 auto ClampRenderDistanceMeters(const float meters) -> float
 {
     return Clamp(meters, kMinimumRenderDistanceMeters, kMaximumRenderDistanceMeters);
+}
+
+auto Trim(std::string_view text) -> std::string_view
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0)
+    {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())) != 0)
+    {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+auto LowerAscii(std::string_view text) -> std::string
+{
+    std::string lowered;
+    lowered.reserve(text.size());
+    for (const char ch : text)
+    {
+        lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return lowered;
+}
+
+auto ParseIntSetting(const std::string_view value, int& outValue) -> bool
+{
+    const std::string_view trimmed = Trim(value);
+    int parsed = 0;
+    const auto [ptr, error] = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), parsed);
+    if (error != std::errc{} || ptr != trimmed.data() + trimmed.size())
+    {
+        return false;
+    }
+    outValue = parsed;
+    return true;
+}
+
+auto ParseUint32Setting(const std::string_view value, std::uint32_t& outValue) -> bool
+{
+    const std::string_view trimmed = Trim(value);
+    std::uint32_t parsed = 0u;
+    const auto [ptr, error] = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), parsed);
+    if (error != std::errc{} || ptr != trimmed.data() + trimmed.size())
+    {
+        return false;
+    }
+    outValue = parsed;
+    return true;
+}
+
+auto ParseFloatSetting(const std::string_view value, float& outValue) -> bool
+{
+    try
+    {
+        std::size_t parsedChars = 0u;
+        const std::string text(Trim(value));
+        const float parsed = std::stof(text, &parsedChars);
+        if (parsedChars != text.size())
+        {
+            return false;
+        }
+        outValue = parsed;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+void ApplyRuntimeIni(
+    const std::filesystem::path& path,
+    world::WorldGenerationSettings& worldSettings,
+    game::SessionRenderOptions& renderOptions,
+    int& targetFrameRate)
+{
+    std::ifstream input(path);
+    if (!input)
+    {
+        return;
+    }
+
+    LogInfo("Loading runtime tuning from ", path.string());
+
+    std::string section;
+    std::string line;
+    while (std::getline(input, line))
+    {
+        std::string_view text = Trim(line);
+        if (text.empty() || text.front() == '#' || text.front() == ';')
+        {
+            continue;
+        }
+
+        if (text.front() == '[' && text.back() == ']')
+        {
+            section = LowerAscii(Trim(text.substr(1, text.size() - 2)));
+            continue;
+        }
+
+        const std::size_t equals = text.find('=');
+        if (equals == std::string_view::npos)
+        {
+            continue;
+        }
+
+        const std::string key = section + "." + LowerAscii(Trim(text.substr(0, equals)));
+        const std::string_view value = Trim(text.substr(equals + 1));
+        if (key == "world.width")
+        {
+            (void)ParseIntSetting(value, worldSettings.worldWidth);
+        }
+        else if (key == "world.height")
+        {
+            (void)ParseIntSetting(value, worldSettings.worldHeight);
+        }
+        else if (key == "world.depth")
+        {
+            (void)ParseIntSetting(value, worldSettings.worldDepth);
+        }
+        else if (key == "world.active_chunk_size")
+        {
+            (void)ParseIntSetting(value, worldSettings.activeChunkSize);
+        }
+        else if (key == "world.seed")
+        {
+            (void)ParseUint32Setting(value, worldSettings.seed);
+        }
+        else if (key == "world.terrain_relief")
+        {
+            (void)ParseFloatSetting(value, worldSettings.terrainRelief);
+        }
+        else if (key == "world.water_level")
+        {
+            (void)ParseFloatSetting(value, worldSettings.waterLevel);
+        }
+        else if (key == "render.draw_distance_meters")
+        {
+            (void)ParseFloatSetting(value, renderOptions.terrainDrawDistanceMeters);
+        }
+        else if (key == "render.full_detail_distance_meters")
+        {
+            (void)ParseFloatSetting(value, renderOptions.terrainFullDetailDistanceMeters);
+        }
+        else if (key == "render.coarse_detail_distance_meters")
+        {
+            (void)ParseFloatSetting(value, renderOptions.terrainCoarseDetailDistanceMeters);
+        }
+        else if (key == "render.target_fps")
+        {
+            (void)ParseIntSetting(value, targetFrameRate);
+        }
+    }
+
+    worldSettings = world::DemoWorld::ClampGenerationSettings(worldSettings);
+    renderOptions.terrainDrawDistanceMeters = ClampRenderDistanceMeters(renderOptions.terrainDrawDistanceMeters);
+    renderOptions.terrainFullDetailDistanceMeters = std::clamp(renderOptions.terrainFullDetailDistanceMeters, 64.0f, renderOptions.terrainDrawDistanceMeters);
+    renderOptions.terrainCoarseDetailDistanceMeters = std::clamp(
+        renderOptions.terrainCoarseDetailDistanceMeters,
+        renderOptions.terrainFullDetailDistanceMeters,
+        renderOptions.terrainDrawDistanceMeters);
+    targetFrameRate = std::clamp(targetFrameRate, 30, 240);
 }
 
 auto FindActorSnapshot(const net::ActorSnapshotFrame& frame, const game::PlayerId playerId) -> const net::ActorSnapshot*
@@ -265,6 +430,8 @@ int Application::Run()
     renderer_.SetFrameProfiler(&frameProfiler_);
     userDataPath_ = platform::GetUserDataPath("Don Reagan", config::kApplicationName);
     pendingWorldSettings_ = {};
+    ApplyRuntimeIni(std::filesystem::current_path() / "DonCraft.ini", pendingWorldSettings_, renderOptions_, targetFrameRate_);
+    ApplyRuntimeIni(userDataPath_ / "DonCraft.ini", pendingWorldSettings_, renderOptions_, targetFrameRate_);
     playerName_ = steam_.PersonaName().empty() ? "Frontier Player" : steam_.PersonaName();
     statusText_ = "MAIN MENU";
 
@@ -1400,7 +1567,6 @@ void Application::BuildHostSetupMenu(std::vector<render::ColorVertex2D>& overlay
         std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight) + " CELLS",
         std::string("WORLD DEPTH ") + std::to_string(pendingWorldSettings_.worldDepth) + " CELLS",
         std::string("ACTIVE CHUNK ") + std::to_string(pendingWorldSettings_.activeChunkSize) + " CELLS",
-        std::string("CELL SCALE ") + FormatFloat(pendingWorldSettings_.cellSize, 2) + " M",
         std::string("SEED ") + std::to_string(pendingWorldSettings_.seed),
         std::string("RELIEF ") + FormatFloat(pendingWorldSettings_.terrainRelief, 2),
         std::string("WATER LEVEL ") + FormatFloat(pendingWorldSettings_.waterLevel, 2),
@@ -1507,13 +1673,12 @@ void Application::BuildSessionOverlay(std::vector<render::ColorVertex2D>& overla
         game::AppendRect(overlayTriangles, panelX + 14.0f, panelY + 14.0f, panelWidth - 28.0f, 30.0f, MakeColor(0.12f, 0.15f, 0.20f, 0.95f), screenWidth, screenHeight);
         game::AppendText(overlayTriangles, panelX + 28.0f, panelY + 24.0f, 2.0f, "PAUSE MENU", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-        const std::array<std::string, 14> rows = {
+        const std::array<std::string, 13> rows = {
             "RESUME",
             std::string("WORLD WIDTH ") + std::to_string(pendingWorldSettings_.worldWidth) + " CELLS",
             std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight) + " CELLS",
             std::string("WORLD DEPTH ") + std::to_string(pendingWorldSettings_.worldDepth) + " CELLS",
             std::string("ACTIVE CHUNK ") + std::to_string(pendingWorldSettings_.activeChunkSize) + " CELLS",
-            std::string("CELL SCALE ") + FormatFloat(pendingWorldSettings_.cellSize, 2) + " M",
             std::string("SEED ") + std::to_string(pendingWorldSettings_.seed),
             std::string("RELIEF ") + FormatFloat(pendingWorldSettings_.terrainRelief, 2),
             std::string("WATER LEVEL ") + FormatFloat(pendingWorldSettings_.waterLevel, 2),
@@ -1763,9 +1928,6 @@ void Application::HandleHostSetupInput(const platform::InputState& input)
         case kHostSetupActiveChunkRow:
             pendingWorldSettings_.activeChunkSize += quantized(1);
             break;
-        case kHostSetupCellScaleRow:
-            pendingWorldSettings_.cellSize += scalar * (coarseAdjust ? 0.04f : 0.01f);
-            break;
         case kHostSetupSeedRow:
         {
             const std::uint32_t amount = static_cast<std::uint32_t>(std::abs(quantized(1)));
@@ -1922,7 +2084,6 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input, b
             const int worldHorizontalStep = coarseAdjust ? 16 : 4;
             const int worldVerticalStep = coarseAdjust ? 8 : 2;
             const int chunkStep = coarseAdjust ? 8 : 1;
-            const float cellScaleStep = coarseAdjust ? 0.10f : 0.01f;
             const std::uint32_t seedStep = coarseAdjust ? 100u : 1u;
             const float reliefStep = coarseAdjust ? 0.10f : 0.02f;
             const float waterStep = coarseAdjust ? 0.05f : 0.01f;
@@ -1943,9 +2104,6 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input, b
             case OfflinePauseItem::ActiveChunkSize:
                 pendingWorldSettings_.activeChunkSize += quantized(chunkStep);
                 break;
-            case OfflinePauseItem::CellScale:
-                pendingWorldSettings_.cellSize += scalar * cellScaleStep;
-                break;
             case OfflinePauseItem::Seed:
                 if (scalar > 0.0f)
                 {
@@ -1965,6 +2123,8 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input, b
                 break;
             case OfflinePauseItem::RenderDistance:
                 renderOptions_.terrainDrawDistanceMeters = ClampRenderDistanceMeters(renderOptions_.terrainDrawDistanceMeters + static_cast<float>(quantized(renderDistanceStep)));
+                renderOptions_.terrainCoarseDetailDistanceMeters = std::min(renderOptions_.terrainCoarseDetailDistanceMeters, renderOptions_.terrainDrawDistanceMeters);
+                renderOptions_.terrainFullDetailDistanceMeters = std::min(renderOptions_.terrainFullDetailDistanceMeters, renderOptions_.terrainCoarseDetailDistanceMeters);
                 break;
             case OfflinePauseItem::TargetFps:
                 targetFrameRate_ = std::clamp(targetFrameRate_ + quantized(fpsStep), 30, 240);
@@ -2087,6 +2247,8 @@ void Application::HandleSessionOverlayInput(const platform::InputState& input, b
         const int step = coarseAdjust ? 250 : 25;
         renderOptions_.terrainDrawDistanceMeters = ClampRenderDistanceMeters(
             renderOptions_.terrainDrawDistanceMeters + static_cast<float>(direction * magnitude * step));
+        renderOptions_.terrainCoarseDetailDistanceMeters = std::min(renderOptions_.terrainCoarseDetailDistanceMeters, renderOptions_.terrainDrawDistanceMeters);
+        renderOptions_.terrainFullDetailDistanceMeters = std::min(renderOptions_.terrainFullDetailDistanceMeters, renderOptions_.terrainCoarseDetailDistanceMeters);
     };
 
     if (input.KeyPressed(SDL_SCANCODE_UP))

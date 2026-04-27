@@ -217,18 +217,18 @@ inline constexpr std::array<WeaponViewTuning, kToolTypeCount> kWeaponViewTunings
                     .enabled = true,
                     .screen =
                         {
-                            .localCenterPoint = Vec3{0.0f, 0.064f, -0.354f},
-                            .localHalfSize = Vec2{0.128f, 0.104f},
+                            .localCenterPoint = Vec3{0.0f, 0.064f, 0.150f},
+                            .localHalfSize = Vec2{0.058f, 0.048f},
                             .pixelOffset = Vec2{0.0f, 0.0f},
-                            .paddingPixels = 3.0f,
-                            .fallbackScreenFraction = 0.54f,
-                            .fallbackMinSizePixels = 280,
-                            .fallbackMaxSizePixels = 620,
+                            .paddingPixels = 6.0f,
+                            .fallbackScreenFraction = 0.32f,
+                            .fallbackMinSizePixels = 180,
+                            .fallbackMaxSizePixels = 420,
                         },
                     .camera =
                         {
                             .localPosition = Vec3{0.0f, 0.064f, 0.354f},
-                            .localFocalPoint = Vec3{0.0f, 0.064f, 1.354f},
+                            .localFocalPoint = Vec3{0.0f, 0.064f, 8.354f},
                             .minimumTargetDistanceMeters = 48.0f,
                             .farPlanePaddingMeters = 64.0f,
                         },

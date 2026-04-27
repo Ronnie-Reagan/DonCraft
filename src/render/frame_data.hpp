@@ -35,6 +35,14 @@ struct ColorVertex2D
     Vec4 color{};
 };
 
+struct TerrainChunkDraw
+{
+    std::uint64_t key = 0;
+    std::uint64_t meshVersion = 0;
+    std::span<const ColorVertex3D> opaqueTriangles;
+    std::span<const ColorVertex3D> translucentTriangles;
+};
+
 struct FrameRenderData
 {
     struct ScopedView
@@ -53,6 +61,7 @@ struct FrameRenderData
     std::uint64_t terrainMeshVersion = 0;
     std::span<const ColorVertex3D> terrainTriangles;
     std::span<const ColorVertex3D> translucentTerrainTriangles;
+    std::vector<TerrainChunkDraw> terrainChunks;
     std::vector<ColorVertex3D> terrainTriangleStorage;
     std::vector<ColorVertex3D> translucentTerrainTriangleStorage;
     std::vector<ColorVertex3D> dynamicTriangles;

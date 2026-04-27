@@ -49,6 +49,7 @@ That means the same authoritative world simulation can run inside the graphical 
   - `Don_Craft_server`
 - `build-server-debug` now builds both `Don_Craft_server` and `Don_Craft_selfcheck`, so `ctest --preset test-server-debug` is usable after the matching build preset.
 - `assets/shaders/` is now limited to runtime shader assets, and CMake fails configure-time if `*.cpp` or `*.hpp` files drift back into that directory.
+- Runtime world scale is fixed at 1.0 meter per material cell; world size, terrain relief, water level, draw distance, and LOD distances are tuned through `DonCraft.ini`.
 - Self-check coverage now includes protocol, browser entry, world snapshot, chunk-delta, save/resume, and in-memory host/client session validation.
 - The loopback self-check now also covers remote interpolation, delayed authoritative correction with local command replay, and disconnect/reconnect recovery.
 
@@ -219,7 +220,6 @@ Useful options:
 - `--world-height <cells>`
 - `--world-depth <cells>`
 - `--active-chunk-size <cells>`
-- `--cell-size <meters>`
 - `--seed <uint32>`
 - `--terrain-relief <scalar>`
 - `--water-level <0..1>`
@@ -227,6 +227,14 @@ Useful options:
 - `--tags <comma separated tags>`
 - `--map-name <server browser map name>`
 - `--new-world`
+
+### Runtime tuning
+
+`DonCraft.ini` is staged beside the client executable. Edit it to tune default world dimensions and render LOD without rebuilding:
+
+- `[world]`: `width`, `height`, `depth`, `active_chunk_size`, `seed`, `terrain_relief`, `water_level`
+- `[render]`: `draw_distance_meters`, `full_detail_distance_meters`, `coarse_detail_distance_meters`, `target_fps`
+- Keep `full_detail_distance_meters` local on dense worlds; distant terrain uses coarse surface patches while nearby terrain keeps the full deformable mesh.
 
 ## Current limits
 

@@ -310,6 +310,12 @@ if(Don_Craft_BUILD_CLIENT)
             "$<TARGET_FILE_DIR:Don_Craft_client>/shaders"
     )
 
+    add_custom_command(TARGET Don_Craft_client POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/DonCraft.ini"
+            "$<TARGET_FILE_DIR:Don_Craft_client>/DonCraft.ini"
+    )
+
     if(Don_Craft_CREATE_LOCAL_STEAM_APPID)
         add_custom_command(TARGET Don_Craft_client POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

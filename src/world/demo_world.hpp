@@ -21,14 +21,14 @@ namespace df::world
 {
 struct WorldGenerationSettings
 {
-    int worldWidth = 48;
-    int worldHeight = 20;
-    int worldDepth = 48;
+    int worldWidth = 128;
+    int worldHeight = 64;
+    int worldDepth = 128;
     int activeChunkSize = 32;
     std::uint32_t seed = 1337u;
-    float cellSize = 0.35f;
-    float terrainRelief = 1.0f;
-    float waterLevel = 0.36f;
+    float cellSize = 1.0f;
+    float terrainRelief = 1.25f;
+    float waterLevel = 0.34f;
 };
 
 struct DenseWorldSnapshot
@@ -76,6 +76,7 @@ public:
     [[nodiscard]] auto CaptureSnapshot() const -> DenseWorldSnapshot;
     [[nodiscard]] bool ApplySnapshot(const DenseWorldSnapshot& snapshot);
     [[nodiscard]] bool ApplyCellEdits(std::span<const CellMaterialEdit> edits);
+    [[nodiscard]] auto ConsumeNetworkDirtyChunks() -> std::vector<ChunkCoord>;
     void ActivateSimulationRegion(const Vec3& center, int radiusInChunks = 1);
 
     [[nodiscard]] auto GenerationSettings() const -> const WorldGenerationSettings&
@@ -114,10 +115,13 @@ public:
     void GatherRenderGeometrySmoothedCulled(
         std::vector<render::ColorVertex3D>& opaqueTerrainTriangles,
         std::vector<render::ColorVertex3D>& translucentTerrainTriangles,
+        std::vector<render::TerrainChunkDraw>& terrainChunks,
         std::vector<render::ColorVertex3D>& debugLines,
         const Mat4& worldToClip,
         const Vec3& cameraPosition,
         float maxDistanceMeters,
+        float fullDetailDistanceMeters,
+        float coarseDetailDistanceMeters,
         bool showWireframe,
         bool showActiveChunks);
 
@@ -201,6 +205,7 @@ private:
         std::uint32_t mpmCellCount = 0u;
         bool meshDirty = true;
         bool meshInitialized = false;
+        std::uint64_t meshVersion = 0;
         std::vector<render::ColorVertex3D> opaqueTriangles;
         std::vector<render::ColorVertex3D> translucentTriangles;
     };
@@ -235,6 +240,7 @@ private:
     void RebuildChunkRuntimeState();
     void NoteCellMaterialChange(int x, int y, int z, MaterialId previousMaterial, MaterialId nextMaterial);
     void NotifyExternalTerrainEdit();
+    void MarkNetworkChunkDirtyForCell(int x, int y, int z);
     void TouchChunk(const ChunkCoord& chunk);
     void MarkChunkMeshDirty(const ChunkCoord& chunk);
     void MarkDirtyChunk(const ChunkCoord& chunk);
@@ -300,8 +306,11 @@ private:
     std::vector<std::uint8_t> cells_;
     std::vector<std::int8_t> waterLastLateralDirection_;
     std::vector<std::uint32_t> waterLastLateralPass_;
+    std::vector<ChunkCoord> networkDirtyChunks_;
     std::vector<float> solidSurfaceHeightMap_;
     std::vector<float> waterSurfaceHeightMap_;
+    std::vector<MaterialId> solidSurfaceMaterialMap_;
+    std::vector<MaterialId> waterSurfaceMaterialMap_;
     std::vector<render::ColorVertex3D> terrainTriangleCache_;
     std::vector<render::ColorVertex3D> translucentTerrainTriangleCache_;
     std::vector<render::ColorVertex3D> terrainWireCache_;

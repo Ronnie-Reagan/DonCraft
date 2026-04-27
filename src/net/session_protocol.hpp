@@ -236,5 +236,9 @@ struct DecodedMessage
 [[nodiscard]] auto DecodeBrowserEntry(std::span<const std::byte> bytes) -> SessionBrowserEntry;
 
 [[nodiscard]] auto BuildChunkDeltas(const world::DenseWorldSnapshot& baseline, const world::DenseWorldSnapshot& current) -> std::vector<ChunkDelta>;
+[[nodiscard]] auto BuildChunkDeltasForChunks(
+    const world::DenseWorldSnapshot& baseline,
+    const world::DemoWorld& current,
+    std::span<const world::ChunkCoord> dirtyChunks) -> std::vector<ChunkDelta>;
 [[nodiscard]] bool ApplyChunkDeltas(world::DenseWorldSnapshot& target, std::span<const ChunkDelta> deltas);
 }

@@ -581,6 +581,8 @@ void SessionRuntime::TickPlayers(const float dt)
             {
                 player.drivingTruck = true;
                 truckDriverId_ = id;
+                const Vec3 forward = truck_.ForwardVector();
+                player.controller.PlaceAt(truck_.DriverSeatPosition(), std::atan2(forward.z, forward.x), DegreesToRadians(-8.0f));
                 QueueAudioCue(CueAt(truck_.Position(), 140.0f, 0.14f, 0.18f, 0.18f, 90.0f));
             }
         }
@@ -624,6 +626,10 @@ void SessionRuntime::TickPlayers(const float dt)
                     break;
                 }
             }
+        }
+        else
+        {
+            player.controller.ApplyViewDelta(player.command.control.lookYawDelta * 0.0026f, player.command.control.lookPitchDelta * 0.0022f);
         }
 
         world_.ActivateSimulationRegion(player.drivingTruck ? truck_.Position() : player.controller.Position(), 1);
@@ -737,6 +743,10 @@ void SessionRuntime::TickTruck(const float dt)
     }
 
     truck_.Tick(driverControl, world_, dt, truckDriverId_ != kInvalidPlayerId);
+    if (PlayerState* const driver = FindPlayer(truckDriverId_))
+    {
+        driver->controller.Translate(truck_.DriverSeatPosition() - driver->controller.Position());
+    }
     if (truckDriverId_ != kInvalidPlayerId || truck_.SpeedMetersPerSecond() > 0.25f)
     {
         world_.ActivateSimulationRegion(truck_.Position(), 1);
@@ -795,14 +805,17 @@ void SessionRuntime::FireWeapon(PlayerState& player)
 
     if (player.tool == ToolType::Smg)
     {
+        QueueAudioCue(CueAt(origin, 62.0f, 0.08f, 0.10f, 0.18f, -18.0f));
         QueueAudioCue(CueAt(origin, 118.0f, 0.06f, 0.16f, 0.16f, -22.0f));
         QueueAudioCue(CueAt(origin, 360.0f, 0.03f, 0.10f, 0.12f, 24.0f));
     }
     else
     {
-        QueueAudioCue(CueAt(origin, 74.0f, 0.11f, 0.26f, 0.18f, -36.0f));
-        QueueAudioCue(CueAt(origin, 238.0f, 0.06f, 0.18f, 0.14f, 18.0f));
-        QueueAudioCue(CueAt(origin, 820.0f, 0.03f, 0.08f, 0.30f, -140.0f));
+        QueueAudioCue(CueAt(origin, 46.0f, 0.20f, 0.34f, 0.20f, -18.0f));
+        QueueAudioCue(CueAt(origin, 82.0f, 0.32f, 0.22f, 0.56f, -30.0f));
+        QueueAudioCue(CueAt(origin, 238.0f, 0.075f, 0.17f, 0.22f, 18.0f));
+        QueueAudioCue(CueAt(origin, 820.0f, 0.035f, 0.07f, 0.34f, -180.0f));
+        QueueAudioCue(CueAt(origin, 34.0f, 0.46f, 0.11f, 0.78f, -8.0f));
     }
 }
 
@@ -1072,13 +1085,19 @@ void SessionRuntime::UpdateGrenades(const float dt)
             switch (detonationMaterial)
             {
             case world::MaterialId::ShallowWater:
+                QueueAudioCue(CueAt(iter->position, 44.0f, 0.72f, 0.28f, 0.72f, -14.0f));
                 QueueAudioCue(CueAt(iter->position, 82.0f, 0.55f, 0.30f, 0.78f, -44.0f));
+                QueueAudioCue(CueAt(iter->position, 210.0f, 0.20f, 0.13f, 0.86f, -96.0f));
                 break;
             case world::MaterialId::WetMud:
+                QueueAudioCue(CueAt(iter->position, 38.0f, 0.68f, 0.30f, 0.58f, -10.0f));
                 QueueAudioCue(CueAt(iter->position, 76.0f, 0.48f, 0.28f, 0.66f, -38.0f));
+                QueueAudioCue(CueAt(iter->position, 170.0f, 0.18f, 0.12f, 0.72f, -70.0f));
                 break;
             default:
+                QueueAudioCue(CueAt(iter->position, 34.0f, 0.76f, 0.34f, 0.46f, -8.0f));
                 QueueAudioCue(CueAt(iter->position, 92.0f, 0.42f, 0.32f, 0.40f, -70.0f));
+                QueueAudioCue(CueAt(iter->position, 260.0f, 0.16f, 0.15f, 0.74f, -130.0f));
                 break;
             }
             iter = grenades_.erase(iter);
@@ -1322,6 +1341,6 @@ auto SessionRuntime::CurrentAimPosition(const PlayerState& player) const -> Vec3
 
 auto SessionRuntime::CurrentForwardVector(const PlayerState& player) const -> Vec3
 {
-    return player.drivingTruck ? truck_.ForwardVector() : player.controller.ForwardVector();
+    return player.controller.ForwardVector();
 }
 }

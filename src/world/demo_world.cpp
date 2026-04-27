@@ -33,23 +33,23 @@ constexpr float kActiveChunkLifetimeSeconds = 2.5f;
 constexpr std::uint32_t kDemoWorldMagic = 0x57464444u;
 constexpr std::uint32_t kDemoWorldVersion = 3u;
 constexpr int kMinWorldWidthDepthCells = 8;
-constexpr int kMaxWorldWidthDepthCells = 384;
+constexpr int kMaxWorldWidthDepthCells = 768;
 constexpr int kMinWorldHeightCells = 8;
-constexpr int kMaxWorldHeightCells = 160;
+constexpr int kMaxWorldHeightCells = 192;
 constexpr int kMinActiveChunkSizeCells = 8;
 constexpr int kMaxActiveChunkSizeCells = 128;
 constexpr float kDrySandTravelSpeedMetersPerSecond = 4.0f;
 constexpr float kWetMudTravelSpeedMetersPerSecond = 1.3f;
-constexpr float kWaterFallSpeedMetersPerSecond = 8.0f;
-constexpr float kWaterSpreadSpeedMetersPerSecond = 4.0f;
-constexpr int kMaxWaterFallPassesPerTick = 2;
-constexpr int kMaxWaterSpreadPassesPerTick = 2;
-constexpr int kWaterFallCascadeMovesPerPass = 4;
-constexpr int kWaterSpreadStrideMovesPerPass = 4;
-constexpr std::uint32_t kWaterBacktrackCooldownPasses = 4u;
+constexpr float kWaterFallSpeedMetersPerSecond = 48.0f;
+constexpr float kWaterSpreadSpeedMetersPerSecond = 32.0f;
+constexpr int kMaxWaterFallPassesPerTick = 8;
+constexpr int kMaxWaterSpreadPassesPerTick = 8;
+constexpr int kWaterFallCascadeMovesPerPass = 8;
+constexpr int kWaterSpreadStrideMovesPerPass = 8;
+constexpr std::uint32_t kWaterBacktrackCooldownPasses = 2u;
 constexpr int kLooseSimulationPaddingCells = 1;
 constexpr float kMpmSimulationIntervalSeconds = 1.0f / 120.0f;
-constexpr int kMpmSliceBudgetPerAxisPass = 16;
+constexpr int kMpmSliceBudgetPerAxisPass = 32;
 constexpr std::size_t kMpmParticleWarningThreshold = 8192u;
 constexpr float kSurfaceIsoLevel = 0.5f;
 
@@ -157,8 +157,9 @@ auto AllowGpuLooseMaterialSimulation() -> bool
     return enabled;
 }
 constexpr float kSurfaceIntersectionEpsilon = 1.0e-4f;
-constexpr std::size_t kMinMeshChunkBudgetPerPass = 32u;
+constexpr std::size_t kMinMeshChunkBudgetPerPass = 4u;
 constexpr std::size_t kMeshChunkBudgetPerWorker = 16u;
+constexpr std::size_t kMaxMeshCellsPerPass = 262144u;
 
 const std::array<Vec3, 8> kCubeCorners = {
     Vec3{0.0f, 0.0f, 0.0f},
@@ -267,6 +268,47 @@ auto ValueNoise2D(const float x, const float z, const std::uint32_t seed) -> flo
     const float ix0 = Lerp(v00, v10, fx);
     const float ix1 = Lerp(v01, v11, fx);
     return Lerp(ix0, ix1, fz) * 2.0f - 1.0f;
+}
+
+auto FbmNoise2D(
+    float x,
+    float z,
+    const std::uint32_t seed,
+    const int octaves,
+    const float lacunarity = 2.0f,
+    const float gain = 0.50f) -> float
+{
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float accumulated = 0.0f;
+    float totalAmplitude = 0.0f;
+    for (int octave = 0; octave < octaves; ++octave)
+    {
+        accumulated += ValueNoise2D(x * frequency, z * frequency, seed + static_cast<std::uint32_t>(octave) * 0x9e3779b9u) * amplitude;
+        totalAmplitude += amplitude;
+        amplitude *= gain;
+        frequency *= lacunarity;
+    }
+
+    return totalAmplitude > 0.0f ? accumulated / totalAmplitude : 0.0f;
+}
+
+auto RidgedNoise2D(float x, float z, const std::uint32_t seed, const int octaves) -> float
+{
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float accumulated = 0.0f;
+    float totalAmplitude = 0.0f;
+    for (int octave = 0; octave < octaves; ++octave)
+    {
+        const float value = 1.0f - std::abs(ValueNoise2D(x * frequency, z * frequency, seed + static_cast<std::uint32_t>(octave) * 0x68bc21ebu));
+        accumulated += value * amplitude;
+        totalAmplitude += amplitude;
+        amplitude *= 0.48f;
+        frequency *= 2.05f;
+    }
+
+    return totalAmplitude > 0.0f ? accumulated / totalAmplitude : 0.0f;
 }
 
 struct ScanOrder
@@ -495,6 +537,13 @@ auto BoxIntersectsClipSpace(const Mat4& worldToClip, const Vec3& minCorner, cons
 
     return !(allLeft || allRight || allBottom || allTop || allNear || allFar);
 }
+
+auto TerrainChunkRenderKey(const ChunkCoord& chunk) -> std::uint64_t
+{
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(chunk.x)) & 0x1fffffu) |
+           ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(chunk.y)) & 0x1fffffu) << 21u) |
+           ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(chunk.z)) & 0x1fffffu) << 42u);
+}
 }
 
 DemoWorld::DemoWorld()
@@ -513,7 +562,7 @@ auto DemoWorld::ClampGenerationSettings(WorldGenerationSettings settings) -> Wor
         settings.activeChunkSize,
         std::min(kMinActiveChunkSizeCells, maxMeaningfulChunkSize),
         std::min(kMaxActiveChunkSizeCells, maxMeaningfulChunkSize));
-    settings.cellSize = Clamp(settings.cellSize, 0.01f, 3.0f);
+    settings.cellSize = 1.0f;
     settings.terrainRelief = Clamp(settings.terrainRelief, 0.0f, 3.0f);
     settings.waterLevel = Clamp(settings.waterLevel, 0.0f, 0.95f);
     return settings;
@@ -559,6 +608,8 @@ void DemoWorld::ResetTransientState()
     activeChunkCount_ = 0;
     solidSurfaceHeightMap_.clear();
     waterSurfaceHeightMap_.clear();
+    solidSurfaceMaterialMap_.clear();
+    waterSurfaceMaterialMap_.clear();
     terrainTriangleCache_.clear();
     translucentTerrainTriangleCache_.clear();
     terrainWireCache_.clear();
@@ -569,6 +620,7 @@ void DemoWorld::ResetTransientState()
     waterFallAccumulator_ = 0.0f;
     waterSpreadAccumulator_ = 0.0f;
     waterSpreadPass_ = 0u;
+    networkDirtyChunks_.clear();
     mpmTimeAccumulator_ = 0.0f;
     mpmNextXySlice_ = 0;
     mpmNextZySlice_ = 0;
@@ -587,6 +639,17 @@ void DemoWorld::RebuildChunkRuntimeState()
 {
     chunkRuntimeStates_.clear();
     activeChunkCount_ = 0;
+
+    const std::size_t columnCount = static_cast<std::size_t>(width_ * depth_);
+    solidSurfaceHeightMap_.assign(columnCount, -std::numeric_limits<float>::infinity());
+    waterSurfaceHeightMap_.assign(columnCount, -std::numeric_limits<float>::infinity());
+    solidSurfaceMaterialMap_.assign(columnCount, MaterialId::Air);
+    waterSurfaceMaterialMap_.assign(columnCount, MaterialId::Air);
+
+    const auto columnIndex = [this](const int x, const int z) -> std::size_t
+    {
+        return static_cast<std::size_t>(z * width_ + x);
+    };
 
     for (int z = 0; z < depth_; ++z)
     {
@@ -609,6 +672,22 @@ void DemoWorld::RebuildChunkRuntimeState()
                 if (UsesMpmLooseSimulation(material))
                 {
                     ++state.mpmCellCount;
+                }
+
+                const std::size_t surfaceIndex = columnIndex(x, z);
+                const float worldTop = (static_cast<float>(y) + 1.0f) * cellSize_;
+                if (material == MaterialId::ShallowWater)
+                {
+                    if (worldTop >= waterSurfaceHeightMap_[surfaceIndex])
+                    {
+                        waterSurfaceHeightMap_[surfaceIndex] = worldTop;
+                        waterSurfaceMaterialMap_[surfaceIndex] = material;
+                    }
+                }
+                else if (worldTop >= solidSurfaceHeightMap_[surfaceIndex])
+                {
+                    solidSurfaceHeightMap_[surfaceIndex] = worldTop;
+                    solidSurfaceMaterialMap_[surfaceIndex] = material;
                 }
             }
         }
@@ -669,6 +748,15 @@ void DemoWorld::NotifyExternalTerrainEdit()
 {
     mpmTimeAccumulator_ = 0.0f;
     mpmStabilizationTicks_ = std::max(mpmStabilizationTicks_, 1);
+}
+
+void DemoWorld::MarkNetworkChunkDirtyForCell(const int x, const int y, const int z)
+{
+    networkDirtyChunks_.push_back({
+        x / static_cast<int>(kChunkSize),
+        y / static_cast<int>(kChunkSize),
+        z / static_cast<int>(kChunkSize),
+    });
 }
 
 void DemoWorld::TouchChunk(const ChunkCoord& chunk)
@@ -761,17 +849,31 @@ void DemoWorld::Reset()
             const float normalizedZ = ((static_cast<float>(z) + 0.5f) / static_cast<float>(depth_)) * 2.0f - 1.0f;
             const float worldX = minCorner.x + (static_cast<float>(x) + 0.5f) * cellSize_;
             const float worldZ = minCorner.z + (static_cast<float>(z) + 0.5f) * cellSize_;
-            const float broadNoise = 0.5f + 0.5f * ValueNoise2D((normalizedX + 1.0f) * 2.4f, (normalizedZ + 1.0f) * 2.4f, generationSettings_.seed);
-            const float detailNoise = 0.5f + 0.5f * ValueNoise2D((normalizedX + 1.0f) * 7.3f, (normalizedZ + 1.0f) * 7.3f, generationSettings_.seed ^ 0x68bc21ebu);
-            const float ridgeNoise = 1.0f - std::abs(ValueNoise2D((normalizedX + 1.0f) * 4.5f, (normalizedZ + 1.0f) * 4.5f, generationSettings_.seed ^ 0x51633e2du));
-            const float terrainSignal = broadNoise * 0.58f + detailNoise * 0.22f + ridgeNoise * 0.20f;
-            const float baseHeightNormalized = 0.18f + terrainSignal * (0.18f * generationSettings_.terrainRelief);
+            const float warpX = FbmNoise2D(worldX * 0.0065f, worldZ * 0.0065f, generationSettings_.seed ^ 0x31a2f00du, 3) * 42.0f;
+            const float warpZ = FbmNoise2D(worldX * 0.0065f, worldZ * 0.0065f, generationSettings_.seed ^ 0x6b82d3a1u, 3) * 42.0f;
+            const float terrainX = worldX + warpX;
+            const float terrainZ = worldZ + warpZ;
+            const float broadSignal = FbmNoise2D(terrainX * 0.0048f, terrainZ * 0.0048f, generationSettings_.seed ^ 0x4bd0137u, 5, 1.92f, 0.54f);
+            const float rollingSignal = FbmNoise2D(terrainX * 0.0120f, terrainZ * 0.0120f, generationSettings_.seed ^ 0x68bc21ebu, 4, 2.06f, 0.46f);
+            const float detailSignal = FbmNoise2D(terrainX * 0.0350f, terrainZ * 0.0350f, generationSettings_.seed ^ 0x05e33fa5u, 3, 2.12f, 0.38f);
+            const float ridgeSignal = RidgedNoise2D(terrainX * 0.0105f, terrainZ * 0.0105f, generationSettings_.seed ^ 0x51633e2du, 4);
+            const float broadNoise = broadSignal * 0.5f + 0.5f;
+            const float detailNoise = detailSignal * 0.5f + 0.5f;
+            const float ridgeNoise = ridgeSignal;
+            const float terrainSignal =
+                broadSignal * 0.58f +
+                rollingSignal * 0.28f +
+                detailSignal * 0.08f +
+                (ridgeSignal - 0.48f) * 0.22f;
+            const float baseHeightNormalized =
+                0.16f +
+                (terrainSignal * 0.105f + 0.105f) * generationSettings_.terrainRelief;
 
             const float basinX = (normalizedX - basinCenterX) / basinRadiusX;
             const float basinZ = (normalizedZ - basinCenterZ) / basinRadiusZ;
             const float basinDistance = basinX * basinX + basinZ * basinZ;
             const float basinShape = Clamp(1.0f - basinDistance, 0.0f, 1.0f);
-            const int basinCarve = static_cast<int>(std::round(basinShape * 3.5f));
+            const int basinCarve = static_cast<int>(std::round(basinShape * std::max(4.0f, static_cast<float>(height_) * 0.055f)));
             int baseHeight = std::clamp(static_cast<int>(std::round(baseHeightNormalized * static_cast<float>(height_))) - basinCarve, 2, height_ - 4);
 
             const bool sandBand = normalizedX < (-0.35f + 0.10f * ValueNoise2D(worldZ * 0.11f, worldX * 0.09f, generationSettings_.seed ^ 0x1234567u));
@@ -1091,6 +1193,31 @@ bool DemoWorld::ApplySnapshot(const DenseWorldSnapshot& snapshot)
     ++terrainContentVersion_;
     EnsureMpmBackend();
     return true;
+}
+
+auto DemoWorld::ConsumeNetworkDirtyChunks() -> std::vector<ChunkCoord>
+{
+    std::vector<ChunkCoord> chunks;
+    chunks.swap(networkDirtyChunks_);
+    if (chunks.empty())
+    {
+        return chunks;
+    }
+
+    std::sort(chunks.begin(), chunks.end(), [](const ChunkCoord& lhs, const ChunkCoord& rhs)
+    {
+        if (lhs.z != rhs.z)
+        {
+            return lhs.z < rhs.z;
+        }
+        if (lhs.y != rhs.y)
+        {
+            return lhs.y < rhs.y;
+        }
+        return lhs.x < rhs.x;
+    });
+    chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+    return chunks;
 }
 
 bool DemoWorld::ApplyCellEdits(const std::span<const CellMaterialEdit> edits)
@@ -1872,10 +1999,13 @@ void DemoWorld::GatherRenderGeometrySmoothed(
 void DemoWorld::GatherRenderGeometrySmoothedCulled(
     std::vector<render::ColorVertex3D>& opaqueTerrainTriangles,
     std::vector<render::ColorVertex3D>& translucentTerrainTriangles,
+    std::vector<render::TerrainChunkDraw>& terrainChunks,
     std::vector<render::ColorVertex3D>& debugLines,
     const Mat4& worldToClip,
     const Vec3& cameraPosition,
     const float maxDistanceMeters,
+    const float fullDetailDistanceMeters,
+    const float coarseDetailDistanceMeters,
     const bool showWireframe,
     const bool showActiveChunks)
 {
@@ -1887,13 +2017,18 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
 
     opaqueTerrainTriangles.clear();
     translucentTerrainTriangles.clear();
+    terrainChunks.clear();
     debugLines.clear();
 
     const int chunkSpan = std::max(activeChunkSize_, 1);
     const float clampedDrawDistance = std::max(maxDistanceMeters, 1.0f);
     const float chunkWorldSpan = static_cast<float>(chunkSpan) * cellSize_;
-    const float fullDetailDistance = std::min(clampedDrawDistance, std::max(chunkWorldSpan * 4.0f, 100.0f));
-    const float coarseDetailDistance = std::min(clampedDrawDistance, std::max(chunkWorldSpan * 8.0f, 250.0f));
+    const float fullDetailDistance = std::min(
+        clampedDrawDistance,
+        std::max(fullDetailDistanceMeters, std::max(chunkWorldSpan * 3.0f, 96.0f)));
+    const float coarseDetailDistance = std::min(
+        clampedDrawDistance,
+        std::max(coarseDetailDistanceMeters, std::max(fullDetailDistance + chunkWorldSpan * 4.0f, 384.0f)));
     const Vec3 worldMinimum = WorldMin();
 
     struct ColumnCoord
@@ -1989,6 +2124,7 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         }
         return lhs.x < rhs.x;
     });
+    terrainChunks.reserve(visibleChunks.size());
 
     std::vector<std::pair<ColumnCoord, float>> orderedFarColumns;
     orderedFarColumns.reserve(farColumns.size());
@@ -2013,8 +2149,8 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         totalOpaqueVertices += state.opaqueTriangles.size();
         totalTranslucentVertices += state.translucentTriangles.size();
     }
-    opaqueTerrainTriangles.reserve(totalOpaqueVertices + orderedFarColumns.size() * 384u);
-    translucentTerrainTriangles.reserve(totalTranslucentVertices + orderedFarColumns.size() * 192u);
+    opaqueTerrainTriangles.reserve(totalOpaqueVertices + orderedFarColumns.size() * 96u);
+    translucentTerrainTriangles.reserve(totalTranslucentVertices + orderedFarColumns.size() * 48u);
     debugLines.reserve(showWireframe ? (totalOpaqueVertices + totalTranslucentVertices) * 2u : visibleChunks.size() * 24u);
 
     const auto columnIndex = [this](const int x, const int z) -> std::size_t
@@ -2070,6 +2206,15 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
         if (x < 0 || x >= width_ || z < 0 || z >= depth_)
         {
             return MaterialId::Air;
+        }
+
+        const std::size_t surfaceIndex = static_cast<std::size_t>(z * width_ + x);
+        const std::vector<MaterialId>& materialMap = field == SurfaceField::Water
+            ? waterSurfaceMaterialMap_
+            : solidSurfaceMaterialMap_;
+        if (surfaceIndex < materialMap.size())
+        {
+            return materialMap[surfaceIndex];
         }
 
         for (int y = height_ - 1; y >= 0; --y)
@@ -2216,7 +2361,7 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
             return;
         }
 
-        const int stepCells = distanceToColumn > coarseDetailDistance ? 8 : 4;
+        const int stepCells = distanceToColumn > coarseDetailDistance ? 16 : 8;
         for (int patchZ = zBegin; patchZ < zEnd; patchZ += stepCells)
         {
             const int patchMaxZ = std::min(patchZ + stepCells, zEnd);
@@ -2242,8 +2387,15 @@ void DemoWorld::GatherRenderGeometrySmoothedCulled(
     for (const ChunkCoord& chunk : visibleChunks)
     {
         const ChunkRuntimeState& state = chunkRuntimeStates_.at(chunk);
-        opaqueTerrainTriangles.insert(opaqueTerrainTriangles.end(), state.opaqueTriangles.begin(), state.opaqueTriangles.end());
-        translucentTerrainTriangles.insert(translucentTerrainTriangles.end(), state.translucentTriangles.begin(), state.translucentTriangles.end());
+        if (!state.opaqueTriangles.empty() || !state.translucentTriangles.empty())
+        {
+            terrainChunks.push_back({
+                .key = TerrainChunkRenderKey(chunk),
+                .meshVersion = state.meshVersion,
+                .opaqueTriangles = state.opaqueTriangles,
+                .translucentTriangles = state.translucentTriangles,
+            });
+        }
 
         if (!showActiveChunks || state.activityLifetime <= 0.0f)
         {
@@ -2502,6 +2654,7 @@ void DemoWorld::SetCellBatched(
     NoteCellMaterialChange(x, y, z, previousMaterial, material);
     SetCellUnchecked(x, y, z, material);
     ClearCellWaterMetadata(CellIndex(x, y, z));
+    MarkNetworkChunkDirtyForCell(x, y, z);
     changedChunks.push_back(CellToChunkCoord(x, y, z));
 }
 
@@ -2574,6 +2727,7 @@ void DemoWorld::SetCell(const int x, const int y, const int z, const MaterialId 
     NoteCellMaterialChange(x, y, z, previousMaterial, material);
     SetCellUnchecked(x, y, z, material);
     ClearCellWaterMetadata(CellIndex(x, y, z));
+    MarkNetworkChunkDirtyForCell(x, y, z);
     MarkDirty(x, y, z);
     ++terrainContentVersion_;
 }
@@ -3996,6 +4150,14 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
     {
         waterSurfaceHeightMap_.assign(columnCount, -std::numeric_limits<float>::infinity());
     }
+    if (solidSurfaceMaterialMap_.size() != columnCount)
+    {
+        solidSurfaceMaterialMap_.assign(columnCount, MaterialId::Air);
+    }
+    if (waterSurfaceMaterialMap_.size() != columnCount)
+    {
+        waterSurfaceMaterialMap_.assign(columnCount, MaterialId::Air);
+    }
 
     std::vector<ChunkCoord> dirtyChunks;
     dirtyChunks.reserve(chunkRuntimeStates_.size());
@@ -4017,15 +4179,21 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
         return;
     }
 
-    std::sort(dirtyChunks.begin(), dirtyChunks.end(), [](const ChunkCoord& lhs, const ChunkCoord& rhs)
+    std::sort(dirtyChunks.begin(), dirtyChunks.end(), [this](const ChunkCoord& lhs, const ChunkCoord& rhs)
     {
-        if (lhs.z != rhs.z)
+        const float lhsActivity = chunkRuntimeStates_.at(lhs).activityLifetime;
+        const float rhsActivity = chunkRuntimeStates_.at(rhs).activityLifetime;
+        if ((lhsActivity > 0.0f) != (rhsActivity > 0.0f))
         {
-            return lhs.z < rhs.z;
+            return lhsActivity > 0.0f;
         }
         if (lhs.y != rhs.y)
         {
-            return lhs.y < rhs.y;
+            return lhs.y > rhs.y;
+        }
+        if (lhs.z != rhs.z)
+        {
+            return lhs.z < rhs.z;
         }
         return lhs.x < rhs.x;
     });
@@ -4039,14 +4207,17 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
     }
 
     const std::size_t dirtyChunkTotal = dirtyChunks.size();
-    const std::size_t dirtyChunkBudget = std::max<std::size_t>(kMinMeshChunkBudgetPerPass, std::max<std::size_t>(meshWorkerCount_, 1u) * kMeshChunkBudgetPerWorker);
+    const int chunkSpan = std::max(activeChunkSize_, 1);
+    const std::size_t chunkVolume = static_cast<std::size_t>(chunkSpan) * static_cast<std::size_t>(chunkSpan) * static_cast<std::size_t>(chunkSpan);
+    const std::size_t workerChunkBudget = std::max<std::size_t>(kMinMeshChunkBudgetPerPass, std::max<std::size_t>(meshWorkerCount_, 1u) * kMeshChunkBudgetPerWorker);
+    const std::size_t cellChunkBudget = std::max<std::size_t>(kMinMeshChunkBudgetPerPass, kMaxMeshCellsPerPass / std::max<std::size_t>(chunkVolume, 1u));
+    const std::size_t dirtyChunkBudget = std::max<std::size_t>(1u, std::min(workerChunkBudget, cellChunkBudget));
     if (dirtyChunks.size() > dirtyChunkBudget)
     {
         dirtyChunks.resize(dirtyChunkBudget);
         dirtyChunkNonAirCounts.resize(dirtyChunkBudget);
     }
 
-    const int chunkSpan = std::max(activeChunkSize_, 1);
     const auto columnIndex = [this](const int x, const int z) -> std::size_t
     {
         return static_cast<std::size_t>(z * width_ + x);
@@ -4090,22 +4261,35 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
                 {
                     float solidSurfaceHeight = -std::numeric_limits<float>::infinity();
                     float waterSurfaceHeight = -std::numeric_limits<float>::infinity();
+                    MaterialId solidSurfaceMaterial = MaterialId::Air;
+                    MaterialId waterSurfaceMaterial = MaterialId::Air;
                     for (int y = 0; y < height_; ++y)
                     {
                         const MaterialId material = GetCell(x, y, z);
                         const float worldTop = (static_cast<float>(y) + 1.0f) * cellSize_;
                         if (material == MaterialId::ShallowWater)
                         {
-                            waterSurfaceHeight = std::max(waterSurfaceHeight, worldTop);
+                            if (worldTop >= waterSurfaceHeight)
+                            {
+                                waterSurfaceHeight = worldTop;
+                                waterSurfaceMaterial = material;
+                            }
                         }
                         else if (material != MaterialId::Air)
                         {
-                            solidSurfaceHeight = std::max(solidSurfaceHeight, worldTop);
+                            if (worldTop >= solidSurfaceHeight)
+                            {
+                                solidSurfaceHeight = worldTop;
+                                solidSurfaceMaterial = material;
+                            }
                         }
                     }
 
-                    solidSurfaceHeightMap_[columnIndex(x, z)] = solidSurfaceHeight;
-                    waterSurfaceHeightMap_[columnIndex(x, z)] = waterSurfaceHeight;
+                    const std::size_t surfaceIndex = columnIndex(x, z);
+                    solidSurfaceHeightMap_[surfaceIndex] = solidSurfaceHeight;
+                    waterSurfaceHeightMap_[surfaceIndex] = waterSurfaceHeight;
+                    solidSurfaceMaterialMap_[surfaceIndex] = solidSurfaceMaterial;
+                    waterSurfaceMaterialMap_[surfaceIndex] = waterSurfaceMaterial;
                 }
             }
         }
@@ -4258,6 +4442,7 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
     };
 
     std::vector<BuiltChunkCache> rebuiltChunks(dirtyChunks.size());
+    const std::uint64_t rebuildMeshVersion = terrainMeshVersion_ + 1u;
     meshJobs_->ParallelFor(dirtyChunks.size(), 1, [&](const std::size_t begin, const std::size_t end)
     {
         for (std::size_t index = begin; index < end; ++index)
@@ -4280,6 +4465,34 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
             if (dirtyChunkNonAirCounts[index] == 0u)
             {
                 continue;
+            }
+
+            const std::uint32_t chunkCellCount = static_cast<std::uint32_t>((xEnd - xBegin) * (yEnd - yBegin) * (zEnd - zBegin));
+            if (dirtyChunkNonAirCounts[index] >= chunkCellCount)
+            {
+                const float chunkTop = static_cast<float>(yEnd) * cellSize_;
+                bool buriedBelowSurface = true;
+                const int sampleMinX = std::max(0, xBegin - 1);
+                const int sampleMaxX = std::min(width_ - 1, xEnd);
+                const int sampleMinZ = std::max(0, zBegin - 1);
+                const int sampleMaxZ = std::min(depth_ - 1, zEnd);
+                for (int sampleZ = sampleMinZ; buriedBelowSurface && sampleZ <= sampleMaxZ; ++sampleZ)
+                {
+                    for (int sampleX = sampleMinX; sampleX <= sampleMaxX; ++sampleX)
+                    {
+                        const float surfaceHeight = solidSurfaceHeightMap_[columnIndex(sampleX, sampleZ)];
+                        if (!std::isfinite(surfaceHeight) || surfaceHeight <= chunkTop + cellSize_ * 0.05f)
+                        {
+                            buriedBelowSurface = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (buriedBelowSurface)
+                {
+                    continue;
+                }
             }
 
             const int densityMinX = std::max(0, xBegin - 1);
@@ -4701,6 +4914,7 @@ void DemoWorld::RebuildMeshCache(const bool rebuildGlobalVertexCache)
         state.translucentTriangles = std::move(rebuiltChunk.translucentTriangles);
         state.meshDirty = false;
         state.meshInitialized = true;
+        state.meshVersion = rebuildMeshVersion;
     }
 
     PruneRetiredChunkStates();

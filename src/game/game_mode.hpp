@@ -106,7 +106,6 @@ private:
         WorldHeight,
         WorldDepth,
         ActiveChunkSize,
-        CellScale,
         Seed,
         Relief,
         WaterLevel,

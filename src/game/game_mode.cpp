@@ -456,7 +456,6 @@ void GameMode::UpdatePauseMenu(const platform::InputState& input)
         const int worldHorizontalStep = coarseAdjust ? 16 : 4;
         const int worldVerticalStep = coarseAdjust ? 8 : 2;
         const int chunkStep = coarseAdjust ? 8 : 1;
-        const float cellScaleStep = coarseAdjust ? 0.10f : 0.01f;
         const std::uint32_t seedStep = coarseAdjust ? 100u : 1u;
         const float reliefStep = coarseAdjust ? 0.10f : 0.02f;
         const float waterStep = coarseAdjust ? 0.05f : 0.01f;
@@ -475,9 +474,6 @@ void GameMode::UpdatePauseMenu(const platform::InputState& input)
             break;
         case PauseMenuItem::ActiveChunkSize:
             pendingWorldSettings_.activeChunkSize += quantized(chunkStep);
-            break;
-        case PauseMenuItem::CellScale:
-            pendingWorldSettings_.cellSize += scalar * cellScaleStep;
             break;
         case PauseMenuItem::Seed:
             if (scalar > 0.0f)
@@ -1213,7 +1209,7 @@ void GameMode::BuildHud(std::vector<render::ColorVertex2D>& overlayTriangles, co
     AppendText(overlayTriangles, 28.0f, 118.0f, 2.0f, std::string("MATERIAL ") + ToUpperAscii(world::ToString(crosshairMaterial_)), MakeColor(0.82f, 1.0f, 0.84f, 1.0f), screenWidth, screenHeight);
     AppendText(overlayTriangles, 28.0f, 136.0f, 2.0f, std::string("WORLD ") + std::to_string(settings.worldWidth) + "X" + std::to_string(settings.worldHeight) + "X" + std::to_string(settings.worldDepth) + "  CHUNK " + std::to_string(settings.activeChunkSize), MakeColor(0.90f, 0.83f, 1.0f, 1.0f), screenWidth, screenHeight);
     AppendText(overlayTriangles, 28.0f, 154.0f, 2.0f, std::string("EXTENT ") + FormatFloat(worldExtentMeters.x, 1) + " X " + FormatFloat(worldExtentMeters.y, 1) + " X " + FormatFloat(worldExtentMeters.z, 1) + " M", MakeColor(0.82f, 0.95f, 1.0f, 1.0f), screenWidth, screenHeight);
-    AppendText(overlayTriangles, 28.0f, 172.0f, 2.0f, std::string("CELL SCALE ") + FormatFloat(settings.cellSize, 2) + " M  SEED " + std::to_string(settings.seed), MakeColor(1.0f, 0.82f, 0.72f, 1.0f), screenWidth, screenHeight);
+    AppendText(overlayTriangles, 28.0f, 172.0f, 2.0f, std::string("UNIT SCALE 1.00 M  SEED ") + std::to_string(settings.seed), MakeColor(1.0f, 0.82f, 0.72f, 1.0f), screenWidth, screenHeight);
     AppendText(overlayTriangles, 28.0f, 190.0f, 2.0f, std::string("TRUCK ") + FormatFloat(truck_.SpeedMetersPerSecond()) + " MPS  " + ToUpperAscii(world::ToString(truck_.ContactMaterial())), MakeColor(0.97f, 0.82f, 0.58f, 1.0f), screenWidth, screenHeight);
     std::string simLine = std::string("SIM ") + std::string(world_.ActiveMpmBackendName());
     if (world_.ActiveMpmBackendName() == "CPU Reference")
@@ -1316,13 +1312,12 @@ void GameMode::BuildPauseMenu(std::vector<render::ColorVertex2D>& overlayTriangl
     AppendRect(overlayTriangles, menuX + 14.0f, menuY + 14.0f, menuWidth - 28.0f, 30.0f, MakeColor(0.12f, 0.15f, 0.20f, 0.95f), screenWidth, screenHeight);
     AppendText(overlayTriangles, menuX + 28.0f, menuY + 24.0f, 2.0f, "PAUSE MENU", MakeColor(0.98f, 0.98f, 1.0f, 1.0f), screenWidth, screenHeight);
 
-    const std::array<std::string, 11> menuRows = {
+    const std::array<std::string, 10> menuRows = {
         "RESUME",
         std::string("WORLD WIDTH ") + std::to_string(pendingWorldSettings_.worldWidth) + " CELLS",
         std::string("WORLD HEIGHT ") + std::to_string(pendingWorldSettings_.worldHeight) + " CELLS",
         std::string("WORLD DEPTH ") + std::to_string(pendingWorldSettings_.worldDepth) + " CELLS",
         std::string("ACTIVE CHUNK ") + std::to_string(pendingWorldSettings_.activeChunkSize) + " CELLS",
-        std::string("CELL SCALE ") + FormatFloat(pendingWorldSettings_.cellSize, 2) + " M",
         std::string("SEED ") + std::to_string(pendingWorldSettings_.seed),
         std::string("RELIEF ") + FormatFloat(pendingWorldSettings_.terrainRelief, 2),
         std::string("WATER LEVEL ") + FormatFloat(pendingWorldSettings_.waterLevel, 2),

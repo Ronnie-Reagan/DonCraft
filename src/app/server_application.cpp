@@ -263,10 +263,12 @@ bool ServerApplication::ParseCommandLine(const int argc, char** argv, Options& o
         {
             if (const char* value = requireValue(index, "--cell-size"))
             {
-                if (!ParseValue<float>(value, "--cell-size", [](const std::string& text) { return std::stof(text); }, options.worldSettings.cellSize))
+                float ignoredCellSize = 1.0f;
+                if (!ParseValue<float>(value, "--cell-size", [](const std::string& text) { return std::stof(text); }, ignoredCellSize))
                 {
                     return false;
                 }
+                LogWarning("--cell-size is ignored; DonCraft worlds now use fixed 1.0 meter cells.");
                 continue;
             }
             return false;
@@ -342,7 +344,6 @@ void ServerApplication::PrintUsage()
     LogInfo("  --world-height <cells>");
     LogInfo("  --world-depth <cells>");
     LogInfo("  --active-chunk-size <cells>");
-    LogInfo("  --cell-size <meters>");
     LogInfo("  --seed <uint32>");
     LogInfo("  --terrain-relief <scalar>");
     LogInfo("  --water-level <0..1>");

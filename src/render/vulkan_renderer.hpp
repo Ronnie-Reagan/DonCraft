@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace df::render
@@ -79,6 +80,16 @@ private:
         std::uint64_t uploadedTerrainMeshVersion = 0;
     };
 
+    struct TerrainChunkGpuMesh
+    {
+        BufferResource opaqueVertexBuffer{};
+        BufferResource translucentVertexBuffer{};
+        std::uint64_t meshVersion = 0;
+        std::size_t opaqueVertexCount = 0;
+        std::size_t translucentVertexCount = 0;
+        std::uint64_t lastUsedFrame = 0;
+    };
+
     struct QueueFamilySelection
     {
         std::optional<std::uint32_t> graphics;
@@ -120,6 +131,7 @@ private:
 
     void EnsureBufferCapacity(BufferResource& buffer, VkDeviceSize minimumSize, VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     void DestroyBuffer(BufferResource& buffer);
+    void DestroyTerrainChunkMeshes();
 
     [[nodiscard]] std::vector<const char*> GetRequiredInstanceExtensions() const;
     [[nodiscard]] QueueFamilySelection FindQueueFamilies(VkPhysicalDevice device) const;
@@ -142,6 +154,8 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::array<FrameResources, static_cast<std::size_t>(config::kMaxFramesInFlight)> frames_{};
     std::uint32_t frameIndex_ = 0;
+    std::unordered_map<std::uint64_t, TerrainChunkGpuMesh> terrainChunkMeshes_;
+    std::uint64_t terrainChunkFrameSerial_ = 0;
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet shadowDescriptorSet_ = VK_NULL_HANDLE;

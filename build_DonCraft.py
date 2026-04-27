@@ -670,6 +670,7 @@ def stage_runtime_package(runtime_dir: Path, package_dir: Path, target_name: str
         copy_steam_appid_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
         copy_runtime_file_if_present(runtime_dir / "SDL3.dll", package_dir / "SDL3.dll")
         copy_shader_payload(runtime_dir, package_dir)
+        copy_runtime_file_if_present(runtime_dir / "DonCraft.ini", package_dir / "DonCraft.ini")
     elif target_name == SERVER_TARGET:
         copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
         copy_steam_appid_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")

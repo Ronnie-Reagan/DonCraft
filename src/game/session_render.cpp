@@ -706,6 +706,13 @@ auto BuildViewCameraPosition(
 {
     if (drivingTruck)
     {
+        const Vec3 truckLookForward = player != nullptr
+            ? player->FlatForwardVector()
+            : FlatForwardFromDirection(fallbackFlatForward);
+        if (options.thirdPerson)
+        {
+            return BuildThirdPersonCameraPosition(world, truckCameraPosition + Vec3{0.0f, 0.24f, 0.0f}, truckLookForward);
+        }
         return truckCameraPosition;
     }
     if (player != nullptr)
@@ -745,14 +752,12 @@ auto BuildScopedSessionFovDegrees(
     const int screenWidth,
     const int screenHeight) -> float
 {
+    static_cast<void>(scopedViewportWidth);
+    static_cast<void>(scopedViewportHeight);
+    static_cast<void>(screenWidth);
+    static_cast<void>(screenHeight);
     const float baseFovRadians = DegreesToRadians(BuildMainSessionFovDegrees());
-    const float viewportFraction = Clamp(
-        std::min(
-            static_cast<float>(scopedViewportWidth) / static_cast<float>(std::max(screenWidth, 1)),
-            static_cast<float>(scopedViewportHeight) / static_cast<float>(std::max(screenHeight, 1))),
-        0.08f,
-        1.0f);
-    const float scopedHalfFovRadians = std::atan(std::tan(baseFovRadians * 0.5f) * viewportFraction / std::max(options.zoomMagnification, 1.0f));
+    const float scopedHalfFovRadians = std::atan(std::tan(baseFovRadians * 0.5f) / std::max(options.zoomMagnification, 1.0f));
     return Clamp(scopedHalfFovRadians * 2.0f * (180.0f / kPi), 2.0f, BuildMainSessionFovDegrees());
 }
 
@@ -1007,10 +1012,13 @@ void GatherTerrainRenderData(
     world.GatherRenderGeometrySmoothedCulled(
         data.terrainTriangleStorage,
         data.translucentTerrainTriangleStorage,
+        data.terrainChunks,
         data.debugLines,
         data.worldToClip,
         cameraPosition,
         options.terrainDrawDistanceMeters + 160.0f,
+        options.terrainFullDetailDistanceMeters,
+        options.terrainCoarseDetailDistanceMeters,
         options.showWireframe,
         options.showActiveChunks);
 
@@ -1170,7 +1178,7 @@ auto BuildRuntimeRenderData(
     const PlayerController* const cameraPlayer = predictedLocalPlayer != nullptr ? predictedLocalPlayer : (localPlayer != nullptr ? &localPlayer->controller : nullptr);
     const bool drivingTruck = localPlayer != nullptr && localPlayer->drivingTruck;
     const Vec3 cameraPosition = BuildViewCameraPosition(runtime.World(), cameraPlayer, drivingTruck, runtime.Truck().CameraPosition(), options);
-    const Vec3 forward = drivingTruck ? runtime.Truck().ForwardVector() : (cameraPlayer != nullptr ? cameraPlayer->ForwardVector() : Vec3{0.0f, 0.0f, 1.0f});
+    const Vec3 forward = cameraPlayer != nullptr ? cameraPlayer->ForwardVector() : (drivingTruck ? runtime.Truck().ForwardVector() : Vec3{0.0f, 0.0f, 1.0f});
     const Vec3 aimPosition = drivingTruck ? runtime.Truck().CameraPosition() : (cameraPlayer != nullptr ? cameraPlayer->CameraPosition() : cameraPosition);
     GatherTerrainRenderData(
         data,
@@ -1291,9 +1299,10 @@ auto BuildClientRenderData(
         localActor != nullptr ? localActor->cameraPosition : Vec3{0.0f, 4.0f, -8.0f},
         localActor != nullptr ? localActor->flatForward : Vec3{0.0f, 0.0f, 1.0f},
         localActor != nullptr);
-    const Vec3 forward = drivingTruck
-        ? frame.truck.forward
-        : (predictedLocalPlayer != nullptr ? predictedLocalPlayer->ForwardVector() : (localActor != nullptr ? localActor->forward : Vec3{0.0f, 0.0f, 1.0f}));
+    const Vec3 forward =
+        predictedLocalPlayer != nullptr
+            ? predictedLocalPlayer->ForwardVector()
+            : (localActor != nullptr ? localActor->forward : (drivingTruck ? frame.truck.forward : Vec3{0.0f, 0.0f, 1.0f}));
     const Vec3 aimPosition = drivingTruck
         ? truckCameraPosition
         : (predictedLocalPlayer != nullptr ? predictedLocalPlayer->CameraPosition() : (localActor != nullptr ? localActor->cameraPosition : cameraPosition));

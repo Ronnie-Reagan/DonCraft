@@ -5,8 +5,13 @@
   "files": [
     {
       "path": "Don_Craft_client.exe",
-      "sha256": "ec3b9ff19ad2bfa747fec7bae0e3c10b9215dbe26c6388349006dc6b7de027cd",
-      "size": 764416
+      "sha256": "34403ad7bd684f129ebde744d9ec2f20ac73f237750ce0cf294898c00139c35a",
+      "size": 791552
+    },
+    {
+      "path": "DonCraft.ini",
+      "sha256": "5aaca8058c49a46266918eaae2c7a83dd945854c7901c3f39091c04cd1f24c83",
+      "size": 223
     },
     {
       "path": "SDL3.dll",
@@ -94,8 +99,8 @@
       "size": 4
     }
   ],
-  "generated_utc": "2026-04-23T16:25:14+00:00",
+  "generated_utc": "2026-04-27T13:13:09+00:00",
   "product": "DonCraft",
   "schema": 1,
-  "version": "046b8664a0d1"
+  "version": "9960b750dc9b"
 }

@@ -2,6 +2,7 @@
 
 #include "core/math.hpp"
 #include "world/demo_world.hpp"
+#include "world/material_properties.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -96,43 +97,34 @@ inline auto SnapDownToGround(
         return false;
     }
 
-    const auto isClearAtDrop = [&](const float drop) -> bool
-    {
-        return !world.OverlapsBlocking(position - Vec3{0.0f, drop, 0.0f}, halfExtents);
-    };
-
-    if (!isClearAtDrop(0.0f))
+    if (world.OverlapsBlocking(position, halfExtents))
     {
         return false;
     }
 
-    float low = 0.0f;
-    float high = maxDrop;
-    if (isClearAtDrop(high))
-    {
-        position.y -= high;
-        return true;
-    }
-
-    for (int iteration = 0; iteration < 8; ++iteration)
-    {
-        const float mid = (low + high) * 0.5f;
-        if (isClearAtDrop(mid))
-        {
-            low = mid;
-        }
-        else
-        {
-            high = mid;
-        }
-    }
-
-    if (low <= 1.0e-4f)
+    const Vec3 probeOrigin = position + Vec3{0.0f, halfExtents.y + 0.05f, 0.0f};
+    const float probeDistance = halfExtents.y * 2.0f + maxDrop + 0.12f;
+    const world::RaycastHit hit = world.Raycast({probeOrigin, Vec3{0.0f, -1.0f, 0.0f}}, probeDistance);
+    if (!hit.hit || !world::BlocksMovement(hit.material))
     {
         return false;
     }
 
-    position.y -= low;
+    const float targetCenterY = hit.position.y + halfExtents.y;
+    const float drop = position.y - targetCenterY;
+    if (drop < -0.05f || drop > maxDrop + 0.08f)
+    {
+        return false;
+    }
+
+    Vec3 snapped = position;
+    snapped.y = targetCenterY;
+    if (world.OverlapsBlocking(snapped, halfExtents))
+    {
+        return false;
+    }
+
+    position = snapped;
     return true;
 }
 }

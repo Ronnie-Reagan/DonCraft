@@ -19,6 +19,8 @@ struct SessionRenderOptions
     bool buildWallMode = false;
     std::uint8_t buildRotationQuarterTurns = 0u;
     world::MaterialId buildMaterial = world::MaterialId::WoodPlanks;
+    float terrainFullDetailDistanceMeters = 320.0f;
+    float terrainCoarseDetailDistanceMeters = 1100.0f;
 };
 
 [[nodiscard]] auto BuildRuntimeRenderData(

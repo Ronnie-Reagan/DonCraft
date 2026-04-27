@@ -1215,6 +1215,7 @@ int main()
             settings.waterLevel = 0.42f;
             world.SetGenerationSettings(settings);
             world.Reset();
+            settings = world.GenerationSettings();
             world.EditCell(4, 9, 4, df::world::MaterialId::BrittleConcrete);
 
             const std::filesystem::path tempFile = std::filesystem::temp_directory_path() / "Don_Craft_demo_world.bin";
@@ -1226,7 +1227,8 @@ int main()
             allPassed &= Expect(loadedWorld.GenerationSettings().worldHeight == settings.worldHeight, "Demo world load lost the world height setting.");
             allPassed &= Expect(loadedWorld.GenerationSettings().worldDepth == settings.worldDepth, "Demo world load lost the world depth setting.");
             allPassed &= Expect(loadedWorld.GenerationSettings().activeChunkSize == settings.activeChunkSize, "Demo world load lost the active chunk size setting.");
-            allPassed &= Expect(std::abs(loadedWorld.GenerationSettings().cellSize - settings.cellSize) < 0.0001f, "Demo world load lost the cell scale setting.");
+            allPassed &= Expect(std::abs(settings.cellSize - 1.0f) < 0.0001f, "Demo world did not canonicalize to fixed 1.0 meter cells.");
+            allPassed &= Expect(std::abs(loadedWorld.GenerationSettings().cellSize - settings.cellSize) < 0.0001f, "Demo world load lost the fixed unit cell setting.");
             allPassed &= Expect(loadedWorld.GenerationSettings().seed == settings.seed, "Demo world load lost the generation seed.");
             allPassed &= Expect(loadedWorld.MaterialAtCell(4, 9, 4) == df::world::MaterialId::BrittleConcrete, "Demo world load lost the edited cell.");
 
@@ -1401,15 +1403,18 @@ int main()
 
             world.Tick(0.07f);
 
-            bool fellFarEnough = false;
-            for (int y = startY - 2; y >= std::max(0, startY - 6); --y)
+            bool foundFallenWater = false;
+            int highestFallenWaterY = startY;
+            for (int y = startY - 1; y >= 0; --y)
             {
                 if (world.MaterialAtCell(waterX, y, waterZ) == df::world::MaterialId::ShallowWater)
                 {
-                    fellFarEnough = true;
+                    foundFallenWater = true;
+                    highestFallenWaterY = y;
                     break;
                 }
             }
+            const bool fellFarEnough = foundFallenWater && highestFallenWaterY <= startY - 6;
 
             allPassed &= Expect(
                 world.MaterialAtCell(waterX, startY, waterZ) == df::world::MaterialId::Air && fellFarEnough,

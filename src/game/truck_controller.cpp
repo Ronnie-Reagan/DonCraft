@@ -91,8 +91,8 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
     const float forwardSpeed = Dot(velocity_, forward);
     const float lateralSpeed = Dot(velocity_, right);
 
-    const float maxSpeed = occupied ? 17.0f : 0.0f;
-    const float engineAcceleration = 18.0f * averageGrip;
+    const float maxSpeed = occupied ? 22.0f : 0.0f;
+    const float engineAcceleration = 26.0f * Clamp(averageGrip + 0.22f, 0.20f, 1.35f);
     const float brakeAcceleration = 26.0f * std::max(averageGrip, 0.35f);
 
     float targetForwardSpeed = throttle * maxSpeed;
@@ -117,7 +117,7 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
 
     if (grounded_)
     {
-        const float steeringStrength = (0.8f + averageGrip * 1.5f) * Clamp(std::abs(nextForwardSpeed) / 8.0f, 0.2f, 1.0f);
+        const float steeringStrength = (0.92f + averageGrip * 1.65f) * Clamp(std::abs(nextForwardSpeed) / 8.0f, 0.2f, 1.0f);
         yawRadians_ += steering_ * steeringStrength * dt * (nextForwardSpeed >= 0.0f ? 1.0f : -1.0f);
     }
 
@@ -125,12 +125,12 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
 
     const Vec3 halfExtents = BodyHalfExtents();
     const Vec3 horizontalDelta{velocity_.x * dt, 0.0f, velocity_.z * dt};
-    const float stepHeight = grounded_ ? 0.24f + averageSink_ * world.CellSize() * 0.20f : 0.0f;
+    const float stepHeight = grounded_ ? std::max(0.42f, world.CellSize() * (0.62f + averageSink_ * 0.18f)) : 0.0f;
     const float horizontalDistance = Length(horizontalDelta);
     const int horizontalSubsteps = std::clamp(
-        static_cast<int>(std::ceil(horizontalDistance / std::max(world.CellSize() * 0.60f, 0.14f))),
+        static_cast<int>(std::ceil(horizontalDistance / std::max(world.CellSize() * 0.42f, 0.14f))),
         1,
-        6);
+        8);
     const Vec3 horizontalSubstepDelta = horizontalDelta / static_cast<float>(horizontalSubsteps);
     for (int substepIndex = 0; substepIndex < horizontalSubsteps; ++substepIndex)
     {
@@ -220,8 +220,8 @@ void TruckController::Tick(const ControlState& input, world::DemoWorld& world, c
 
         if (heightCount > 0)
         {
-            const float targetHeight = (heightSum / static_cast<float>(heightCount)) + BodyHalfExtents().y + 0.28f - averageSink_ * world.CellSize() * 0.65f;
-            position_.y = Lerp(position_.y, targetHeight, Clamp(dt * 8.0f, 0.0f, 1.0f));
+            const float targetHeight = (heightSum / static_cast<float>(heightCount)) + BodyHalfExtents().y + 0.34f - averageSink_ * world.CellSize() * 0.48f;
+            position_.y = Lerp(position_.y, targetHeight, Clamp(dt * 10.0f, 0.0f, 1.0f));
             velocity_.y = std::max(velocity_.y, 0.0f);
         }
     }
@@ -352,8 +352,8 @@ void TruckController::SampleGroundContacts(const world::DemoWorld& world)
     const auto wheelOffsets = WheelLocalOffsets();
     for (std::size_t wheelIndex = 0; wheelIndex < wheelContacts_.size(); ++wheelIndex)
     {
-        const Vec3 wheelOrigin = position_ + WorldOffset(wheelOffsets[wheelIndex]) + Vec3{0.0f, 0.55f, 0.0f};
-        const world::RaycastHit hit = world.Raycast({wheelOrigin, Vec3{0.0f, -1.0f, 0.0f}}, 1.8f);
+        const Vec3 wheelOrigin = position_ + WorldOffset(wheelOffsets[wheelIndex]) + Vec3{0.0f, 0.80f, 0.0f};
+        const world::RaycastHit hit = world.Raycast({wheelOrigin, Vec3{0.0f, -1.0f, 0.0f}}, 2.35f);
 
         wheelContacts_[wheelIndex].hit = hit.hit;
         wheelContacts_[wheelIndex].point = hit.position;

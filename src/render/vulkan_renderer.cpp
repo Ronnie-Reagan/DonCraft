@@ -367,6 +367,7 @@ void VulkanRenderer::Shutdown()
             frame.inFlight = VK_NULL_HANDLE;
         }
     }
+    DestroyTerrainChunkMeshes();
 
     if (pipelineLayout_ != VK_NULL_HANDLE)
     {
@@ -491,6 +492,36 @@ void VulkanRenderer::Draw(const FrameRenderData& frameData)
         frame.uploadedTerrainMeshVersion = frameData.terrainMeshVersion;
         uploadVertices(frame.terrainVertexBuffer, frameData.terrainTriangles.data(), frameData.terrainTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.translucentTerrainVertexBuffer, frameData.translucentTerrainTriangles.data(), frameData.translucentTerrainTriangles.size(), sizeof(ColorVertex3D));
+        ++terrainChunkFrameSerial_;
+        for (const TerrainChunkDraw& chunk : frameData.terrainChunks)
+        {
+            TerrainChunkGpuMesh& gpuMesh = terrainChunkMeshes_[chunk.key];
+            gpuMesh.lastUsedFrame = terrainChunkFrameSerial_;
+            if (gpuMesh.meshVersion != chunk.meshVersion ||
+                gpuMesh.opaqueVertexCount != chunk.opaqueTriangles.size())
+            {
+                uploadVertices(gpuMesh.opaqueVertexBuffer, chunk.opaqueTriangles.data(), chunk.opaqueTriangles.size(), sizeof(ColorVertex3D));
+                gpuMesh.opaqueVertexCount = chunk.opaqueTriangles.size();
+            }
+            if (gpuMesh.meshVersion != chunk.meshVersion ||
+                gpuMesh.translucentVertexCount != chunk.translucentTriangles.size())
+            {
+                uploadVertices(gpuMesh.translucentVertexBuffer, chunk.translucentTriangles.data(), chunk.translucentTriangles.size(), sizeof(ColorVertex3D));
+                gpuMesh.translucentVertexCount = chunk.translucentTriangles.size();
+            }
+            gpuMesh.meshVersion = chunk.meshVersion;
+        }
+        for (auto iter = terrainChunkMeshes_.begin(); iter != terrainChunkMeshes_.end();)
+        {
+            if (terrainChunkFrameSerial_ > iter->second.lastUsedFrame + 240u)
+            {
+                DestroyBuffer(iter->second.opaqueVertexBuffer);
+                DestroyBuffer(iter->second.translucentVertexBuffer);
+                iter = terrainChunkMeshes_.erase(iter);
+                continue;
+            }
+            ++iter;
+        }
         uploadVertices(frame.dynamicVertexBuffer, frameData.dynamicTriangles.data(), frameData.dynamicTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.dynamicTranslucentVertexBuffer, frameData.dynamicTranslucentTriangles.data(), frameData.dynamicTranslucentTriangles.size(), sizeof(ColorVertex3D));
         uploadVertices(frame.viewModelVertexBuffer, frameData.viewModelTriangles.data(), frameData.viewModelTriangles.size(), sizeof(ColorVertex3D));
@@ -1660,6 +1691,39 @@ void VulkanRenderer::RecordFrame(
     vkCmdSetScissor(commandBuffer, 0, 1, &shadowScissor);
 
     constexpr VkDeviceSize bufferOffset = 0;
+    const auto drawResidentTerrainChunks = [&](const VkPipeline pipeline, const ScenePushConstants& scenePushConstants, const bool translucent)
+    {
+        bool pipelineBound = false;
+        for (const TerrainChunkDraw& chunk : frameData.terrainChunks)
+        {
+            const auto meshIter = terrainChunkMeshes_.find(chunk.key);
+            if (meshIter == terrainChunkMeshes_.end())
+            {
+                continue;
+            }
+
+            const TerrainChunkGpuMesh& mesh = meshIter->second;
+            const BufferResource& buffer = translucent ? mesh.translucentVertexBuffer : mesh.opaqueVertexBuffer;
+            const std::size_t vertexCount = translucent ? mesh.translucentVertexCount : mesh.opaqueVertexCount;
+            if (vertexCount == 0 || buffer.buffer == VK_NULL_HANDLE)
+            {
+                continue;
+            }
+
+            if (!pipelineBound)
+            {
+                vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                vkCmdPushConstants(commandBuffer, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ScenePushConstants), &scenePushConstants);
+                pipelineBound = true;
+            }
+
+            const VkBuffer vertexBuffer = buffer.buffer;
+            vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &bufferOffset);
+            vkCmdDraw(commandBuffer, static_cast<std::uint32_t>(vertexCount), 1, 0, 0);
+        }
+    };
+
+    drawResidentTerrainChunks(shadowPipeline_, shadowPushConstants, false);
     if (!frameData.terrainTriangles.empty())
     {
         const VkBuffer vertexBuffer = frame.terrainVertexBuffer.buffer;
@@ -1762,6 +1826,7 @@ void VulkanRenderer::RecordFrame(
         vkCmdSetViewport(commandBuffer, 0, 1, &sceneViewport);
         vkCmdSetScissor(commandBuffer, 0, 1, &sceneScissor);
 
+        drawResidentTerrainChunks(terrainPipeline_, scenePushConstants, false);
         if (!frameData.terrainTriangles.empty())
         {
             const VkBuffer vertexBuffer = frame.terrainVertexBuffer.buffer;
@@ -1792,9 +1857,17 @@ void VulkanRenderer::RecordFrame(
 
     const auto hasAnyTranslucency = [&]() -> bool
     {
-        return !frameData.translucentTerrainTriangles.empty() ||
-               !frameData.dynamicTranslucentTriangles.empty() ||
-               !frameData.effectTriangles.empty();
+        if (!frameData.translucentTerrainTriangles.empty() ||
+            !frameData.dynamicTranslucentTriangles.empty() ||
+            !frameData.effectTriangles.empty())
+        {
+            return true;
+        }
+
+        return std::any_of(frameData.terrainChunks.begin(), frameData.terrainChunks.end(), [](const TerrainChunkDraw& chunk)
+        {
+            return !chunk.translucentTriangles.empty();
+        });
     };
 
     const auto drawOitGeometry = [&](const ScenePushConstants& scenePushConstants, const VkViewport& sceneViewport, const VkRect2D& sceneScissor)
@@ -1803,6 +1876,7 @@ void VulkanRenderer::RecordFrame(
         vkCmdSetViewport(commandBuffer, 0, 1, &sceneViewport);
         vkCmdSetScissor(commandBuffer, 0, 1, &sceneScissor);
 
+        drawResidentTerrainChunks(translucentTerrainOitPipeline_, scenePushConstants, true);
         if (!frameData.translucentTerrainTriangles.empty())
         {
             const VkBuffer vertexBuffer = frame.translucentTerrainVertexBuffer.buffer;
@@ -2247,6 +2321,18 @@ void VulkanRenderer::DestroyBuffer(BufferResource& buffer)
     buffer.capacity = 0;
     buffer.hostCoherent = false;
     buffer.usage = 0;
+}
+
+void VulkanRenderer::DestroyTerrainChunkMeshes()
+{
+    for (auto& [key, mesh] : terrainChunkMeshes_)
+    {
+        static_cast<void>(key);
+        DestroyBuffer(mesh.opaqueVertexBuffer);
+        DestroyBuffer(mesh.translucentVertexBuffer);
+    }
+    terrainChunkMeshes_.clear();
+    terrainChunkFrameSerial_ = 0;
 }
 
 std::vector<const char*> VulkanRenderer::GetRequiredInstanceExtensions() const
