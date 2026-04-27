@@ -136,7 +136,7 @@ By default, staged runtime packages are written under:
 - `build/package/<config>/Don_Craft_client/`
 - `build/package/<config>/Don_Craft_server/`
 
-The build output keeps `steam_api64.dll` and a local development `steam_appid.txt` beside both executables for local runs. Staged packages include `steam_appid.txt` when CMake created it, and otherwise only include runtime files for that target.
+The build output keeps `steam_api64.dll` and a local development `steam_appid.txt` beside both executables for local runs. Public staged packages omit `steam_appid.txt` unless `--include-steam-appid` is passed, and the default `filtered` package mode only includes runtime files needed by each target.
 
 ### Launcher and GitHub updates
 
@@ -146,7 +146,7 @@ Release builds also produce `DonCraftLauncher.exe`. The Python build helper stag
 - `dist/update/alpha/manifest.json`
 - `dist/update/alpha/files/`
 
-The launcher downloads `dist/update/alpha/manifest.json` from the GitHub `main` branch, validates every runtime file by SHA-256, updates `DonCraftRuntime/` beside the launcher, and then starts `Don_Craft_client.exe`. This keeps the launcher compatible with Steam: set the Steam launch executable to `DonCraftLauncher.exe`; the launcher waits for the game process and forwards normal launch arguments.
+The launcher downloads `dist/update/alpha/manifest.json` from the GitHub `main` branch, validates every runtime file by SHA-256, updates `%LOCALAPPDATA%\DonCraft\Runtime` by default, and then starts `Don_Craft_client.exe`. Use `--doncraft-portable` or create `doncraft_portable.txt` beside the launcher to use `DonCraftRuntime/` next to the launcher instead. Use `--doncraft-runtime-dir <path>` to select an explicit runtime directory.
 
 For an alpha update, run a release build, commit the rewritten `dist/` tree, and push `main`:
 
@@ -157,7 +157,7 @@ git commit -m "Publish alpha build"
 git push origin main
 ```
 
-Use `--no-dist` for local builds that should not rewrite the tracked launcher/update payloads. The generated manifest uses repository-relative file paths only; it does not include local build directories or Windows user paths.
+Use `--launcher-bootstrap-runtime` only when you intentionally want to copy a bootstrap runtime beside the launcher in `dist/launcher/windows-x64/DonCraftBootstrap/`. Use `--no-dist` for local builds that should not rewrite the tracked launcher/update payloads. The generated manifest uses repository-relative file paths only; it does not include local build directories or Windows user paths.
 
 ## Running the client
 

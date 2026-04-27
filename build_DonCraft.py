@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import os
+from fnmatch import fnmatch
 import re
 import shutil
 import subprocess
@@ -49,12 +50,94 @@ class ResolvedTestPreset:
     configuration: str | None
 
 
+@dataclass
+class PackageCopyStats:
+    copied_files: int = 0
+    copied_bytes: int = 0
+    skipped_files: int = 0
+    duplicate_files: int = 0
+
+    def add(self, other: "PackageCopyStats") -> None:
+        self.copied_files += other.copied_files
+        self.copied_bytes += other.copied_bytes
+        self.skipped_files += other.skipped_files
+        self.duplicate_files += other.duplicate_files
+
+
+@dataclass
+class PackageOptions:
+    source_dir: Path
+    mode: str
+    include_source_payload: bool
+    include_steam_appid: bool
+    payload_dirs: list[Path]
+    runtime_roots: list[Path]
+    include_globs: list[str]
+    exclude_globs: list[str]
+    verbose: bool
+
+
+@dataclass
+class StagedPackage:
+    path: Path
+    entrypoint: str
+    stats: PackageCopyStats
+
+
 CLIENT_TARGET = "Don_Craft_client"
 SERVER_TARGET = "Don_Craft_server"
 LAUNCHER_TARGET = "DonCraftLauncher"
 DEFAULT_GITHUB_REPO = "Ronnie-Reagan/DonCraft"
 DEFAULT_UPDATE_BRANCH = "main"
 DEFAULT_UPDATE_CHANNEL = "alpha"
+
+DEFAULT_PACKAGE_MODE = "filtered"
+DEFAULT_PACKAGE_EXCLUDE_GLOBS = (
+    ".git/*",
+    ".vs/*",
+    "CMakeFiles/*",
+    "Testing/*",
+    "*.pdb",
+    "*.ilk",
+    "*.exp",
+    "*.lib",
+    "*.obj",
+    "*.iobj",
+    "*.ipdb",
+    "*.lastbuildstate",
+    "*.tlog",
+    "*.log",
+    "*.tmp",
+    "*.download",
+    "desktop.ini",
+    "Thumbs.db",
+)
+DEFAULT_SOURCE_PAYLOAD_DIRS = (
+    "assets",
+    "Assets",
+    "data",
+    "Data",
+    "content",
+    "Content",
+    "resources",
+    "Resources",
+    "config",
+    "Config",
+    "shaders",
+    "Shaders",
+    "Native/assets",
+    "Native/Assets",
+    "Native/data",
+    "Native/Data",
+    "Native/content",
+    "Native/Content",
+    "Native/resources",
+    "Native/Resources",
+    "Native/config",
+    "Native/Config",
+    "Native/shaders",
+    "Native/Shaders",
+)
 
 
 def find_cmake() -> str:
@@ -644,40 +727,217 @@ def copy_steam_appid_file_if_present(source: Path, destination: Path) -> bool:
     return True
 
 
-def copy_shader_payload(runtime_dir: Path, package_dir: Path) -> None:
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_glob_patterns(patterns: list[str] | tuple[str, ...]) -> list[str]:
+    normalized: list[str] = []
+    for pattern in patterns:
+        text = str(pattern).strip().replace("\\", "/")
+        if not text:
+            continue
+        while text.startswith("./"):
+            text = text[2:]
+        normalized.append(text)
+    return normalized
+
+
+def path_matches_any_glob(relative_path: str, patterns: list[str]) -> bool:
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    basename = Path(normalized).name
+    for pattern in patterns:
+        if fnmatch(normalized, pattern) or fnmatch(basename, pattern):
+            return True
+    return False
+
+
+def should_stage_package_file(relative_path: str, options: PackageOptions) -> bool:
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    if normalized == "":
+        return False
+
+    if not options.include_steam_appid and normalized.lower() == "steam_appid.txt":
+        return False
+
+    if path_matches_any_glob(normalized, options.exclude_globs):
+        return False
+
+    if options.include_globs and not path_matches_any_glob(normalized, options.include_globs):
+        return False
+
+    return True
+
+
+def copy_package_file(
+    source: Path,
+    destination: Path,
+    relative_path: str,
+    copied_paths: set[str],
+    options: PackageOptions,
+    *,
+    required: bool = False,
+) -> PackageCopyStats:
+    stats = PackageCopyStats()
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+
+    if not should_stage_package_file(normalized, options):
+        stats.skipped_files += 1
+        return stats
+
+    if normalized in copied_paths:
+        stats.duplicate_files += 1
+        return stats
+
+    if not source.is_file():
+        if required:
+            raise FileNotFoundError(f"Required package file was not found: {source}")
+        stats.skipped_files += 1
+        return stats
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    copied_paths.add(normalized)
+    stats.copied_files += 1
+    stats.copied_bytes += destination.stat().st_size
+
+    if options.verbose:
+        print(f"  + package {normalized}")
+
+    return stats
+
+
+def copy_package_tree(
+    source_root: Path,
+    destination_root: Path,
+    copied_paths: set[str],
+    options: PackageOptions,
+    *,
+    label: str,
+) -> PackageCopyStats:
+    stats = PackageCopyStats()
+    if not source_root.exists():
+        return stats
+    if not source_root.is_dir():
+        raise ValueError(f"Package source is not a directory: {source_root}")
+
+    if path_is_relative_to(destination_root, source_root):
+        raise ValueError(f"Package destination cannot live inside a package source: {destination_root} inside {source_root}")
+
+    if options.verbose:
+        print(f"Packaging {label}: {source_root} -> {destination_root}")
+
+    for source_file in sorted(path for path in source_root.rglob("*") if path.is_file()):
+        relative_path = relative_posix(source_file, source_root)
+        destination = destination_root / relative_path
+        stats.add(copy_package_file(source_file, destination, relative_path, copied_paths, options))
+
+    return stats
+
+
+def discover_source_payload_dirs(source_dir: Path) -> list[Path]:
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+    for relative in DEFAULT_SOURCE_PAYLOAD_DIRS:
+        candidate = (source_dir / relative).resolve()
+        if not candidate.is_dir():
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        discovered.append(candidate)
+    return discovered
+
+
+def copy_source_payload_dir(
+    source_root: Path,
+    package_dir: Path,
+    copied_paths: set[str],
+    options: PackageOptions,
+) -> PackageCopyStats:
+    source_root = source_root.expanduser().resolve()
+    if not source_root.exists():
+        raise FileNotFoundError(f"Package payload directory was not found: {source_root}")
+    if not source_root.is_dir():
+        raise ValueError(f"Package payload path is not a directory: {source_root}")
+
+    destination_root = package_dir / source_root.name
+    return copy_package_tree(source_root, destination_root, copied_paths, options, label=f"payload:{source_root.name}")
+
+
+def copy_shader_payload(runtime_dir: Path, package_dir: Path, copied_paths: set[str], options: PackageOptions) -> PackageCopyStats:
     shader_dir = runtime_dir / "shaders"
     if not shader_dir.exists():
-        return
-
-    for shader_file in sorted(shader_dir.rglob("*.spv")):
-        if shader_file.is_file():
-            relative_path = shader_file.relative_to(runtime_dir)
-            copy_runtime_file(shader_file, package_dir / relative_path)
+        return PackageCopyStats()
+    return copy_package_tree(shader_dir, package_dir / "shaders", copied_paths, options, label="filtered shaders")
 
 
-def stage_runtime_package(runtime_dir: Path, package_dir: Path, target_name: str, executable: Path) -> Path:
-    if runtime_dir.resolve() == package_dir.resolve():
-        raise ValueError("Filtered runtime packaging cannot be staged over the build output directory.")
+def stage_runtime_package(
+    runtime_dir: Path,
+    package_dir: Path,
+    target_name: str,
+    executable: Path,
+    options: PackageOptions,
+) -> StagedPackage:
+    runtime_dir = runtime_dir.resolve()
+    executable = executable.resolve()
+    package_dir = package_dir.resolve()
+
+    if runtime_dir == package_dir or path_is_relative_to(package_dir, runtime_dir):
+        raise ValueError("Runtime packaging cannot be staged over, or inside, the build output directory.")
 
     if package_dir.exists():
         shutil.rmtree(package_dir)
     package_dir.mkdir(parents=True, exist_ok=True)
 
-    copy_runtime_file(executable, package_dir / executable.name)
+    copied_paths: set[str] = set()
+    stats = PackageCopyStats()
 
-    if target_name == CLIENT_TARGET:
-        copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
-        copy_steam_appid_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
-        copy_runtime_file_if_present(runtime_dir / "SDL3.dll", package_dir / "SDL3.dll")
-        copy_shader_payload(runtime_dir, package_dir)
-        copy_runtime_file_if_present(runtime_dir / "DonCraft.ini", package_dir / "DonCraft.ini")
-    elif target_name == SERVER_TARGET:
-        copy_runtime_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll")
-        copy_steam_appid_file_if_present(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt")
+    stats.add(copy_package_file(executable, package_dir / executable.name, executable.name, copied_paths, options, required=True))
+
+    if options.mode == "complete":
+        stats.add(copy_package_tree(runtime_dir, package_dir, copied_paths, options, label="runtime directory"))
+
+        for extra_root in options.runtime_roots:
+            extra_root = extra_root.expanduser().resolve()
+            if not extra_root.exists():
+                raise FileNotFoundError(f"Additional runtime root was not found: {extra_root}")
+            stats.add(copy_package_tree(extra_root, package_dir, copied_paths, options, label="extra runtime root"))
+
+        if options.include_source_payload:
+            for payload_dir in discover_source_payload_dirs(options.source_dir):
+                if payload_dir.resolve() == runtime_dir:
+                    continue
+                stats.add(copy_source_payload_dir(payload_dir, package_dir, copied_paths, options))
+
+        for payload_dir in options.payload_dirs:
+            stats.add(copy_source_payload_dir(payload_dir, package_dir, copied_paths, options))
+
+    elif options.mode == "filtered":
+        if target_name == CLIENT_TARGET:
+            stats.add(copy_package_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll", "steam_api64.dll", copied_paths, options, required=True))
+            if options.include_steam_appid:
+                stats.add(copy_package_file(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt", "steam_appid.txt", copied_paths, options))
+            stats.add(copy_package_file(runtime_dir / "SDL3.dll", package_dir / "SDL3.dll", "SDL3.dll", copied_paths, options))
+            stats.add(copy_shader_payload(runtime_dir, package_dir, copied_paths, options))
+            stats.add(copy_package_file(runtime_dir / "DonCraft.ini", package_dir / "DonCraft.ini", "DonCraft.ini", copied_paths, options))
+        elif target_name == SERVER_TARGET:
+            stats.add(copy_package_file(runtime_dir / "steam_api64.dll", package_dir / "steam_api64.dll", "steam_api64.dll", copied_paths, options, required=True))
+            if options.include_steam_appid:
+                stats.add(copy_package_file(runtime_dir / "steam_appid.txt", package_dir / "steam_appid.txt", "steam_appid.txt", copied_paths, options))
+        else:
+            stats.add(copy_shader_payload(runtime_dir, package_dir, copied_paths, options))
     else:
-        copy_shader_payload(runtime_dir, package_dir)
+        raise ValueError(f"Unknown package mode: {options.mode}")
 
-    return package_dir
+    if not (package_dir / executable.name).exists():
+        raise FileNotFoundError(f"Packaged runtime is missing the entrypoint executable: {executable.name}")
+
+    return StagedPackage(path=package_dir, entrypoint=executable.name, stats=stats)
 
 
 def sha256_file(path: Path) -> str:
@@ -752,7 +1012,8 @@ def write_update_channel(
     github_repo: str,
     branch: str,
     version: str,
-) -> tuple[Path, str]:
+    entrypoint: str,
+) -> tuple[Path, str, int, int]:
     channel_root = dist_dir / "update" / channel
     files_root = channel_root / "files"
     if channel_root.exists():
@@ -760,15 +1021,18 @@ def write_update_channel(
     files_root.mkdir(parents=True, exist_ok=True)
 
     entries: list[dict[str, str | int]] = []
+    total_size = 0
     for source_file in sorted(path for path in staged_runtime_dir.rglob("*") if path.is_file()):
         relative_path = relative_posix(source_file, staged_runtime_dir)
         destination = files_root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_file, destination)
+        file_size = destination.stat().st_size
+        total_size += file_size
         entries.append(
             {
                 "path": relative_path,
-                "size": destination.stat().st_size,
+                "size": file_size,
                 "sha256": sha256_file(destination),
             }
         )
@@ -786,26 +1050,57 @@ def write_update_channel(
         "version": version,
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "base_url": raw_base_url,
-        "entrypoint": "Don_Craft_client.exe",
+        "entrypoint": entrypoint,
+        "file_count": len(entries),
+        "total_size": total_size,
         "files": entries,
     }
     manifest_path = channel_root / "manifest.json"
     with manifest_path.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    return manifest_path, manifest_url
+    return manifest_path, manifest_url, len(entries), total_size
 
 
-def stage_launcher_distribution(build_dir: Path, config: str, dist_dir: Path) -> Path | None:
+def count_tree_files(root: Path) -> tuple[int, int]:
+    file_count = 0
+    total_size = 0
+    if not root.exists():
+        return file_count, total_size
+
+    for path in root.rglob("*"):
+        if path.is_file():
+            file_count += 1
+            total_size += path.stat().st_size
+    return file_count, total_size
+
+
+def stage_launcher_distribution(
+    build_dir: Path,
+    config: str,
+    dist_dir: Path,
+    bootstrap_runtime: StagedPackage | None,
+) -> tuple[Path | None, Path | None, int, int]:
     launcher = find_built_executable(build_dir, config, LAUNCHER_TARGET)
     if launcher is None:
-        return None
+        return None, None, 0, 0
 
     launcher_dir = dist_dir / "launcher" / "windows-x64"
     if launcher_dir.exists():
         shutil.rmtree(launcher_dir)
     launcher_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(launcher, launcher_dir / launcher.name)
-    return launcher_dir / launcher.name
+
+    launcher_path = launcher_dir / launcher.name
+    shutil.copy2(launcher, launcher_path)
+
+    bootstrap_path: Path | None = None
+    bootstrap_files = 0
+    bootstrap_bytes = 0
+    if bootstrap_runtime is not None:
+        bootstrap_path = launcher_dir / "DonCraftBootstrap"
+        shutil.copytree(bootstrap_runtime.path, bootstrap_path)
+        bootstrap_files, bootstrap_bytes = count_tree_files(bootstrap_path)
+
+    return launcher_path, bootstrap_path, bootstrap_files, bootstrap_bytes
 
 
 def normalize_optional_cache_path(value: str) -> str:
@@ -976,6 +1271,51 @@ def parse_args() -> argparse.Namespace:
         help="Skip staging a packaged runtime directory after the build completes.",
     )
     parser.add_argument(
+        "--package-mode",
+        choices=("complete", "filtered"),
+        default=DEFAULT_PACKAGE_MODE,
+        help="Runtime packaging mode. filtered stages only the files needed by the selected target; complete mirrors the playable runtime folder for diagnostics.",
+    )
+    parser.add_argument(
+        "--package-runtime-root",
+        action="append",
+        default=[],
+        help="Additional directory whose contents are copied into the package root. May be repeated.",
+    )
+    parser.add_argument(
+        "--package-payload-dir",
+        action="append",
+        default=[],
+        help="Additional payload directory copied into the package under its folder name. May be repeated.",
+    )
+    parser.add_argument(
+        "--no-source-payload",
+        action="store_true",
+        help="Do not auto-copy source payload folders such as assets/, data/, resources/, config/, or shaders/.",
+    )
+    parser.add_argument(
+        "--package-include-glob",
+        action="append",
+        default=[],
+        help="Only include package files matching this glob. May be repeated. Empty means include everything except excludes.",
+    )
+    parser.add_argument(
+        "--package-exclude-glob",
+        action="append",
+        default=[],
+        help="Exclude package files matching this glob. May be repeated and extends the default excludes.",
+    )
+    parser.add_argument(
+        "--include-steam-appid",
+        action="store_true",
+        help="Include steam_appid.txt in packaged/update output. Off by default so public launcher builds do not ship the dev AppID file.",
+    )
+    parser.add_argument(
+        "--verbose-package",
+        action="store_true",
+        help="Print every file copied into the staged runtime package.",
+    )
+    parser.add_argument(
         "--dist-dir",
         default=str(source_dir / "dist"),
         help="Tracked distribution directory for the launcher and GitHub update channel. Defaults to dist/.",
@@ -995,6 +1335,20 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=f"GitHub repository in owner/name form. Defaults to origin, then {DEFAULT_GITHUB_REPO}.",
     )
+    bootstrap_group = parser.add_mutually_exclusive_group()
+    bootstrap_group.add_argument(
+        "--launcher-bootstrap-runtime",
+        dest="launcher_bootstrap_runtime",
+        action="store_true",
+        help="Copy the packaged client runtime into dist/launcher/windows-x64/DonCraftBootstrap. Off by default.",
+    )
+    bootstrap_group.add_argument(
+        "--no-launcher-bootstrap-runtime",
+        dest="launcher_bootstrap_runtime",
+        action="store_false",
+        help="Do not copy a client runtime bootstrap beside the launcher. This is the default.",
+    )
+    parser.set_defaults(launcher_bootstrap_runtime=False)
     parser.add_argument(
         "--no-dist",
         action="store_true",
@@ -1101,8 +1455,13 @@ def main() -> int:
     print(f"Target: {target_display}")
     print(f"Metrics CSV: {metrics_csv if metrics_csv is not None else 'disabled'}")
     print(f"Distribution dir: {dist_dir if dist_requested else 'disabled'}")
+    if package_requested:
+        print(f"Package mode: {args.package_mode}")
+        source_payload_enabled = args.package_mode == "complete" and not args.no_source_payload
+        print(f"Source payload discovery: {'enabled' if source_payload_enabled else 'disabled'}")
     if dist_requested:
         print(f"GitHub update channel: {github_repo}@{args.update_branch}/{args.update_channel}")
+        print(f"Launcher bootstrap runtime: {'enabled' if args.launcher_bootstrap_runtime else 'disabled'}")
     print(f"Run label: {run_label}")
     if override_defines:
         print("Override cache variables:")
@@ -1300,7 +1659,18 @@ def main() -> int:
         print(f"Build completed in {total_duration:.3f}s")
         return 0
 
-    client_package_dir: Path | None = None
+    client_package: StagedPackage | None = None
+    package_options = PackageOptions(
+        source_dir=source_dir,
+        mode=args.package_mode,
+        include_source_payload=not args.no_source_payload,
+        include_steam_appid=args.include_steam_appid,
+        payload_dirs=[Path(path).expanduser().resolve() for path in args.package_payload_dir],
+        runtime_roots=[Path(path).expanduser().resolve() for path in args.package_runtime_root],
+        include_globs=normalize_glob_patterns(args.package_include_glob),
+        exclude_globs=normalize_glob_patterns([*DEFAULT_PACKAGE_EXCLUDE_GLOBS, *args.package_exclude_glob]),
+        verbose=args.verbose_package,
+    )
 
     for target_name in primary_targets:
         executable = find_built_executable(configure_preset.binary_dir, config, target_name)
@@ -1317,36 +1687,55 @@ def main() -> int:
             else:
                 package_dir = source_dir / "build" / "package" / config / target_name
             try:
-                staged_dir = stage_runtime_package(executable.parent, package_dir, target_name, executable)
+                staged_package = stage_runtime_package(executable.parent, package_dir, target_name, executable, package_options)
             except (FileNotFoundError, ValueError) as error:
                 print(str(error), file=sys.stderr)
                 return 1
-            print(f"Packaged runtime ({target_name}): {staged_dir}")
+            print(
+                f"Packaged runtime ({target_name}): {staged_package.path} "
+                f"({staged_package.stats.copied_files} files, {staged_package.stats.copied_bytes} bytes, "
+                f"{staged_package.stats.skipped_files} skipped, {staged_package.stats.duplicate_files} duplicates)"
+            )
             if target_name == CLIENT_TARGET:
-                client_package_dir = staged_dir
+                client_package = staged_package
 
     if dist_requested:
-        launcher_path = stage_launcher_distribution(configure_preset.binary_dir, config, dist_dir)
+        bootstrap_runtime = client_package if args.launcher_bootstrap_runtime else None
+        launcher_path, launcher_bootstrap_path, launcher_bootstrap_files, launcher_bootstrap_bytes = stage_launcher_distribution(
+            configure_preset.binary_dir,
+            config,
+            dist_dir,
+            bootstrap_runtime,
+        )
         if launcher_path is not None:
             print(f"Launcher distribution: {launcher_path}")
+            if launcher_bootstrap_path is not None:
+                print(
+                    f"Launcher bootstrap runtime: {launcher_bootstrap_path} "
+                    f"({launcher_bootstrap_files} files, {launcher_bootstrap_bytes} bytes)"
+                )
+            elif args.launcher_bootstrap_runtime:
+                print("Launcher bootstrap runtime skipped: client runtime package was not built.")
         else:
             print("Launcher distribution skipped: DonCraftLauncher executable was not found.")
 
-        if client_package_dir is not None:
+        if client_package is not None:
             try:
-                manifest_path, manifest_url = write_update_channel(
-                    staged_runtime_dir=client_package_dir,
+                manifest_path, manifest_url, manifest_file_count, manifest_total_size = write_update_channel(
+                    staged_runtime_dir=client_package.path,
                     source_dir=source_dir,
                     dist_dir=dist_dir,
                     channel=args.update_channel.strip() or DEFAULT_UPDATE_CHANNEL,
                     github_repo=github_repo,
                     branch=args.update_branch.strip() or DEFAULT_UPDATE_BRANCH,
                     version=git_commit_version(source_dir),
+                    entrypoint=client_package.entrypoint,
                 )
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
                 print(str(error), file=sys.stderr)
                 return 1
             print(f"GitHub update manifest: {manifest_path}")
+            print(f"GitHub update files: {manifest_file_count} files, {manifest_total_size} bytes")
             print(f"Launcher manifest URL: {manifest_url}")
         elif package_requested:
             print("GitHub update channel skipped: client runtime package was not built.")

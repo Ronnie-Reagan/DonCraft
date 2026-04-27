@@ -70,6 +70,3 @@ local/
 /dist/**/*.ilk
 /dist/**/*.exp
 /dist/**/*.lib
-
-# Temp ignoration
-src/app/application_session.cpp

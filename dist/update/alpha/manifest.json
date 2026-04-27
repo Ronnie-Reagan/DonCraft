@@ -2,10 +2,11 @@
   "base_url": "https://raw.githubusercontent.com/Ronnie-Reagan/DonCraft/main/dist/update/alpha/files/",
   "channel": "alpha",
   "entrypoint": "Don_Craft_client.exe",
+  "file_count": 18,
   "files": [
     {
       "path": "Don_Craft_client.exe",
-      "sha256": "34403ad7bd684f129ebde744d9ec2f20ac73f237750ce0cf294898c00139c35a",
+      "sha256": "69c445e8f54b2cb8dbaa7178606cf60a8ee4b3a4263c9d7f6090072ea53874d8",
       "size": 791552
     },
     {
@@ -15,7 +16,7 @@
     },
     {
       "path": "SDL3.dll",
-      "sha256": "0dbf840835de3d05296d3d8f47d60ec46577c05039a309d02024a16fe46626e5",
+      "sha256": "a9405495a64a90ecbf68e673ef8cb54322ba3d3eb6aabdb25c8a06942bae3b65",
       "size": 2701824
     },
     {
@@ -92,15 +93,11 @@
       "path": "steam_api64.dll",
       "sha256": "eb17909a76668cf9ae0b92a618a34a50f6c73d3a6787cb4dd8ce36a8b10bfb75",
       "size": 317080
-    },
-    {
-      "path": "steam_appid.txt",
-      "sha256": "66c342932aa7c18f7bf1fa212aa011069fc2e50e0c7e9e4c73fcaa6851854c47",
-      "size": 4
     }
   ],
-  "generated_utc": "2026-04-27T13:13:09+00:00",
+  "generated_utc": "2026-04-27T18:21:33+00:00",
   "product": "DonCraft",
   "schema": 1,
-  "version": "9960b750dc9b"
+  "total_size": 3902523,
+  "version": "e17d0618e194"
 }
